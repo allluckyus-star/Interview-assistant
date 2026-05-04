@@ -1,0 +1,7 @@
+pynput
+groq
+tk
+uiautomation
+pyperclip
+pyautogui
+websockets>=10.4,<12

@@ -1,0 +1,45 @@
+# Python virtual environments
+.venv/
+venv/
+env/
+ENV/
+
+# Python cache and build artifacts
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.so
+*.egg
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+.coverage.*
+htmlcov/
+dist/
+build/
+
+# Environment and secrets
+.env
+.env.*
+*.pem
+*.key
+*.crt
+
+# Logs and runtime files
+*.log
+*.pid
+*.out
+*.err
+live.txt
+registered_clients.json
+
+# IDE/editor metadata
+.vscode/
+.idea/
+
+# OS metadata
+.DS_Store
+Thumbs.db
