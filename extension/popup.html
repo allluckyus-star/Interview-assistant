@@ -7,12 +7,35 @@
       * {
         box-sizing: border-box;
       }
+      html,
       body {
-        font-family: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
         margin: 0;
         padding: 0;
+        overflow-x: hidden;
+      }
+      body {
+        font-family: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
         background: #1a1d23;
         color: #e8eaed;
+      }
+      ::-webkit-scrollbar {
+        width: 10px;
+        height: 10px;
+        background: #14161b;
+      }
+      ::-webkit-scrollbar-track {
+        background: #14161b;
+      }
+      ::-webkit-scrollbar-thumb {
+        background: #2d323c;
+        border-radius: 5px;
+        border: 2px solid #14161b;
+      }
+      ::-webkit-scrollbar-thumb:hover {
+        background: #3c424c;
+      }
+      ::-webkit-scrollbar-corner {
+        background: #14161b;
       }
       .shell {
         display: flex;
@@ -105,6 +128,36 @@
         line-height: 1.4;
         font-family: inherit;
       }
+      .panel.prompts {
+        flex: 0 0 420px;
+        width: 420px;
+        max-height: 560px;
+        overflow-y: auto;
+        overflow-x: hidden;
+      }
+      .panel textarea {
+        max-width: 100%;
+        word-break: break-word;
+      }
+      .prompt-section {
+        display: flex;
+        flex-direction: column;
+        gap: 4px;
+        margin-bottom: 12px;
+      }
+      .prompt-section:last-child {
+        margin-bottom: 0;
+      }
+      .prompt-section .ph-hint {
+        font-size: 10px;
+        color: #80868b;
+        line-height: 1.35;
+        margin: 0;
+      }
+      .prompt-section textarea {
+        min-height: 110px;
+        max-height: 260px;
+      }
       .panel textarea:focus {
         outline: none;
         border-color: #5c6bc0;
@@ -139,13 +192,15 @@
         <div class="row">
           <button type="button" id="btnResume" class="toggle-btn">Resume</button>
           <button type="button" id="btnJD" class="toggle-btn">JD</button>
+          <button type="button" id="btnPrompts" class="toggle-btn">Prompts</button>
         </div>
         <div class="register-section">
           <button type="button" id="btnRegister">Register with bridge</button>
           <p class="register-status" id="registerStatus"></p>
-          <p class="register-status muted" id="selectedClientStatus"></p>
         </div>
-        <p class="hint">Open ChatGPT, paste resume/JD here, then use End in the desktop app.</p>
+        <p class="hint">
+          Resume, JD, and prompt templates are saved in this profile. When live.py is running, non-empty fields sync to the bridge on open, while typing, and on blur. Empty fields clear the bridge so prep waits until you paste.
+        </p>
         <p class="bridge-err" id="bridgeErr" hidden></p>
       </div>
       <aside class="panel" id="panelResume" aria-hidden="true">
@@ -155,6 +210,29 @@
       <aside class="panel" id="panelJD" aria-hidden="true">
         <label for="jdText">Job description</label>
         <textarea id="jdText" spellcheck="false" placeholder="Paste the job description…"></textarea>
+      </aside>
+      <aside class="panel prompts" id="panelPrompts" aria-hidden="true">
+        <label>Prompt templates</label>
+        <div class="prompt-section">
+          <label for="tplResumeSummary">1. Resume summary (Prep step 2)</label>
+          <p class="ph-hint">Use {resume_text} where the resume text should be inserted.</p>
+          <textarea id="tplResumeSummary" spellcheck="false" placeholder="Required. Use {resume_text} placeholder."></textarea>
+        </div>
+        <div class="prompt-section">
+          <label for="tplJdSummary">2. JD summary (Prep step 3)</label>
+          <p class="ph-hint">Use {jd_text} where the job description should be inserted.</p>
+          <textarea id="tplJdSummary" spellcheck="false" placeholder="Required. Use {jd_text} placeholder."></textarea>
+        </div>
+        <div class="prompt-section">
+          <label for="tplInitialInterview">3. Initial interview prompt (Prep step 4)</label>
+          <p class="ph-hint">Optional placeholders: {resume_text}, {jd_text}.</p>
+          <textarea id="tplInitialInterview" spellcheck="false" placeholder="Required. Sent once to ChatGPT to prime the live session."></textarea>
+        </div>
+        <div class="prompt-section">
+          <label for="tplChunkInterview">4. Per-caption interview prompt (during interview)</label>
+          <p class="ph-hint">Use {cleaned_interviewer_intent} where the cleaned caption should be inserted.</p>
+          <textarea id="tplChunkInterview" spellcheck="false" placeholder="Required. Sent for every interviewer caption chunk."></textarea>
+        </div>
       </aside>
     </div>
     <script src="popup.js"></script>

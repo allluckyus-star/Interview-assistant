@@ -1,25 +1,29 @@
-"""Three-step setup UI before the main interview window (account, resume summary, JD summary)."""
+"""Three-step setup UI before the main interview window (register, resume summary, JD summary)."""
 
 from __future__ import annotations
 
 import json
 import urllib.error
 import urllib.request
-from typing import Any, Callable
+from typing import Any
+from urllib.parse import quote
 
-from PySide6.QtCore import QEasingCurve, QPropertyAnimation, Qt, QTimer, Signal
+from PySide6.QtCore import QEasingCurve, QPropertyAnimation, Qt, QThread, QTimer, Signal
 from PySide6.QtWidgets import (
     QFrame,
     QGraphicsOpacityEffect,
     QHBoxLayout,
     QLabel,
     QPushButton,
-    QScrollArea,
     QSizePolicy,
     QStackedWidget,
     QVBoxLayout,
     QWidget,
 )
+
+
+# Rounded shell QSS must match top-level mask — keep equal to live.APP_SHELL_CORNER_RADIUS_PX.
+APP_SHELL_CORNER_RADIUS_PX = 0
 
 
 def _http_get_json(base: str, path: str) -> dict[str, Any]:
@@ -47,31 +51,64 @@ def _http_post_json(base: str, path: str, payload: dict[str, Any]) -> tuple[dict
             return {"ok": False, "error": raw or str(exc)}, exc.code
 
 
-def _build_resume_summary_prompt(resume: str) -> str:
+_TEMPLATE_KEYS = ("resume_summary", "jd_summary", "initial_interview", "chunk_interview")
+
+
+def _apply_resume_summary_template(template: str, resume: str) -> str:
+    return template.replace("{resume_text}", resume.strip())
+
+
+def _apply_jd_summary_template(template: str, jd: str) -> str:
+    return template.replace("{jd_text}", jd.strip())
+
+
+def _apply_initial_interview_template(template: str, resume: str, jd: str) -> str:
     return (
-        "Summarize this resume for quick interview reference. "
-        "Output plain text only: short bullet-style lines, key skills, years of experience, domains. "
-        "No preamble, no headings like 'Summary:'.\n\n"
-        f"Resume:\n---\n{resume.strip()}\n---"
+        template.replace("{resume_text}", resume.strip()).replace("{jd_text}", jd.strip())
     )
 
 
-def _build_jd_summary_prompt(jd: str) -> str:
-    return (
-        "Summarize this job description for interview prep. "
-        "Output plain text only: role, must-have skills, responsibilities, location/mode if stated. "
-        "No preamble.\n\n"
-        f"Job description:\n---\n{jd.strip()}\n---"
-    )
+class _WaitRegisterThread(QThread):
+    """One blocking long-poll to the bridge (no UI timer polling)."""
+
+    outcome = Signal(dict)
+
+    def __init__(self, bridge_base: str, since_seq: int, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self._bridge_base = bridge_base.rstrip("/")
+        self._since_seq = since_seq
+
+    def run(self) -> None:
+        payload: dict[str, Any] = {"ok": False, "error": ""}
+        try:
+            path = f"/wait-register-event?since_seq={int(self._since_seq)}"
+            req = urllib.request.Request(
+                f"{self._bridge_base}{path}",
+                method="GET",
+                headers={"Cache-Control": "no-store"},
+            )
+            with urllib.request.urlopen(req, timeout=130) as resp:
+                body = json.loads(resp.read().decode("utf-8"))
+            payload = dict(body)
+            req2 = urllib.request.Request(
+                f"{self._bridge_base}/registered-clients",
+                method="GET",
+                headers={"Cache-Control": "no-store"},
+            )
+            with urllib.request.urlopen(req2, timeout=8) as resp2:
+                payload["registry"] = json.loads(resp2.read().decode("utf-8"))
+        except Exception as exc:
+            payload = {"ok": False, "error": str(exc)}
+        self.outcome.emit(payload)
 
 
-class PrepWizardWindow(QWidget):
-    """Setup flow: pick registered client → resume GPT summary → JD GPT summary."""
+class PrepWizardWidget(QWidget):
+    """Setup: register → resume summary → JD summary → ChatGPT interview priming (embedded in main window)."""
 
     finished = Signal(str, str)
 
-    def __init__(self, bridge_base: str = "http://127.0.0.1:8765") -> None:
-        super().__init__()
+    def __init__(self, bridge_base: str = "http://127.0.0.1:8765", parent: QWidget | None = None) -> None:
+        super().__init__(parent)
         self.bridge_base = bridge_base.rstrip("/")
         self.selected_client_id = ""
         self.display_email = ""
@@ -81,59 +118,85 @@ class PrepWizardWindow(QWidget):
         self._waiting_job_id = ""
         self._fade_anim: QPropertyAnimation | None = None
 
-        self.setWindowFlags(Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint)
-        self.setAttribute(Qt.WA_TranslucentBackground, True)
-        self.resize(720, 520)
+        self._register_seq_baseline = 0
+        self._step1_advancing = False
+        self._reg_thread: _WaitRegisterThread | None = None
+        self._abandon_register_wait = False
+        self._resume_listen_timer = QTimer(self)
+        self._resume_listen_timer.setInterval(400)
+        self._resume_listen_timer.timeout.connect(self._tick_resume_listen)
+        self._jd_listen_timer = QTimer(self)
+        self._jd_listen_timer.setInterval(400)
+        self._jd_listen_timer.timeout.connect(self._tick_jd_listen)
+        self._step4_listen_timer = QTimer(self)
+        self._step4_listen_timer.setInterval(400)
+        self._step4_listen_timer.timeout.connect(self._tick_step4_listen)
+
+        self.setObjectName("PrepWizardWidget")
+        self.setStyleSheet(
+            "#PrepWizardWidget { background: transparent; border: none; outline: none; }"
+        )
+        self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
 
         root = QVBoxLayout(self)
         root.setContentsMargins(0, 0, 0, 0)
 
         self.shell = QFrame()
         self.shell.setObjectName("prepShell")
+        self.shell.setFrameShape(QFrame.Shape.NoFrame)
+        self.shell.setFrameShadow(QFrame.Shadow.Plain)
+        _r = APP_SHELL_CORNER_RADIUS_PX
         self.shell.setStyleSheet(
-            """
-            #prepShell {
-                background-color: rgba(255, 255, 255, 235);
-                border-radius: 22px;
-                border: 1px solid #d0d4e0;
-            }
+            f"""
+            #prepShell {{
+                background: transparent;
+                border-radius: {_r}px;
+                border: none;
+                outline: none;
+            }}
+            #prepShell QLabel {{
+                font-weight: 700;
+            }}
+            #prepShell QPushButton {{
+                font-weight: 700;
+            }}
             """
         )
         root.addWidget(self.shell)
 
         layout = QVBoxLayout(self.shell)
-        layout.setContentsMargins(28, 22, 28, 22)
-        layout.setSpacing(14)
+        layout.setContentsMargins(40, 32, 40, 32)
+        layout.setSpacing(10)
 
         top = QHBoxLayout()
-        self.step_badge = QLabel("1 / 3")
-        self.step_badge.setStyleSheet("font-size: 13px; font-weight: 700; color: #3949ab;")
+        self.step_badge = QLabel("1 / 4")
+        self.step_badge.setStyleSheet(
+            "font-size: 15px; font-weight: 700; color: #3949ab; letter-spacing: 0.02em;"
+        )
         top.addWidget(self.step_badge)
         top.addStretch(1)
-        close_btn = QPushButton("✕")
-        close_btn.setFixedSize(32, 32)
-        close_btn.setCursor(Qt.PointingHandCursor)
-        close_btn.setStyleSheet(
-            "QPushButton { border: none; border-radius: 16px; background: #eee; font-size: 16px; }"
-            "QPushButton:hover { background: #f88; color: white; }"
-        )
-        close_btn.clicked.connect(self.close)
-        top.addWidget(close_btn)
         layout.addLayout(top)
+        layout.addSpacing(16)
 
-        self.title_label = QLabel("Select your account")
-        self.title_label.setStyleSheet("font-size: 20px; font-weight: 700; color: #111;")
+        self.title_label = QLabel("Register your extension")
+        self.title_label.setAlignment(Qt.AlignHCenter)
+        self.title_label.setStyleSheet(
+            "font-size: 26px; font-weight: 700; color: #0d1117; padding: 8px 12px 4px 12px;"
+        )
         layout.addWidget(self.title_label)
 
-        self.sub_label = QLabel("Choose the Chrome profile you registered with the extension.")
+        self.sub_label = QLabel("")
+        self.sub_label.setAlignment(Qt.AlignHCenter)
         self.sub_label.setWordWrap(True)
-        self.sub_label.setStyleSheet("font-size: 13px; color: #444;")
+        self.sub_label.setStyleSheet(
+            "font-size: 16px; font-weight: 700; color: #37474f; line-height: 1.45; padding: 4px 24px 8px 24px;"
+        )
         layout.addWidget(self.sub_label)
 
         self.stack_host = QWidget()
         self.stack_host.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
         host_layout = QVBoxLayout(self.stack_host)
-        host_layout.setContentsMargins(0, 8, 0, 0)
+        host_layout.setContentsMargins(8, 20, 8, 8)
         self.stack = QStackedWidget()
         host_layout.addWidget(self.stack)
         layout.addWidget(self.stack_host, stretch=1)
@@ -141,13 +204,19 @@ class PrepWizardWindow(QWidget):
         self._page1 = self._build_step1()
         self._page2 = self._build_step2()
         self._page3 = self._build_step3()
+        self._page4 = self._build_step4()
         self.stack.addWidget(self._page1)
         self.stack.addWidget(self._page2)
         self.stack.addWidget(self._page3)
+        self.stack.addWidget(self._page4)
 
+        layout.addSpacing(8)
         self.bottom_hint = QLabel("")
         self.bottom_hint.setWordWrap(True)
-        self.bottom_hint.setStyleSheet("font-size: 11px; color: #666;")
+        self.bottom_hint.setAlignment(Qt.AlignHCenter)
+        self.bottom_hint.setStyleSheet(
+            "font-size: 14px; font-weight: 700; color: #546e7a; padding: 12px 20px 4px 20px; line-height: 1.4;"
+        )
         layout.addWidget(self.bottom_hint)
 
     def _bridge_unreachable(self) -> bool:
@@ -160,165 +229,304 @@ class PrepWizardWindow(QWidget):
     def _build_step1(self) -> QWidget:
         page = QWidget()
         v = QVBoxLayout(page)
-        v.setSpacing(12)
+        v.setContentsMargins(16, 8, 16, 24)
+        v.setSpacing(22)
+        v.setAlignment(Qt.AlignHCenter)
+        v.addStretch(1)
+        self.step1_instructions = QLabel(
+            "1. Open the Chrome window where you want to use ChatGPT.\n"
+            "2. In the Interview Assistant extension popup, click Register."
+        )
+        self.step1_instructions.setAlignment(Qt.AlignHCenter)
+        self.step1_instructions.setWordWrap(True)
+        self.step1_instructions.setStyleSheet(
+            "font-size: 17px; color: #263238; line-height: 1.55; padding: 12px 20px;"
+        )
+        v.addWidget(self.step1_instructions)
         self.step1_error = QLabel("")
+        self.step1_error.setAlignment(Qt.AlignHCenter)
         self.step1_error.setWordWrap(True)
-        self.step1_error.setStyleSheet("color: #c62828; font-size: 13px;")
+        self.step1_error.setStyleSheet(
+            "color: #b71c1c; font-size: 16px; font-weight: 700; padding: 12px 20px; line-height: 1.45;"
+        )
         self.step1_error.hide()
         v.addWidget(self.step1_error)
-
-        scroll = QScrollArea()
-        scroll.setWidgetResizable(True)
-        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
-        scroll.setFrameShape(QFrame.NoFrame)
-        scroll.setStyleSheet("QScrollArea { background: transparent; border: none; }")
-        inner = QWidget()
-        self.chips_layout = QHBoxLayout(inner)
-        self.chips_layout.setSpacing(12)
-        self.chips_layout.setAlignment(Qt.AlignLeft)
-        scroll.setWidget(inner)
-        v.addWidget(scroll, stretch=1)
+        self.step1_success = QLabel("")
+        self.step1_success.setAlignment(Qt.AlignHCenter)
+        self.step1_success.setWordWrap(True)
+        self.step1_success.setStyleSheet(
+            "color: #1b5e20; font-size: 17px; font-weight: 700; padding: 12px 20px; line-height: 1.45;"
+        )
+        self.step1_success.hide()
+        v.addWidget(self.step1_success)
+        self.step1_wait_hint = QLabel("")
+        self.step1_wait_hint.setAlignment(Qt.AlignHCenter)
+        self.step1_wait_hint.setWordWrap(True)
+        self.step1_wait_hint.setStyleSheet(
+            "font-size: 15px; font-weight: 700; color: #455a64; padding: 10px 24px; line-height: 1.5;"
+        )
+        self.step1_wait_hint.hide()
+        v.addWidget(self.step1_wait_hint)
+        self.step1_retry = QPushButton("Wait again")
+        self.step1_retry.setMinimumHeight(44)
+        self.step1_retry.setMinimumWidth(200)
+        self.step1_retry.setCursor(Qt.PointingHandCursor)
+        self.step1_retry.setStyleSheet(
+            "QPushButton { padding: 12px 28px; border-radius: 12px; background: #eceff1; color: #263238; "
+            "font-weight: 700; font-size: 15px; border: none; }"
+            "QPushButton:hover { background: #cfd8dc; }"
+        )
+        self.step1_retry.hide()
+        self.step1_retry.clicked.connect(self._start_register_wait_thread)
+        v.addWidget(self.step1_retry, alignment=Qt.AlignHCenter)
+        v.addStretch(2)
         return page
 
     def _build_step2(self) -> QWidget:
         page = QWidget()
         v = QVBoxLayout(page)
-        v.setSpacing(12)
+        v.setContentsMargins(16, 8, 16, 24)
+        v.setSpacing(22)
+        v.setAlignment(Qt.AlignHCenter)
+        v.addStretch(1)
+        self.step2_waiting = QLabel("")
+        self.step2_waiting.setAlignment(Qt.AlignHCenter)
+        self.step2_waiting.setWordWrap(True)
+        self.step2_waiting.setStyleSheet(
+            "font-size: 17px; color: #455a64; padding: 16px 28px; line-height: 1.5; font-weight: 700;"
+        )
+        self.step2_waiting.hide()
+        v.addWidget(self.step2_waiting)
         self.step2_error = QLabel("")
+        self.step2_error.setAlignment(Qt.AlignHCenter)
         self.step2_error.setWordWrap(True)
-        self.step2_error.setStyleSheet("color: #c62828; font-size: 13px;")
+        self.step2_error.setStyleSheet(
+            "color: #b71c1c; font-size: 16px; font-weight: 700; padding: 12px 24px; line-height: 1.45;"
+        )
         self.step2_error.hide()
         v.addWidget(self.step2_error)
-        self.step2_success = QLabel("")
-        self.step2_success.setWordWrap(True)
-        self.step2_success.setStyleSheet("color: #2e7d32; font-size: 13px;")
-        self.step2_success.hide()
-        v.addWidget(self.step2_success)
         self.btn_resume_summary = QPushButton("Get resume summary")
+        self.btn_resume_summary.setMinimumHeight(52)
+        self.btn_resume_summary.setMinimumWidth(300)
         self.btn_resume_summary.setCursor(Qt.PointingHandCursor)
         self.btn_resume_summary.setStyleSheet(
-            "QPushButton { padding: 12px 20px; border-radius: 12px; background: #3949ab; color: white; "
-            "font-weight: 600; font-size: 14px; border: none; }"
+            "QPushButton { padding: 14px 28px; border-radius: 14px; background: #3949ab; color: white; "
+            "font-weight: 700; font-size: 16px; border: none; }"
             "QPushButton:hover { background: #5c6bc0; }"
             "QPushButton:pressed { background: #283593; }"
-            "QPushButton:disabled { background: #aaa; }"
+            "QPushButton:disabled { background: #9e9e9e; color: #eceff1; }"
         )
         self.btn_resume_summary.clicked.connect(self._on_resume_summary_clicked)
         v.addWidget(self.btn_resume_summary)
-        self.btn_refresh_resume = QPushButton("Refresh from extension")
-        self.btn_refresh_resume.setFlat(True)
-        self.btn_refresh_resume.setCursor(Qt.PointingHandCursor)
-        self.btn_refresh_resume.setStyleSheet("color: #3949ab; font-size: 12px; text-align: left;")
-        self.btn_refresh_resume.clicked.connect(self._prepare_step2)
-        v.addWidget(self.btn_refresh_resume)
-        v.addStretch(1)
+        self.step2_success = QLabel("")
+        self.step2_success.setAlignment(Qt.AlignHCenter)
+        self.step2_success.setWordWrap(True)
+        self.step2_success.setStyleSheet(
+            "color: #1b5e20; font-size: 16px; font-weight: 700; padding: 12px 24px; line-height: 1.45;"
+        )
+        self.step2_success.hide()
+        v.addWidget(self.step2_success)
+        v.addStretch(2)
         return page
 
     def _build_step3(self) -> QWidget:
         page = QWidget()
         v = QVBoxLayout(page)
-        v.setSpacing(12)
+        v.setContentsMargins(16, 8, 16, 24)
+        v.setSpacing(22)
+        v.setAlignment(Qt.AlignHCenter)
+        v.addStretch(1)
+        self.step3_waiting = QLabel("")
+        self.step3_waiting.setAlignment(Qt.AlignHCenter)
+        self.step3_waiting.setWordWrap(True)
+        self.step3_waiting.setStyleSheet(
+            "font-size: 17px; color: #455a64; padding: 16px 28px; line-height: 1.5; font-weight: 700;"
+        )
+        self.step3_waiting.hide()
+        v.addWidget(self.step3_waiting)
         self.step3_error = QLabel("")
+        self.step3_error.setAlignment(Qt.AlignHCenter)
         self.step3_error.setWordWrap(True)
-        self.step3_error.setStyleSheet("color: #c62828; font-size: 13px;")
+        self.step3_error.setStyleSheet(
+            "color: #b71c1c; font-size: 16px; font-weight: 700; padding: 12px 24px; line-height: 1.45;"
+        )
         self.step3_error.hide()
         v.addWidget(self.step3_error)
-        self.step3_success = QLabel("")
-        self.step3_success.setWordWrap(True)
-        self.step3_success.setStyleSheet("color: #2e7d32; font-size: 13px;")
-        self.step3_success.hide()
-        v.addWidget(self.step3_success)
         self.btn_jd_summary = QPushButton("Get job description summary")
+        self.btn_jd_summary.setMinimumHeight(52)
+        self.btn_jd_summary.setMinimumWidth(300)
         self.btn_jd_summary.setCursor(Qt.PointingHandCursor)
         self.btn_jd_summary.setStyleSheet(
-            "QPushButton { padding: 12px 20px; border-radius: 12px; background: #3949ab; color: white; "
-            "font-weight: 600; font-size: 14px; border: none; }"
+            "QPushButton { padding: 14px 28px; border-radius: 14px; background: #3949ab; color: white; "
+            "font-weight: 700; font-size: 16px; border: none; }"
             "QPushButton:hover { background: #5c6bc0; }"
             "QPushButton:pressed { background: #283593; }"
-            "QPushButton:disabled { background: #aaa; }"
+            "QPushButton:disabled { background: #9e9e9e; color: #eceff1; }"
         )
         self.btn_jd_summary.clicked.connect(self._on_jd_summary_clicked)
         v.addWidget(self.btn_jd_summary)
-        self.btn_refresh_jd = QPushButton("Refresh from extension")
-        self.btn_refresh_jd.setFlat(True)
-        self.btn_refresh_jd.setCursor(Qt.PointingHandCursor)
-        self.btn_refresh_jd.setStyleSheet("color: #3949ab; font-size: 12px; text-align: left;")
-        self.btn_refresh_jd.clicked.connect(self._prepare_step3)
-        v.addWidget(self.btn_refresh_jd)
-        v.addStretch(1)
+        self.step3_success = QLabel("")
+        self.step3_success.setAlignment(Qt.AlignHCenter)
+        self.step3_success.setWordWrap(True)
+        self.step3_success.setStyleSheet(
+            "color: #1b5e20; font-size: 16px; font-weight: 700; padding: 12px 24px; line-height: 1.45;"
+        )
+        self.step3_success.hide()
+        v.addWidget(self.step3_success)
+        v.addStretch(2)
         return page
+
+    def _build_step4(self) -> QWidget:
+        page = QWidget()
+        v = QVBoxLayout(page)
+        v.setContentsMargins(16, 8, 16, 24)
+        v.setSpacing(22)
+        v.setAlignment(Qt.AlignHCenter)
+        v.addStretch(1)
+        self.step4_waiting = QLabel("")
+        self.step4_waiting.setAlignment(Qt.AlignHCenter)
+        self.step4_waiting.setWordWrap(True)
+        self.step4_waiting.setStyleSheet(
+            "font-size: 17px; color: #455a64; padding: 16px 28px; line-height: 1.5; font-weight: 700;"
+        )
+        self.step4_waiting.hide()
+        v.addWidget(self.step4_waiting)
+        self.step4_error = QLabel("")
+        self.step4_error.setAlignment(Qt.AlignHCenter)
+        self.step4_error.setWordWrap(True)
+        self.step4_error.setStyleSheet(
+            "color: #b71c1c; font-size: 16px; font-weight: 700; padding: 12px 24px; line-height: 1.45;"
+        )
+        self.step4_error.hide()
+        v.addWidget(self.step4_error)
+        self.btn_interview_setup = QPushButton("Prepare ChatGPT for interview")
+        self.btn_interview_setup.setMinimumHeight(52)
+        self.btn_interview_setup.setMinimumWidth(300)
+        self.btn_interview_setup.setCursor(Qt.PointingHandCursor)
+        self.btn_interview_setup.setStyleSheet(
+            "QPushButton { padding: 14px 28px; border-radius: 14px; background: #3949ab; color: white; "
+            "font-weight: 700; font-size: 16px; border: none; }"
+            "QPushButton:hover { background: #5c6bc0; }"
+            "QPushButton:pressed { background: #283593; }"
+            "QPushButton:disabled { background: #9e9e9e; color: #eceff1; }"
+        )
+        self.btn_interview_setup.clicked.connect(self._on_interview_setup_clicked)
+        v.addWidget(self.btn_interview_setup)
+        self.step4_success = QLabel("")
+        self.step4_success.setAlignment(Qt.AlignHCenter)
+        self.step4_success.setWordWrap(True)
+        self.step4_success.setStyleSheet(
+            "color: #1b5e20; font-size: 16px; font-weight: 700; padding: 12px 24px; line-height: 1.45;"
+        )
+        self.step4_success.hide()
+        v.addWidget(self.step4_success)
+        v.addStretch(2)
+        return page
+
+    def closeEvent(self, event) -> None:  # noqa: N802
+        self._abandon_register_wait = True
+        self._resume_listen_timer.stop()
+        self._jd_listen_timer.stop()
+        self._step4_listen_timer.stop()
+        self._prep_poll_timer.stop()
+        super().closeEvent(event)
+
+    def shutdown_for_handoff(self) -> None:
+        """Stop timers/animation before the wizard widget is destroyed (avoids stray timeouts)."""
+        self._abandon_register_wait = True
+        self._resume_listen_timer.stop()
+        self._jd_listen_timer.stop()
+        self._step4_listen_timer.stop()
+        self._prep_poll_timer.stop()
+        anim = self._fade_anim
+        if anim is not None:
+            try:
+                anim.stop()
+            except Exception:
+                pass
+            self._fade_anim = None
 
     def showEvent(self, event) -> None:  # noqa: N802
         super().showEvent(event)
-        self._reload_step1()
-
-    def _reload_step1(self) -> None:
-        self._clear_layout(self.chips_layout)
-        self.step1_error.hide()
-        if self._bridge_unreachable():
-            self.step1_error.setText("Python app not reachable. Start live.py first.")
-            self.step1_error.show()
+        if self.stack.currentIndex() != 0 or self._step1_advancing:
             return
+        if self._reg_thread is not None and self._reg_thread.isRunning():
+            return
+        self._reset_step1_baseline_from_bridge()
+        self._start_register_wait_thread()
+
+    def _reset_step1_baseline_from_bridge(self) -> None:
+        self.step1_success.hide()
+        self.step1_error.hide()
+        self.step1_retry.hide()
+        self.step1_wait_hint.hide()
         try:
             data = _http_get_json(self.bridge_base, "/registered-clients")
         except OSError:
-            self.step1_error.setText("Python app not reachable. Start live.py first.")
-            self.step1_error.show()
+            self._register_seq_baseline = 0
             return
-        clients = data.get("clients") or []
-        if not clients:
-            self.step1_error.setText("No registered clients. Open the extension popup and click Register.")
-            self.step1_error.show()
+        ev = data.get("register_event") or {}
+        self._register_seq_baseline = int(ev.get("seq") or 0)
+
+    def _start_register_wait_thread(self) -> None:
+        if self._abandon_register_wait or self._step1_advancing or self.stack.currentIndex() != 0:
             return
-        for c in clients:
-            if not isinstance(c, dict):
-                continue
-            cid = str(c.get("client_id", "")).strip()
-            if not cid:
-                continue
-            label = (c.get("email") or c.get("label") or cid[:8]).strip()
-            btn = QPushButton(label)
-            btn.setMinimumHeight(52)
-            btn.setCursor(Qt.PointingHandCursor)
-            btn.setStyleSheet(
-                "QPushButton {"
-                "  border-radius: 22px;"
-                "  padding: 10px 22px;"
-                "  background: #eef1ff;"
-                "  color: #1a1d23;"
-                "  border: 2px solid #c5cae9;"
-                "  font-size: 15px;"
-                "}"
-                "QPushButton:hover { background: #dde3ff; border-color: #3949ab; }"
-                "QPushButton:pressed { background: #c5cae9; }"
+        if self._reg_thread is not None and self._reg_thread.isRunning():
+            return
+        self.step1_error.hide()
+        self.step1_retry.hide()
+        self.step1_success.hide()
+        self.step1_wait_hint.setText(
+            "Waiting on the bridge for your next Register click in the extension (no background polling)."
+        )
+        self.step1_wait_hint.show()
+        since = self._register_seq_baseline
+        self._reg_thread = _WaitRegisterThread(self.bridge_base, since, self)
+        self._reg_thread.outcome.connect(self._on_register_wait_outcome)
+        self._reg_thread.finished.connect(self._on_register_thread_finished)
+        self._reg_thread.start()
+
+    def _on_register_thread_finished(self) -> None:
+        self._reg_thread = None
+
+    def _on_register_wait_outcome(self, payload: dict[str, Any]) -> None:
+        self.step1_wait_hint.hide()
+        if self._abandon_register_wait or self.stack.currentIndex() != 0 or self._step1_advancing:
+            return
+        if payload.get("ok") is False:
+            self.step1_error.setText(
+                f"Could not reach the bridge ({payload.get('error', '')}). Start live.py, then Wait again."
             )
-            btn.clicked.connect(lambda _=False, i=cid, lbl=label: self._on_client_chosen(i, lbl))
-            self.chips_layout.addWidget(btn)
-
-    @staticmethod
-    def _clear_layout(layout: QHBoxLayout | QVBoxLayout) -> None:
-        while layout.count():
-            item = layout.takeAt(0)
-            w = item.widget()
-            if w is not None:
-                w.deleteLater()
-
-    def _on_client_chosen(self, client_id: str, display: str) -> None:
-        if self._bridge_unreachable():
-            self.step1_error.setText("Python app not reachable. Start live.py first.")
             self.step1_error.show()
+            self.step1_retry.show()
             return
-        body, status = _http_post_json(self.bridge_base, "/selected-client", {"client_id": client_id})
-        if status >= 400 or not body.get("ok"):
-            self.step1_error.setText(body.get("error", "Could not select client."))
-            self.step1_error.show()
+        timed_out = bool(payload.get("timed_out"))
+        data = payload.get("registry") or {}
+        ev = data.get("register_event") or {}
+        if not timed_out:
+            msg = (ev.get("message") or "").strip() or "[Extension] is registered."
+            self._advance_step1_from_bridge(data, msg)
             return
-        self.selected_client_id = client_id
-        self.display_email = display
-        _, st2 = _http_post_json(self.bridge_base, "/sync-store-to-selected-client", {})
-        if st2 >= 400:
-            pass
-        self._animate_to_step(1)
+        self.step1_error.setText(
+            "No new Register yet. Open the Interview Assistant extension, click Register, then Wait again."
+        )
+        self.step1_error.show()
+        self.step1_retry.show()
+
+    def _advance_step1_from_bridge(self, data: dict[str, Any], message: str) -> None:
+        if self._step1_advancing:
+            return
+        self._step1_advancing = True
+        sel = str(data.get("selected_client_id") or "").strip()
+        ev = data.get("register_event") or {}
+        cid = str(ev.get("client_id") or "").strip()
+        self.selected_client_id = cid or sel
+        self.display_email = ""
+        self.step1_error.hide()
+        self.step1_success.setText(message)
+        self.step1_success.show()
+        _http_post_json(self.bridge_base, "/sync-store-to-selected-client", {})
+        QTimer.singleShot(900, lambda: self._animate_to_step(1))
 
     def _animate_to_step(self, index: int) -> None:
         """Cross-fade to stacked page index."""
@@ -362,18 +570,42 @@ class PrepWizardWindow(QWidget):
         self._fade_anim.finished.connect(cleanup)
         self._fade_anim.start()
 
-        self.step_badge.setText(f"{index + 1} / 3")
+        self.step_badge.setText(f"{index + 1} / 4")
         if index == 0:
-            self.title_label.setText("Select your account")
-            self.sub_label.setText("Choose the Chrome profile you registered with the extension.")
+            self._resume_listen_timer.stop()
+            self._jd_listen_timer.stop()
+            self._step4_listen_timer.stop()
+            self._step1_advancing = False
+            self.title_label.setText("Register your extension")
+            self.sub_label.setText(
+                "After you click Register in the extension, this app continues automatically (one long wait, not polling)."
+            )
+            self.sub_label.show()
+            self.bottom_hint.setText("")
+            self._reset_step1_baseline_from_bridge()
+            self._start_register_wait_thread()
         elif index == 1:
+            self._jd_listen_timer.stop()
+            self._step4_listen_timer.stop()
             self.title_label.setText("Resume summary")
-            self.sub_label.setText("We ask ChatGPT (via your extension) to summarize your resume.")
+            self.sub_label.hide()
+            self.bottom_hint.setText("")
             self._prepare_step2()
-        else:
+        elif index == 2:
+            self._resume_listen_timer.stop()
+            self._step4_listen_timer.stop()
             self.title_label.setText("Job description summary")
-            self.sub_label.setText("Same ChatGPT tab; we start a new chat for the JD.")
+            self.sub_label.hide()
+            self.bottom_hint.setText("")
             self._prepare_step3()
+        else:
+            self._resume_listen_timer.stop()
+            self._jd_listen_timer.stop()
+            self.title_label.setText("Set Gpt for interview")
+            self.sub_label.setText("Processing.")
+            self.sub_label.show()
+            self.bottom_hint.setText("")
+            self._prepare_step4()
 
     def _client_record(self) -> dict[str, Any] | None:
         try:
@@ -385,53 +617,167 @@ class PrepWizardWindow(QWidget):
                 return c
         return None
 
+    def _resume_text_for_selected(self) -> str:
+        """Use this wizard session's selected client only (never another profile's global store)."""
+        rec = self._client_record()
+        from_reg = (rec.get("resume_text") or "").strip() if rec else ""
+        if from_reg:
+            return from_reg
+        cid = (self.selected_client_id or "").strip()
+        if not cid:
+            return ""
+        try:
+            path = f"/context?client_id={quote(cid, safe='')}"
+            data = _http_get_json(self.bridge_base, path)
+            return (data.get("resume") or "").strip()
+        except OSError:
+            return ""
+
+    def _jd_text_for_selected(self) -> str:
+        rec = self._client_record()
+        from_reg = (rec.get("jd_text") or "").strip() if rec else ""
+        if from_reg:
+            return from_reg
+        cid = (self.selected_client_id or "").strip()
+        if not cid:
+            return ""
+        try:
+            path = f"/context?client_id={quote(cid, safe='')}"
+            data = _http_get_json(self.bridge_base, path)
+            return (data.get("job_description") or "").strip()
+        except OSError:
+            return ""
+
+    def _template_for_selected(self, key: str) -> str:
+        """Fetch a per-client prompt template from the bridge (extension is the source of truth)."""
+        if key not in _TEMPLATE_KEYS:
+            return ""
+        rec = self._client_record()
+        if rec:
+            from_reg = str(rec.get(f"tpl_{key}") or "").strip()
+            if from_reg:
+                return from_reg
+        cid = (self.selected_client_id or "").strip()
+        if not cid:
+            return ""
+        try:
+            path = f"/context?client_id={quote(cid, safe='')}"
+            data = _http_get_json(self.bridge_base, path)
+            templates = data.get("templates") or {}
+            if isinstance(templates, dict):
+                return str(templates.get(key) or "").strip()
+        except OSError:
+            return ""
+        return ""
+
     def _prepare_step2(self) -> None:
-        self.step2_error.hide()
         self.step2_success.hide()
         self.btn_resume_summary.setEnabled(True)
         self.btn_resume_summary.setText("Get resume summary")
-        rec = self._client_record()
-        resume = ""
-        if rec:
-            resume = (rec.get("resume_text") or "").strip()
+        resume = self._resume_text_for_selected()
+        template = self._template_for_selected("resume_summary")
+        missing: list[str] = []
         if not resume:
-            self.step2_error.setText(
-                "No resume stored for this account. Open the extension, expand Resume, paste your resume, "
-                "then return here and we will sync when you pick the account again — or paste in extension first, "
-                "then re-open this app."
-            )
-            self.step2_error.show()
+            missing.append("resume in the extension")
+        if not template:
+            missing.append("Prompt template #1 (resume summary) in the extension")
+        if missing:
+            self.step2_waiting.setText("Waiting for: " + ", ".join(missing) + "…")
+            self.step2_waiting.show()
+            self.step2_error.hide()
             self.btn_resume_summary.setEnabled(False)
+            if self.stack.currentIndex() == 1 and not self._waiting_job_id:
+                if not self._resume_listen_timer.isActive():
+                    self._resume_listen_timer.start()
             return
+        self._resume_listen_timer.stop()
+        self.step2_waiting.hide()
+        self.step2_error.hide()
+
+    def _tick_resume_listen(self) -> None:
+        if self.stack.currentIndex() != 1 or self._waiting_job_id:
+            self._resume_listen_timer.stop()
+            return
+        self._prepare_step2()
+
+    def _tick_jd_listen(self) -> None:
+        if self.stack.currentIndex() != 2 or self._waiting_job_id:
+            self._jd_listen_timer.stop()
+            return
+        self._prepare_step3()
+
+    def _tick_step4_listen(self) -> None:
+        if self.stack.currentIndex() != 3 or self._waiting_job_id:
+            self._step4_listen_timer.stop()
+            return
+        self._prepare_step4()
+
+    def _prepare_step4(self) -> None:
+        self.step4_success.hide()
+        self.btn_interview_setup.setEnabled(True)
+        self.btn_interview_setup.setText("Prepare ChatGPT for interview")
+        jd = self._jd_text_for_selected()
+        initial_tpl = self._template_for_selected("initial_interview")
+        chunk_tpl = self._template_for_selected("chunk_interview")
+        missing: list[str] = []
+        if not jd:
+            missing.append("job description in the extension")
+        if not initial_tpl:
+            missing.append("Prompt template #3 (initial interview) in the extension")
+        if not chunk_tpl:
+            missing.append("Prompt template #4 (per-caption interview) in the extension")
+        if missing:
+            self.step4_waiting.setText("Waiting for: " + ", ".join(missing) + "…")
+            self.step4_waiting.show()
+            self.step4_error.hide()
+            self.btn_interview_setup.setEnabled(False)
+            if self.stack.currentIndex() == 3 and not self._waiting_job_id:
+                if not self._step4_listen_timer.isActive():
+                    self._step4_listen_timer.start()
+            return
+        self._step4_listen_timer.stop()
+        self.step4_waiting.hide()
+        self.step4_error.hide()
 
     def _prepare_step3(self) -> None:
-        self.step3_error.hide()
         self.step3_success.hide()
         self.btn_jd_summary.setEnabled(True)
         self.btn_jd_summary.setText("Get job description summary")
-        rec = self._client_record()
-        jd = ""
-        if rec:
-            jd = (rec.get("jd_text") or "").strip()
+        jd = self._jd_text_for_selected()
+        template = self._template_for_selected("jd_summary")
+        missing: list[str] = []
         if not jd:
-            self.step3_error.setText(
-                "No job description for this account. Paste JD in the extension (JD panel), "
-                "then restart the wizard or re-select your account after pasting."
-            )
-            self.step3_error.show()
+            missing.append("job description in the extension")
+        if not template:
+            missing.append("Prompt template #2 (JD summary) in the extension")
+        if missing:
+            self.step3_waiting.setText("Waiting for: " + ", ".join(missing) + "…")
+            self.step3_waiting.show()
+            self.step3_error.hide()
             self.btn_jd_summary.setEnabled(False)
+            if self.stack.currentIndex() == 2 and not self._waiting_job_id:
+                if not self._jd_listen_timer.isActive():
+                    self._jd_listen_timer.start()
             return
+        self._jd_listen_timer.stop()
+        self.step3_waiting.hide()
+        self.step3_error.hide()
 
     def _on_resume_summary_clicked(self) -> None:
-        rec = self._client_record()
-        resume = (rec.get("resume_text") or "").strip() if rec else ""
-        if not resume:
+        resume = self._resume_text_for_selected()
+        template = self._template_for_selected("resume_summary")
+        if not resume or not template:
             return
-        prompt = _build_resume_summary_prompt(resume)
+        cid = (self.selected_client_id or "").strip()
+        if not cid:
+            self.step2_error.setText("No registered Chrome client id. Finish step 1 in this profile first.")
+            self.step2_error.show()
+            return
+        prompt = _apply_resume_summary_template(template, resume)
         body, status = _http_post_json(
             self.bridge_base,
             "/prep/start",
-            {"phase": "resume_summary", "prompt": prompt, "open_new_tab": True},
+            {"phase": "resume_summary", "prompt": prompt, "open_new_tab": True, "client_id": cid},
         )
         if status >= 400 or not body.get("ok"):
             self.step2_error.setText("Could not start summary job. Is the extension installed?")
@@ -445,41 +791,90 @@ class PrepWizardWindow(QWidget):
         self._waiting_job_id = job_id
         self.btn_resume_summary.setEnabled(False)
         self.btn_resume_summary.setText("Working… open ChatGPT if prompted")
+        self._resume_listen_timer.stop()
+        self.step2_waiting.hide()
         self.step2_error.hide()
         self.step2_success.hide()
         self._prep_poll_timer.start()
 
     def _on_jd_summary_clicked(self) -> None:
-        rec = self._client_record()
-        jd = (rec.get("jd_text") or "").strip() if rec else ""
-        if not jd:
+        jd = self._jd_text_for_selected()
+        template = self._template_for_selected("jd_summary")
+        if not jd or not template:
             return
-        prompt = _build_jd_summary_prompt(jd)
+        cid = (self.selected_client_id or "").strip()
+        if not cid:
+            self.step3_error.setText("No registered Chrome client id. Finish step 1 in this profile first.")
+            self.step3_error.show()
+            return
+        prompt = _apply_jd_summary_template(template, jd)
         body, status = _http_post_json(
             self.bridge_base,
             "/prep/start",
-            {"phase": "jd_summary", "prompt": prompt, "open_new_tab": False},
+            {"phase": "jd_summary", "prompt": prompt, "open_new_tab": False, "client_id": cid},
         )
         if status >= 400 or not body.get("ok"):
-            self.step3_error.setText("Could not start JD summary job.")
+            self.step3_error.setText("Could not start summary job. Is the extension installed?")
             self.step3_error.show()
             return
         job_id = str(body.get("job_id", "")).strip()
         if not job_id:
+            self.step3_error.setText("Bridge did not return a job id.")
+            self.step3_error.show()
             return
         self._waiting_job_id = job_id
         self.btn_jd_summary.setEnabled(False)
-        self.btn_jd_summary.setText("Working…")
+        self.btn_jd_summary.setText("Working… open ChatGPT if prompted")
+        self._jd_listen_timer.stop()
+        self.step3_waiting.hide()
         self.step3_error.hide()
         self.step3_success.hide()
+        self._prep_poll_timer.start()
+
+    def _on_interview_setup_clicked(self) -> None:
+        jd = self._jd_text_for_selected()
+        initial_tpl = self._template_for_selected("initial_interview")
+        chunk_tpl = self._template_for_selected("chunk_interview")
+        if not jd or not initial_tpl or not chunk_tpl:
+            return
+        cid = (self.selected_client_id or "").strip()
+        if not cid:
+            self.step4_error.setText("No registered Chrome client id. Finish step 1 in this profile first.")
+            self.step4_error.show()
+            return
+        resume = self._resume_text_for_selected()
+        prompt = _apply_initial_interview_template(initial_tpl, resume, jd)
+        body, status = _http_post_json(
+            self.bridge_base,
+            "/prep/start",
+            {"phase": "interview_gpt_setup", "prompt": prompt, "open_new_tab": False, "client_id": cid},
+        )
+        if status >= 400 or not body.get("ok"):
+            self.step4_error.setText("Could not start summary job. Is the extension installed?")
+            self.step4_error.show()
+            return
+        job_id = str(body.get("job_id", "")).strip()
+        if not job_id:
+            self.step4_error.setText("Bridge did not return a job id.")
+            self.step4_error.show()
+            return
+        self._waiting_job_id = job_id
+        self.btn_interview_setup.setEnabled(False)
+        self.btn_interview_setup.setText("Working… open ChatGPT if prompted")
+        self._step4_listen_timer.stop()
+        self.step4_waiting.hide()
+        self.step4_error.hide()
+        self.step4_success.hide()
         self._prep_poll_timer.start()
 
     def _on_prep_poll_tick(self) -> None:
         if not self._waiting_job_id:
             self._prep_poll_timer.stop()
             return
+        cid = (self.selected_client_id or "").strip()
         try:
-            job = _http_get_json(self.bridge_base, "/prep/job")
+            job_path = "/prep/job" if not cid else f"/prep/job?client_id={quote(cid, safe='')}"
+            job = _http_get_json(self.bridge_base, job_path)
         except OSError:
             return
         if str(job.get("job_id", "")) != self._waiting_job_id:
@@ -497,21 +892,41 @@ class PrepWizardWindow(QWidget):
                 _http_post_json(self.bridge_base, "/prep/clear", {})
                 QTimer.singleShot(900, lambda: self._animate_to_step(2))
             elif idx == 2:
-                self.step3_success.setText("Job description summary saved. Opening interview…")
+                self.step3_success.setText("Job description summary saved. Continuing…")
                 self.step3_success.show()
+                _http_post_json(self.bridge_base, "/prep/clear", {})
+                QTimer.singleShot(900, lambda: self._animate_to_step(3))
+            elif idx == 3:
+                self.step4_success.setText("ChatGPT is ready. Opening interview…")
+                self.step4_success.show()
                 _http_post_json(self.bridge_base, "/prep/clear", {})
                 QTimer.singleShot(900, lambda: self.finished.emit(self.display_email, self.selected_client_id))
         else:
             err = str(job.get("error", "") or "Unknown error")
             if idx == 1:
+                self.step2_waiting.hide()
                 self.step2_error.setText(f"Summary failed: {err}")
                 self.step2_error.show()
                 self.btn_resume_summary.setEnabled(True)
                 self.btn_resume_summary.setText("Get resume summary")
                 _http_post_json(self.bridge_base, "/prep/clear", {})
+                self._prepare_step2()
             elif idx == 2:
-                self.step3_error.setText(f"JD summary failed: {err}")
+                self.step3_waiting.hide()
+                self.step3_error.setText(f"Summary failed: {err}")
                 self.step3_error.show()
                 self.btn_jd_summary.setEnabled(True)
                 self.btn_jd_summary.setText("Get job description summary")
                 _http_post_json(self.bridge_base, "/prep/clear", {})
+                self._prepare_step3()
+            elif idx == 3:
+                self.step4_waiting.hide()
+                self.step4_error.setText(f"Summary failed: {err}")
+                self.step4_error.show()
+                self.btn_interview_setup.setEnabled(True)
+                self.btn_interview_setup.setText("Prepare ChatGPT for interview")
+                _http_post_json(self.bridge_base, "/prep/clear", {})
+                self._prepare_step4()
+
+
+PrepWizardWindow = PrepWizardWidget  # backward-compatible name

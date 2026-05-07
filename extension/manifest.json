@@ -8,7 +8,8 @@
     "http://127.0.0.1:8765/*",
     "ws://127.0.0.1:8766/*",
     "https://chat.openai.com/*",
-    "https://chatgpt.com/*"
+    "https://chatgpt.com/*",
+    "https://www.chatgpt.com/*"
   ],
   "background": {
     "service_worker": "background.js"
@@ -19,7 +20,11 @@
   },
   "content_scripts": [
     {
-      "matches": ["https://chat.openai.com/*", "https://chatgpt.com/*"],
+      "matches": [
+        "https://chat.openai.com/*",
+        "https://chatgpt.com/*",
+        "https://www.chatgpt.com/*"
+      ],
       "js": ["content.js"],
       "run_at": "document_idle"
     }
