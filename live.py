@@ -23,10 +23,12 @@ from PySide6.QtWidgets import (
     QHBoxLayout,
     QLabel,
     QPushButton,
+    QSplitter,
     QScrollArea,
     QSizePolicy,
     QSlider,
     QStackedWidget,
+    QTextEdit,
     QToolButton,
     QVBoxLayout,
     QWidget,
@@ -116,6 +118,8 @@ _boundary_shift_candidate_hits = 0
 last_end_key_at = 0.0
 last_delete_key_at = 0.0
 END_KEY_COOLDOWN_SECONDS = 0.8
+HOME_KEY_COOLDOWN_SECONDS = 0.45
+last_home_key_at = 0.0
 
 # Last finalized GPT answer for global paste hotkeys (F9 = paste, Shift+F9 = select-all + delete + paste).
 last_gpt_answer_for_paste = ""
@@ -380,6 +384,17 @@ class InterviewWindow(QWidget):
         self.main_stack: QStackedWidget | None = None
         self.active_draft_label: QLabel | None = None
         self.active_draft_row: QWidget | None = None
+        self.active_draft_panel: QFrame | None = None
+        self._home_edit_active = False
+        self._frozen_draft_text = ""
+        self._caption_edit_text_edit: QTextEdit | None = None
+        self._caption_edit_panel: QFrame | None = None
+        self._caption_edit_cap_id: str | None = None
+        self._caption_edit_sent_once = False
+        self._allow_draft_updates_during_edit = False
+        self._splitter_initialized = False
+        self.gpt_result_history: list[str] = []
+        self.gpt_history_index = -1
         self.gpt_stream_row: QWidget | None = None
         self.gpt_stream_panel: QFrame | None = None
         self.gpt_stream_label: QLabel | None = None
@@ -464,12 +479,12 @@ class InterviewWindow(QWidget):
         topbar.addWidget(self.close_btn)
         shell_layout.addLayout(topbar)
 
-        self.scroll = QScrollArea()
-        self.scroll.setWidgetResizable(True)
-        self.scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
-        self.scroll.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
-        self.scroll.setFrameShape(QFrame.NoFrame)
-        self.scroll.setStyleSheet(
+        self.caption_scroll = QScrollArea()
+        self.caption_scroll.setWidgetResizable(True)
+        self.caption_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.caption_scroll.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        self.caption_scroll.setFrameShape(QFrame.NoFrame)
+        self.caption_scroll.setStyleSheet(
             "QScrollArea { background: transparent; border: none; }"
             "QScrollBar:vertical { width: 10px; background: rgba(0,0,0,24); border-radius: 5px; margin: 2px; }"
             "QScrollBar::handle:vertical { min-height: 24px; background: rgba(57,73,171,160); border-radius: 5px; }"
@@ -483,8 +498,8 @@ class InterviewWindow(QWidget):
         # Auto-scroll is gated on "interviewer is actively saying" (live caption draft updates).
         self._interviewer_speaking_until = 0.0
         self._interviewer_speaking_window_seconds = 2.0
-        self.scroll.viewport().installEventFilter(self)
-        sb = self.scroll.verticalScrollBar()
+        self.caption_scroll.viewport().installEventFilter(self)
+        sb = self.caption_scroll.verticalScrollBar()
         sb.installEventFilter(self)
         sb.actionTriggered.connect(self._on_scrollbar_user_action)
         sb.sliderPressed.connect(self._mark_user_scroll_activity)
@@ -496,13 +511,72 @@ class InterviewWindow(QWidget):
         self.content_layout.setContentsMargins(0, 0, 0, 0)
         self.content_layout.setSpacing(10)
         self.content_layout.addStretch(1)
-        self.scroll.setWidget(self.content)
+        self.caption_scroll.setWidget(self.content)
+
+        self.gpt_result_panel = QFrame()
+        self.gpt_result_panel.setObjectName("GptResultPanel")
+        self.gpt_result_panel.setStyleSheet(
+            "QFrame#GptResultPanel { background: rgba(255,255,255,0.55); border: 1px solid rgba(17,17,17,70); }"
+        )
+        gpt_layout = QVBoxLayout(self.gpt_result_panel)
+        gpt_layout.setContentsMargins(10, 10, 10, 10)
+        gpt_layout.setSpacing(6)
+        self.gpt_result_title = QLabel("0/0")
+        self.gpt_result_title.setStyleSheet("font-size: 12px; font-weight: 700; color: #333;")
+        self.gpt_result_body = QTextEdit()
+        self.gpt_result_body.setReadOnly(True)
+        self.gpt_result_body.setAcceptRichText(False)
+        self.gpt_result_body.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        self.gpt_result_body.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.gpt_result_body.setStyleSheet(
+            f"QTextEdit {{ color: {TEXT_COLOR}; background: transparent; border: none; font-size: 16px; font-weight: 700; }}"
+        )
+        controls_row = QHBoxLayout()
+        controls_row.setContentsMargins(0, 0, 0, 0)
+        controls_row.setSpacing(6)
+        self.gpt_copy_btn = QToolButton()
+        self.gpt_prev_btn = QToolButton()
+        self.gpt_next_btn = QToolButton()
+        self.gpt_copy_btn.setIcon(self._build_copy_glyph_svg_icon(14, "#455a64"))
+        self.gpt_prev_btn.setIcon(self._build_prev_chevron_svg_icon(14, "#455a64"))
+        self.gpt_next_btn.setIcon(self._build_next_chevron_svg_icon(14, "#455a64"))
+        self.gpt_prev_btn.setIconSize(QSize(14, 14))
+        self.gpt_next_btn.setIconSize(QSize(14, 14))
+        for _btn, _tip in (
+            (self.gpt_copy_btn, "Copy result"),
+            (self.gpt_prev_btn, "Previous result"),
+            (self.gpt_next_btn, "Next result"),
+        ):
+            _btn.setCursor(Qt.PointingHandCursor)
+            _btn.setToolTip(_tip)
+            _btn.setFixedSize(24, 24)
+            _btn.setStyleSheet(
+                "QToolButton { border: none; border-radius: 12px; background: transparent; font-weight: 700; }"
+                "QToolButton:hover { background: rgba(0, 0, 0, 0.10); }"
+            )
+        self.gpt_copy_btn.clicked.connect(self._copy_current_gpt_result)
+        self.gpt_prev_btn.clicked.connect(self._show_prev_gpt_result)
+        self.gpt_next_btn.clicked.connect(self._show_next_gpt_result)
+        controls_row.addWidget(self.gpt_copy_btn)
+        controls_row.addWidget(self.gpt_prev_btn)
+        controls_row.addWidget(self.gpt_next_btn)
+        controls_row.addStretch(1)
+        gpt_layout.addWidget(self.gpt_result_title)
+        gpt_layout.addWidget(self.gpt_result_body, 1)
+        gpt_layout.addLayout(controls_row)
+        self._refresh_gpt_history_nav()
+
+        self.interview_splitter = QSplitter(Qt.Orientation.Vertical)
+        self.interview_splitter.addWidget(self.caption_scroll)
+        self.interview_splitter.addWidget(self.gpt_result_panel)
+        self.interview_splitter.setChildrenCollapsible(False)
 
         self.interview_page = QWidget()
         interview_layout = QVBoxLayout(self.interview_page)
         interview_layout.setContentsMargins(0, 0, 0, 0)
         interview_layout.setSpacing(0)
-        interview_layout.addWidget(self.scroll)
+        interview_layout.addWidget(self.interview_splitter)
+        self.scroll = self.caption_scroll
 
         self.main_stack = QStackedWidget()
         self.main_stack.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
@@ -526,6 +600,10 @@ class InterviewWindow(QWidget):
         self.anim_timer = QTimer(self)
         self.anim_timer.timeout.connect(self.tick_status_animation)
         self.anim_timer.start(350)
+
+        self.caption_autoscroll_timer = QTimer(self)
+        self.caption_autoscroll_timer.timeout.connect(self._tick_caption_autoscroll)
+        self.caption_autoscroll_timer.start(500)
 
         self.resize_timer = QTimer(self)
         self.resize_timer.setSingleShot(True)
@@ -604,6 +682,7 @@ class InterviewWindow(QWidget):
             self.prep_widget.shutdown_for_handoff()
         if self.main_stack is not None:
             self.main_stack.setCurrentIndex(1)
+            QTimer.singleShot(0, self._apply_initial_splitter_sizes)
         restart_live_caption_exe()
 
         def _focus_session_window() -> None:
@@ -662,6 +741,54 @@ class InterviewWindow(QWidget):
 <rect x="9" y="9" width="13" height="13" rx="2" ry="2"/>
 <path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/>
 </svg>"""
+        renderer = QSvgRenderer(svg.encode("utf-8"))
+        pixmap = QPixmap(size, size)
+        pixmap.fill(Qt.GlobalColor.transparent)
+        painter = QPainter(pixmap)
+        renderer.render(painter)
+        painter.end()
+        return QIcon(pixmap)
+
+    @staticmethod
+    def _build_prev_chevron_svg_icon(size: int, color: str) -> QIcon:
+        svg = f"""<svg xmlns="http://www.w3.org/2000/svg" width="{size}" height="{size}" viewBox="0 0 24 24" fill="none" stroke="{color}" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round">
+<polyline points="15 18 9 12 15 6"/></svg>"""
+        renderer = QSvgRenderer(svg.encode("utf-8"))
+        pixmap = QPixmap(size, size)
+        pixmap.fill(Qt.GlobalColor.transparent)
+        painter = QPainter(pixmap)
+        renderer.render(painter)
+        painter.end()
+        return QIcon(pixmap)
+
+    @staticmethod
+    def _build_next_chevron_svg_icon(size: int, color: str) -> QIcon:
+        svg = f"""<svg xmlns="http://www.w3.org/2000/svg" width="{size}" height="{size}" viewBox="0 0 24 24" fill="none" stroke="{color}" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round">
+<polyline points="9 18 15 12 9 6"/></svg>"""
+        renderer = QSvgRenderer(svg.encode("utf-8"))
+        pixmap = QPixmap(size, size)
+        pixmap.fill(Qt.GlobalColor.transparent)
+        painter = QPainter(pixmap)
+        renderer.render(painter)
+        painter.end()
+        return QIcon(pixmap)
+
+    @staticmethod
+    def _build_x_cancel_svg_icon(size: int, color: str) -> QIcon:
+        svg = f"""<svg xmlns="http://www.w3.org/2000/svg" width="{size}" height="{size}" viewBox="0 0 24 24" fill="none" stroke="{color}" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
+<path d="M18 6L6 18M6 6l12 12"/></svg>"""
+        renderer = QSvgRenderer(svg.encode("utf-8"))
+        pixmap = QPixmap(size, size)
+        pixmap.fill(Qt.GlobalColor.transparent)
+        painter = QPainter(pixmap)
+        renderer.render(painter)
+        painter.end()
+        return QIcon(pixmap)
+
+    @staticmethod
+    def _build_send_plane_svg_icon(size: int, color: str) -> QIcon:
+        svg = f"""<svg xmlns="http://www.w3.org/2000/svg" width="{size}" height="{size}" viewBox="0 0 24 24" fill="{color}">
+<path d="M2 21l23-9L2 3v7l15 2-15 2v7z"/></svg>"""
         renderer = QSvgRenderer(svg.encode("utf-8"))
         pixmap = QPixmap(size, size)
         pixmap.fill(Qt.GlobalColor.transparent)
@@ -804,11 +931,83 @@ class InterviewWindow(QWidget):
     def showEvent(self, event):
         super().showEvent(event)
         self._sync_round_window_mask()
+        self._apply_initial_splitter_sizes()
 
     def resizeEvent(self, event):
         self._sync_round_window_mask()
         self.resize_timer.start(20)
+        if not self._splitter_initialized:
+            QTimer.singleShot(0, self._apply_initial_splitter_sizes)
         super().resizeEvent(event)
+
+    def _apply_initial_splitter_sizes(self) -> None:
+        if not hasattr(self, "interview_splitter") or self.interview_splitter is None:
+            return
+        total = max(1, self.interview_splitter.height())
+        top = max(120, int(total * 0.30))
+        bottom = max(180, total - top)
+        self.interview_splitter.setSizes([top, bottom])
+        self._splitter_initialized = True
+
+    def _tick_caption_autoscroll(self) -> None:
+        if self._home_edit_active:
+            return
+        bar = self.caption_scroll.verticalScrollBar()
+        bar.setValue(bar.maximum())
+
+    def _set_gpt_result_text(self, text: str) -> None:
+        self.gpt_result_body.setPlainText((text or "").strip() or " ")
+
+    def _refresh_gpt_history_nav(self) -> None:
+        if not hasattr(self, "gpt_prev_btn") or not hasattr(self, "gpt_next_btn"):
+            return
+        n = len(self.gpt_result_history)
+        idx = int(self.gpt_history_index)
+        self.gpt_prev_btn.setEnabled(n > 0 and idx > 0)
+        self.gpt_next_btn.setEnabled(n > 0 and idx >= 0 and idx < (n - 1))
+        if n <= 0 or idx < 0:
+            self.gpt_result_title.setText("0/0")
+        else:
+            self.gpt_result_title.setText(f"{idx + 1}/{n}")
+
+    def _push_gpt_result_history(self, text: str) -> None:
+        body = (text or "").strip()
+        if not body:
+            return
+        if self.gpt_result_history and self.gpt_result_history[-1] == body:
+            self.gpt_history_index = len(self.gpt_result_history) - 1
+            self._refresh_gpt_history_nav()
+            return
+        self.gpt_result_history.append(body)
+        self.gpt_history_index = len(self.gpt_result_history) - 1
+        self._refresh_gpt_history_nav()
+
+    def _copy_current_gpt_result(self) -> None:
+        txt = (self.gpt_result_body.toPlainText() or "").strip()
+        QApplication.clipboard().setText(txt)
+        self.gpt_copy_btn.setIcon(self._build_tick_svg_icon(14, "#2e7d32"))
+
+        def _restore_copy_icon() -> None:
+            try:
+                self.gpt_copy_btn.setIcon(self._build_copy_glyph_svg_icon(14, "#455a64"))
+            except Exception:
+                pass
+
+        QTimer.singleShot(900, _restore_copy_icon)
+
+    def _show_prev_gpt_result(self) -> None:
+        if self.gpt_history_index <= 0:
+            return
+        self.gpt_history_index -= 1
+        self._set_gpt_result_text(self.gpt_result_history[self.gpt_history_index])
+        self._refresh_gpt_history_nav()
+
+    def _show_next_gpt_result(self) -> None:
+        if self.gpt_history_index < 0 or self.gpt_history_index >= len(self.gpt_result_history) - 1:
+            return
+        self.gpt_history_index += 1
+        self._set_gpt_result_text(self.gpt_result_history[self.gpt_history_index])
+        self._refresh_gpt_history_nav()
 
     def bubble_width(self) -> int:
         inner = self.shell.width() - 28
@@ -914,6 +1113,9 @@ class InterviewWindow(QWidget):
         self.scroll_to_bottom()
 
     def show_or_update_draft(self, text: str):
+        if self._home_edit_active and not self._allow_draft_updates_during_edit:
+            self._frozen_draft_text = text or ""
+            return
         if self.active_draft_label is None:
             row, panel, label = self.create_row(
                 "right", with_copy_button=True, copy_tooltip="Copy GPT prompt"
@@ -923,6 +1125,7 @@ class InterviewWindow(QWidget):
             self.content_layout.insertWidget(stretch_index, row)
             panel.setFixedWidth(self.bubble_width())
             self.active_draft_row = row
+            self.active_draft_panel = panel
             self.active_draft_label = label
         else:
             self.active_draft_label.setText(text or " ")
@@ -935,7 +1138,6 @@ class InterviewWindow(QWidget):
             self._interviewer_speaking_until = time.time() + float(
                 getattr(self, "_interviewer_speaking_window_seconds", 2.0)
             )
-        self.scroll_to_bottom()
 
     def finalize_draft(self, text: str, clipboard_prompt: str | None = None):
         if self.active_draft_label is not None:
@@ -948,161 +1150,255 @@ class InterviewWindow(QWidget):
             )
             self.active_draft_label = None
             self.active_draft_row = None
-            self.scroll_to_bottom()
+            self.active_draft_panel = None
+            self._tick_caption_autoscroll()
             return
         self.add_text_row(text, "right", clipboard_prompt)
 
     def create_new_empty_draft(self):
+        self._frozen_draft_text = ""
         if self.active_draft_label is None:
             self.show_or_update_draft("")
 
+    def _try_enter_caption_edit_hotkey(self) -> None:
+        if self._home_edit_active:
+            if self._caption_edit_text_edit is not None:
+                self._caption_edit_text_edit.setFocus()
+                self._caption_edit_text_edit.selectAll()
+            return
+        if self.active_draft_label is None or self.active_draft_panel is None:
+            return
+        label_text = (self.active_draft_label.text() or "").strip()
+        # Consume current pending chunk so new live draft does not repeat the caption being edited.
+        consumed_text = (snapshot_chunk_since_last_end() or "").strip()
+        text = consumed_text or label_text
+        if not text:
+            return
+        self._home_edit_active = True
+        self._caption_edit_cap_id = str(uuid.uuid4())
+        self._caption_edit_sent_once = False
+        self._frozen_draft_text = ""
+        self._allow_draft_updates_during_edit = False
+        self.active_draft_label = None
+
+        panel = self.active_draft_panel
+        lay = panel.layout()
+        if lay is None:
+            return
+        while lay.count():
+            it = lay.takeAt(0)
+            w = it.widget()
+            if w is not None:
+                w.setParent(None)
+                w.deleteLater()
+
+        te = QTextEdit(panel)
+        te.setPlainText(text)
+        te.setAcceptRichText(False)
+        panel_h = int(panel.height() or panel.sizeHint().height() or 72)
+        edit_h = max(88, (panel_h - 38) * 2)
+        edit_h = min(edit_h, 320)
+        te.setFixedHeight(edit_h)
+        te.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        te.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        te.setStyleSheet(
+            f"QTextEdit {{ color: {TEXT_COLOR}; background: rgba(255,255,255,0.92); border: 1px solid rgba(17,17,17,100); padding: 6px; font-size: 15px; font-weight: 600; }}"
+        )
+        lay.addWidget(te)
+        btn_row = QHBoxLayout()
+        btn_row.addStretch(1)
+        reject_btn = QToolButton(panel)
+        send_btn = QToolButton(panel)
+        reject_btn.setIcon(self._build_x_cancel_svg_icon(18, "#c62828"))
+        send_btn.setIcon(self._build_send_plane_svg_icon(18, "#1565c0"))
+        reject_btn.setToolTip("Reject")
+        send_btn.setToolTip("Send")
+        reject_btn.setCursor(Qt.PointingHandCursor)
+        send_btn.setCursor(Qt.PointingHandCursor)
+        reject_btn.setIconSize(QSize(14, 14))
+        send_btn.setIconSize(QSize(14, 14))
+        reject_btn.setFixedSize(20, 20)
+        send_btn.setFixedSize(20, 20)
+        reject_btn.setStyleSheet(
+            "QToolButton { border: none; border-radius: 10px; background: transparent; }"
+            "QToolButton:hover { background: rgba(0, 0, 0, 0.08); }"
+        )
+        send_btn.setStyleSheet(
+            "QToolButton { border: none; border-radius: 10px; background: transparent; }"
+            "QToolButton:hover { background: rgba(0, 0, 0, 0.08); }"
+        )
+        reject_btn.clicked.connect(lambda _c=False, cid=self._caption_edit_cap_id: self._finish_caption_edit(True, cid))
+        send_btn.clicked.connect(lambda _c=False, cid=self._caption_edit_cap_id: self._finish_caption_edit(False, cid))
+        btn_row.addWidget(reject_btn)
+        btn_row.addWidget(send_btn)
+        lay.addLayout(btn_row)
+        self._caption_edit_panel = panel
+        self._caption_edit_text_edit = te
+        panel.adjustSize()
+        te.setFocus()
+        te.selectAll()
+        # Immediately create a fresh draft row so new interviewer speech continues there
+        # while this row stays dedicated to edit-only controls.
+        self._allow_draft_updates_during_edit = True
+        self.create_new_empty_draft()
+
+    def _restore_active_draft_panel_as_final(self, text: str, clipboard_prompt: str | None = None) -> None:
+        panel = self._caption_edit_panel
+        if panel is None:
+            self.add_text_row(text, "right", clipboard_prompt)
+            return
+        lay = panel.layout()
+        if lay is None:
+            lay = QVBoxLayout(panel)
+            lay.setContentsMargins(0, 0, 0, 0)
+            lay.setSpacing(8)
+        while lay.count():
+            it = lay.takeAt(0)
+            w = it.widget()
+            if w is not None:
+                w.setParent(None)
+                w.deleteLater()
+        label = QLabel()
+        label.setWordWrap(True)
+        label.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        label.setStyleSheet(
+            f"QLabel {{ color: {TEXT_COLOR}; background: transparent; border: none; font-size: 16px; font-weight: 700; }}"
+        )
+        label.setText(text or " ")
+        _, default_p = build_chunk_prompts(text or "", prompt_store, template_override=_session_chunk_template)
+        label.setProperty("copy_text", clipboard_prompt if clipboard_prompt is not None else default_p)
+        lay.addWidget(label)
+        actions = QHBoxLayout()
+        actions.setContentsMargins(0, 0, 0, 2)
+        actions.setSpacing(4)
+        actions.addStretch(1)
+        copy_btn = QToolButton(panel)
+        copy_btn.setIcon(self._build_copy_glyph_svg_icon(14, "#455a64"))
+        copy_btn.setIconSize(QSize(14, 14))
+        copy_btn.setCursor(Qt.PointingHandCursor)
+        copy_btn.setToolTip("Copy GPT prompt")
+        copy_btn.setFixedSize(20, 20)
+        copy_btn.setStyleSheet(
+            "QToolButton { border: none; border-radius: 10px; background: transparent; }"
+            "QToolButton:hover { background: rgba(0, 0, 0, 0.10); }"
+        )
+        copy_btn.clicked.connect(
+            lambda _checked=False, btn=copy_btn, lbl=label: InterviewWindow._on_copy_bubble_clicked(btn, lbl)
+        )
+        actions.addWidget(copy_btn)
+        lay.addLayout(actions)
+        panel.setFixedWidth(self.bubble_width())
+        panel.adjustSize()
+
+    def _finish_caption_edit(self, reject: bool, cap_id: str | None) -> None:
+        if not self._home_edit_active:
+            return
+        if cap_id is None or cap_id != self._caption_edit_cap_id:
+            return
+        if self._caption_edit_sent_once:
+            return
+        self._caption_edit_sent_once = True
+        te = self._caption_edit_text_edit
+        panel = self._caption_edit_panel
+        if te is None or panel is None:
+            self._home_edit_active = False
+            return
+        edited = te.toPlainText().strip()
+        if reject:
+            self._restore_active_draft_panel_as_final(edited, None)
+        else:
+            _, clip_prompt = build_chunk_prompts(
+                edited, prompt_store, template_override=_session_chunk_template
+            )
+            self._restore_active_draft_panel_as_final(edited, clip_prompt)
+            if edited:
+                threading.Thread(target=process_chunk, args=(edited,), daemon=True).start()
+        # Keep current active draft row (created after entering edit) for ongoing interviewer speech.
+        self._tick_caption_autoscroll()
+        self._caption_edit_text_edit = None
+        self._caption_edit_panel = None
+        self._caption_edit_cap_id = None
+        self._caption_edit_sent_once = False
+        self._home_edit_active = False
+        self._allow_draft_updates_during_edit = False
+        if self._frozen_draft_text:
+            self.show_or_update_draft(self._frozen_draft_text)
+            self._frozen_draft_text = ""
+
+    def _spawn_new_draft_while_editing(self) -> None:
+        if not self._home_edit_active:
+            return
+        self._allow_draft_updates_during_edit = True
+        self.create_new_empty_draft()
+
     def start_status_animation(self, kind: str, base_text: str):
         if kind == "gpt":
-            self._remove_all_gpt_status_rows()
+            self._set_gpt_result_text(base_text or "Generating...")
+            return
         row, panel, label = self.create_row("left")
         panel.setFixedWidth(self.bubble_width())
         status = StatusRow(label, base_text, row, panel)
         label.setText(self.format_status(base_text, status.step))
         self.status_rows[kind].append(status)
         self.insert_before_draft(row)
-        self.scroll_to_bottom()
 
     def replace_status_text(self, kind: str, text: str):
+        if kind == "gpt":
+            self._set_gpt_result_text(text or " ")
+            return
         if not self.status_rows[kind]:
             return
         status = self.status_rows[kind][-1]
         status.running = False
         status.label.setText(text or " ")
-        self.scroll_to_bottom()
 
     def _remove_all_gpt_status_rows(self) -> None:
-        for st in list(self.status_rows.get("gpt", [])):
-            if st.panel is not None:
-                try:
-                    self.message_panels.remove(st.panel)
-                except ValueError:
-                    pass
-            if st.row is not None:
-                self.content_layout.removeWidget(st.row)
-                st.row.deleteLater()
         self.status_rows["gpt"] = []
 
     def _remove_gpt_fallback_notice_row(self) -> None:
-        if self.gpt_fallback_notice_panel is not None:
-            try:
-                self.message_panels.remove(self.gpt_fallback_notice_panel)
-            except ValueError:
-                pass
-        if self.gpt_fallback_notice_row is not None:
-            self.content_layout.removeWidget(self.gpt_fallback_notice_row)
-            self.gpt_fallback_notice_row.deleteLater()
         self.gpt_fallback_notice_row = None
         self.gpt_fallback_notice_panel = None
         self.gpt_fallback_notice_label = None
 
     def show_gpt_fallback_notice(self, text: str) -> None:
-        self._remove_gpt_fallback_notice_row()
-        row, panel, label = self.create_row("left")
-        label.setText((text or "").strip() or " ")
-        label.setStyleSheet(
-            f"QLabel {{ color: #8a5a00; background: transparent; border: none; "
-            f"font-size: 14px; font-weight: 600; }}"
-        )
-        self.insert_before_draft(row)
-        panel.setFixedWidth(self.bubble_width())
-        self.gpt_fallback_notice_row = row
-        self.gpt_fallback_notice_panel = panel
-        self.gpt_fallback_notice_label = label
-        self.scroll_to_bottom()
+        self._set_gpt_result_text((text or "").strip() or " ")
 
     def begin_gpt_thinking_phase(self, thinking_text: str) -> None:
-        # Do not stack a static "Gpt processing…" row after streaming has already begun (timer race with HTTP notice).
-        if self.gpt_stream_label is not None:
-            return
-        self.start_status_animation("gpt", thinking_text or "Gpt processing")
+        self._set_gpt_result_text(thinking_text or "Generating...")
 
     def apply_gpt_session_start(self, http_notice: str, thinking_text: str) -> None:
-        """One GPT turn: optional HTTP notice, then animated thinking (notice removed first)."""
         self._remove_gpt_fallback_notice_row()
         self._remove_all_gpt_status_rows()
         self._remove_gpt_stream_row()
         notice = (http_notice or "").strip()
-        think = (thinking_text or "Gpt processing").strip() or "Gpt processing"
         if notice:
-
-            def _after_notice() -> None:
-                self._remove_gpt_fallback_notice_row()
-                self.begin_gpt_thinking_phase(think)
-
-            self.show_gpt_fallback_notice(notice)
-            QTimer.singleShot(450, _after_notice)
+            self._set_gpt_result_text(notice)
         else:
-            self.begin_gpt_thinking_phase(think)
+            _ = thinking_text
+            self._set_gpt_result_text("Generating...")
+        self._refresh_gpt_history_nav()
 
     def _remove_gpt_stream_row(self) -> None:
-        if self.gpt_stream_panel is not None:
-            try:
-                self.message_panels.remove(self.gpt_stream_panel)
-            except ValueError:
-                pass
-        if self.gpt_stream_row is not None:
-            self.content_layout.removeWidget(self.gpt_stream_row)
-            self.gpt_stream_row.deleteLater()
         self.gpt_stream_row = None
         self.gpt_stream_panel = None
         self.gpt_stream_label = None
 
     def show_or_update_gpt_stream_partial(self, text: str) -> None:
-        """Left-aligned streaming GPT text while the model is still generating."""
         body = (text or "").strip()
         if not body:
             return
-        if self.gpt_stream_label is None:
-            self._remove_gpt_fallback_notice_row()
-            self._remove_all_gpt_status_rows()
-            row, panel, label = self.create_row("left", with_copy_button=True)
-            label.setStyleSheet(
-                f"QLabel {{ color: {TEXT_COLOR}; background: transparent; border: none; "
-                f"font-size: 16px; font-weight: 700; font-style: italic; }}"
-            )
-            self.insert_before_draft(row)
-            panel.setFixedWidth(self.bubble_width())
-            self.gpt_stream_row = row
-            self.gpt_stream_panel = panel
-            self.gpt_stream_label = label
-        if self.gpt_stream_label is None:
-            return
-        self.gpt_stream_label.setText(body)
-        if self.gpt_stream_panel is not None:
-            self.gpt_stream_panel.setFixedWidth(self.bubble_width())
-        self.scroll_to_bottom()
+        self._set_gpt_result_text(body)
 
     def finalize_gpt_stream_to_answer_row(self, answer: str) -> None:
-        """Keep the same left bubble used for pre-results, restyle it to the final answer (no jump to a new 'input' row)."""
         self._remove_gpt_fallback_notice_row()
         self._remove_all_gpt_status_rows()
         ans = (answer or "").strip()
-        if self.gpt_stream_label is not None:
-            shown = ans or (self.gpt_stream_label.text() or "").strip()
-            if shown:
-                self.gpt_stream_label.setText(shown)
-                self.gpt_stream_label.setStyleSheet(
-                    f"QLabel {{ color: {TEXT_COLOR}; background: transparent; border: none; "
-                    f"font-size: 16px; font-weight: 700; font-style: normal; }}"
-                )
-                _remember_last_gpt_answer(shown)
-            else:
-                self._remove_gpt_stream_row()
-            self.gpt_stream_row = None
-            self.gpt_stream_panel = None
-            self.gpt_stream_label = None
-            self.scroll_to_bottom()
-            return
         self._remove_gpt_stream_row()
-        if ans:
-            _remember_last_gpt_answer(ans)
-            self.add_text_row(ans, "left")
-        self.scroll_to_bottom()
+        shown = ans or (self.gpt_result_body.toPlainText() or "").strip()
+        self._set_gpt_result_text(shown)
+        if shown:
+            self._push_gpt_result_history(shown)
+            _remember_last_gpt_answer(shown)
 
     def format_status(self, base: str, step: int) -> str:
         dot_count = 1 + (step % 3)
@@ -1196,6 +1492,12 @@ class InterviewWindow(QWidget):
                 self.finalize_gpt_stream_to_answer_row(event.get("text", ""))
             elif t == "new_empty_draft":
                 self.create_new_empty_draft()
+            elif t == "caption_edit_hotkey":
+                self._try_enter_caption_edit_hotkey()
+            elif t == "caption_edit_reject_hotkey":
+                self._finish_caption_edit(True, self._caption_edit_cap_id)
+            elif t == "caption_edit_spawn_new_draft":
+                self._spawn_new_draft_while_editing()
             elif t == "message":
                 self.add_text_row(event.get("text", ""), event.get("side", "left"))
             elif t == "f9_paste":
@@ -1268,6 +1570,18 @@ def queue_gpt_session_start(http_notice: str, thinking_text: str) -> None:
 
 def queue_new_empty_draft():
     ui_queue.put({"type": "new_empty_draft"})
+
+
+def queue_caption_edit_hotkey():
+    ui_queue.put({"type": "caption_edit_hotkey"})
+
+
+def queue_caption_edit_reject_hotkey():
+    ui_queue.put({"type": "caption_edit_reject_hotkey"})
+
+
+def queue_caption_edit_spawn_new_draft():
+    ui_queue.put({"type": "caption_edit_spawn_new_draft"})
 
 
 def _suffix_prefix_overlap_len(a: str, b: str, max_chars: int) -> int:
@@ -1392,7 +1706,7 @@ def process_chunk(raw_chunk):
 
 
 def on_press(key):
-    global last_end_key_at, last_delete_key_at
+    global last_end_key_at, last_delete_key_at, last_home_key_at
     global _shift_physically_down, last_f9_key_at
     try:
         if key in (keyboard.Key.shift, keyboard.Key.shift_l, keyboard.Key.shift_r):
@@ -1414,11 +1728,23 @@ def on_press(key):
             replace_all = _shift_physically_down
             threading.Thread(target=_inject_last_gpt_paste, args=(replace_all,), daemon=True).start()
             return
+        if key == keyboard.Key.home:
+            now = time.time()
+            if now - last_home_key_at < HOME_KEY_COOLDOWN_SECONDS:
+                return
+            last_home_key_at = now
+            queue_caption_edit_hotkey()
+            return
         if key == keyboard.Key.end:
             now = time.time()
             if now - last_end_key_at < END_KEY_COOLDOWN_SECONDS:
                 return
             last_end_key_at = now
+            if _main_interview_window is not None and bool(
+                getattr(_main_interview_window, "_home_edit_active", False)
+            ):
+                queue_caption_edit_spawn_new_draft()
+                return
             text = snapshot_chunk_since_last_end()
             if text:
                 _, clip_prompt = build_chunk_prompts(

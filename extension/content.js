@@ -6,6 +6,8 @@
   const latestSentByRequest = new Map();
   let lastGptStatusSent = 0;
   let lastGptStateFailNotified = 0;
+  let activeInterviewRequestId = "";
+  let activeBaselineAssistantCount = -1;
 
   /** DevTools on the ChatGPT tab — prep/GPT progress (not the Python terminal). */
   function iaLog(...args) {
@@ -189,6 +191,8 @@
     const minLen = opts.minLen != null ? opts.minLen : 25;
     const minRatio = opts.minAlphaRatio != null ? opts.minAlphaRatio : 0.12;
     const t = sanitizeAssistantText(text);
+    if (/^(WAITING|READY)$/i.test(t)) return true;
+    if (/^[^.!?\n]{1,120}[.!?]?$/.test(t) && t.length >= 2) return true;
     if (t.length < minLen) return false;
     const letters = t.replace(/[^0-9A-Za-z]+/g, "").length;
     if (letters / Math.max(t.length, 1) < minRatio) return false;
@@ -328,8 +332,8 @@
   async function waitForCompositeAssistantFinish(opts) {
     const o = opts || {};
     const wall = Date.now() + (o.captureWallMs != null ? o.captureWallMs : 180000);
-    const stableNeed = o.stableElapsedMs != null ? o.stableElapsedMs : 1500;
-    const pollMs = o.compositePollMs != null ? o.compositePollMs : 700;
+    const stableNeed = o.stableElapsedMs != null ? o.stableElapsedMs : 700;
+    const pollMs = o.compositePollMs != null ? o.compositePollMs : 220;
     const usableMin = o.minLen != null ? o.minLen : 25;
     const statusExtra = () => ({
       rejectEcho: o.rejectPromptEcho || "",
@@ -415,7 +419,12 @@
     const shouldStop = () => {
       if (Date.now() >= deadline) return true;
       if (isGenerating()) return true;
-      return getAssistantMessageList().length > baselineCount;
+      if (getAssistantMessageList().length > baselineCount) return true;
+      const snap = getLatestAssistantTextSnapshot({
+        baselineAssistantCount: baselineCount,
+        minRawLen: 1,
+      });
+      return !!(snap && snap.trim());
     };
 
     if (shouldStop()) return;
@@ -521,7 +530,7 @@
       return "";
     }
     const streaming = isStopGeneratingControlVisible();
-    const minRaw = streaming ? 1 : o.minRawLen != null ? o.minRawLen : 4;
+    const minRaw = streaming ? 1 : o.minRawLen != null ? o.minRawLen : 1;
     for (let i = nodes.length - 1; i >= b; i -= 1) {
       const el = nodes[i];
       if (!(el instanceof HTMLElement)) continue;
@@ -544,7 +553,7 @@
    */
   function getLatestAssistantTextSnapshot(opts) {
     const o = opts || {};
-    const minRaw = o.minRawLen != null ? o.minRawLen : 8;
+    const minRaw = o.minRawLen != null ? o.minRawLen : 1;
 
     if (typeof o.baselineAssistantCount === "number" && o.baselineAssistantCount >= 0) {
       const nodes = getAssistantMessageList();
@@ -828,12 +837,14 @@
       typeof baselineAssistantCount === "number"
         ? baselineAssistantCount
         : getAssistantMessageList().length;
+    activeInterviewRequestId = String(requestId || "").trim();
+    activeBaselineAssistantCount = baseline;
     runLiveAnswerRelayTicker(requestId, rejectEcho || "", undefined, undefined, baseline);
     (async () => {
       try {
         const answer = await captureAssistantResponseWithRetries(baseline, {
           rejectPromptEcho: rejectEcho || "",
-          minLen: 20,
+          minLen: 1,
           retryAttempts: 3,
           retryDelayMs: 400,
           statusPhase: "insert_prompt",
@@ -875,6 +886,7 @@
     let lastLiveSnap = "";
     wsStreamTimer = setInterval(() => {
       if (!requestId) return;
+      if (activeInterviewRequestId && requestId !== activeInterviewRequestId) return;
       const now = Date.now();
       const snap = getLiveRelayAssistantSnapshot({
         rejectPromptEcho: promptEcho || "",
@@ -891,7 +903,9 @@
           request_id: requestId,
           length: snap.length,
         });
-        wsSend({ type: "LIVE_ANSWER", request_id: requestId, text: snap });
+        if (!activeInterviewRequestId || requestId === activeInterviewRequestId) {
+          wsSend({ type: "LIVE_ANSWER", request_id: requestId, text: snap });
+        }
       }
     }, tick);
   }
@@ -901,20 +915,24 @@
       typeof baselineAssistantCount === "number"
         ? baselineAssistantCount
         : getAssistantMessageList().length;
+    activeInterviewRequestId = String(requestId || "").trim();
+    activeBaselineAssistantCount = baseline;
     runLiveAnswerRelayTicker(requestId, promptEcho, undefined, undefined, baseline);
 
     (async () => {
       try {
         const answer = await captureAssistantResponseWithRetries(baseline, {
           rejectPromptEcho: promptEcho || "",
-          minLen: 15,
+          minLen: 1,
           retryAttempts: 3,
-          retryDelayMs: 450,
+          retryDelayMs: 180,
+          stableElapsedMs: 450,
+          compositePollMs: 120,
           statusPhase: "ws_interview",
           statusExtras: { request_id: requestId },
         });
         clearWsStreamWatch();
-        if (answer) {
+        if (answer && (!activeInterviewRequestId || requestId === activeInterviewRequestId)) {
           wsSend({ type: "FINAL_ANSWER", request_id: requestId, answer });
         } else {
           wsSend({ type: "STATUS", level: "error", message: "no_assistant_reply" });
@@ -1014,10 +1032,16 @@
       const prepPhase = String(message.phase || "prep_capture").replace(/[^a-z0-9_-]/gi, "_");
       iaLog("[prep] submitted; capturing assistant reply", { prepPhase, jobId });
       await reportGptStatus("prep_sent", { phase: prepPhase, job_id: jobId, rejectEcho: prompt }, true);
+      if (prepPhase === "interview_gpt_setup") {
+        // Step 4 only: do not wait for assistant capture.
+        await postPrepComplete(jobId, "", "");
+        return { ok: true };
+      }
 
+      // Step 2/3: keep capturing result text.
       const answer = await captureAssistantResponseWithRetries(baselineAi, {
         rejectPromptEcho: prompt,
-        minLen: 25,
+        minLen: 1,
         retryAttempts: 3,
         retryDelayMs: 450,
         postSubmitDelayMs: 350,
@@ -1026,15 +1050,7 @@
         statusPhase: prepPhase,
         statusExtras: { job_id: jobId },
       });
-
-      if (!answer || answer.length < 15) {
-        iaLog("[prep] FAIL no_assistant_reply", { answerLen: (answer || "").length });
-        await postPrepComplete(jobId, "", "no_assistant_reply");
-        return { ok: false, error: "no_assistant_reply" };
-      }
-
-      iaLog("[prep] OK posting result", { jobId, answerChars: answer.length });
-      await postPrepComplete(jobId, answer, "");
+      await postPrepComplete(jobId, answer || "", "");
       return { ok: true };
     } catch (err) {
       iaLog("[prep] FAIL exception", err && err.message ? err.message : err);
