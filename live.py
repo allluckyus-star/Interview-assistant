@@ -492,8 +492,9 @@ class InterviewWindow(QWidget):
             "QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical { height: 0; }"
         )
         # Pause auto-scroll while the user is interacting (wheel / drag / arrows).
+        # Cooldown extends on each interaction; after last scroll event + this many seconds, timer resumes sticking to bottom.
         self._user_scroll_cooldown_until = 0.0
-        self._user_scroll_cooldown_seconds = 1.4
+        self._user_scroll_cooldown_seconds = 3.0
         self._suppress_user_scroll_signal = False
         # Auto-scroll is gated on "interviewer is actively saying" (live caption draft updates).
         self._interviewer_speaking_until = 0.0
@@ -950,10 +951,22 @@ class InterviewWindow(QWidget):
         self._splitter_initialized = True
 
     def _tick_caption_autoscroll(self) -> None:
+        """Periodic stick-to-bottom for live captions. Disabled in caption edit mode and for 3s after user scroll."""
         if self._home_edit_active:
             return
+        now = time.time()
+        try:
+            cooldown_until = float(getattr(self, "_user_scroll_cooldown_until", 0.0))
+        except (TypeError, ValueError):
+            cooldown_until = 0.0
+        if now < cooldown_until:
+            return
         bar = self.caption_scroll.verticalScrollBar()
-        bar.setValue(bar.maximum())
+        self._suppress_user_scroll_signal = True
+        try:
+            bar.setValue(bar.maximum())
+        finally:
+            self._suppress_user_scroll_signal = False
 
     def _set_gpt_result_text(self, text: str) -> None:
         self.gpt_result_body.setPlainText((text or "").strip() or " ")
@@ -1314,12 +1327,12 @@ class InterviewWindow(QWidget):
             if edited:
                 threading.Thread(target=process_chunk, args=(edited,), daemon=True).start()
         # Keep current active draft row (created after entering edit) for ongoing interviewer speech.
-        self._tick_caption_autoscroll()
         self._caption_edit_text_edit = None
         self._caption_edit_panel = None
         self._caption_edit_cap_id = None
         self._caption_edit_sent_once = False
         self._home_edit_active = False
+        self._tick_caption_autoscroll()
         self._allow_draft_updates_during_edit = False
         if self._frozen_draft_text:
             self.show_or_update_draft(self._frozen_draft_text)
@@ -1422,7 +1435,7 @@ class InterviewWindow(QWidget):
         if getattr(self, "_suppress_user_scroll_signal", False):
             return
         self._user_scroll_cooldown_until = time.time() + float(
-            getattr(self, "_user_scroll_cooldown_seconds", 1.4)
+            getattr(self, "_user_scroll_cooldown_seconds", 3.0)
         )
 
     def _on_scrollbar_user_action(self, _action: int) -> None:
@@ -1435,7 +1448,7 @@ class InterviewWindow(QWidget):
         Skip auto-scroll when:
           - no recent live-caption draft update (interviewer not currently saying),
           - the scrollbar slider is being dragged,
-          - a recent wheel/keyboard scroll just happened (short cooldown),
+          - a recent wheel/keyboard scroll just happened (cooldown: _user_scroll_cooldown_seconds after last interaction),
           - the scrollbar is not near the bottom (user scrolled up).
         """
         now = time.time()
