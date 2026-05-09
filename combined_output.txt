@@ -1243,8 +1243,8 @@ function rememberPrepTabId(tabId) {
 }
 
 /**
- * Same tab the HTTP /next-prompt path uses: bridged prep tab first, then storage, then focused-window ChatGPT only
- * (never first match across all Chrome windows).
+ * Bound ChatGPT tab for live interview: bridged prep tab, then storage, then active ChatGPT
+ * in the focused or current Chrome window only (never arbitrary background tabs).
  */
 async function resolveInterviewTargetTabId() {
   const tryId = async (id) => {
@@ -1276,12 +1276,6 @@ async function resolveInterviewTargetTabId() {
   tabs = await chrome.tabs.query({ active: true, lastFocusedWindow: true, url: chatgptUrls });
   if (tabs.length && tabs[0].id != null) return tabs[0].id;
 
-  tabs = await chrome.tabs.query({ currentWindow: true, url: chatgptUrls });
-  if (tabs.length) {
-    const sorted = [...tabs].sort((a, b) => (b.lastAccessed || 0) - (a.lastAccessed || 0));
-    if (sorted[0].id != null) return sorted[0].id;
-  }
-
   return null;
 }
 
@@ -1306,6 +1300,36 @@ async function forwardInterviewWsToTab(msg) {
   if (tabId == null) {
     console.warn("[Interview Assistant bg] interview WS: no ChatGPT tab for", msg && msg.type);
     return;
+  }
+  let wasInactive = false;
+  try {
+    const tab = await chrome.tabs.get(tabId).catch(() => null);
+    if (tab) {
+      wasInactive = !tab.active;
+      try {
+        const win = await chrome.windows.get(tab.windowId).catch(() => null);
+        if (win && !win.focused) wasInactive = true;
+      } catch (_e) {
+        wasInactive = true;
+      }
+    }
+    await chrome.tabs.update(tabId, { active: true }).catch(() => {});
+    if (tab && tab.windowId != null) {
+      await chrome.windows.update(tab.windowId, { focused: true }).catch(() => {});
+    }
+    if (wasInactive && interviewWs && interviewWs.readyState === WebSocket.OPEN) {
+      try {
+        interviewWs.send(
+          JSON.stringify({
+            type: "STATUS",
+            level: "warning",
+            message: "ChatGPT tab was not active; live pre-result may be delayed.",
+          })
+        );
+      } catch (_e) {}
+    }
+  } catch (_e) {
+    /* still try to deliver payload */
   }
   try {
     await chrome.tabs.sendMessage(tabId, { type: "IA_INTERVIEW_WS_PUSH", payload: msg });
@@ -1832,6 +1856,8 @@ chrome.alarms.onAlarm.addListener((alarm) => {
   const latestSentByRequest = new Map();
   let lastGptStatusSent = 0;
   let lastGptStateFailNotified = 0;
+  let activeInterviewRequestId = "";
+  let activeBaselineAssistantCount = -1;
 
   /** DevTools on the ChatGPT tab — prep/GPT progress (not the Python terminal). */
   function iaLog(...args) {
@@ -2015,6 +2041,8 @@ chrome.alarms.onAlarm.addListener((alarm) => {
     const minLen = opts.minLen != null ? opts.minLen : 25;
     const minRatio = opts.minAlphaRatio != null ? opts.minAlphaRatio : 0.12;
     const t = sanitizeAssistantText(text);
+    if (/^(WAITING|READY)$/i.test(t)) return true;
+    if (/^[^.!?\n]{1,120}[.!?]?$/.test(t) && t.length >= 2) return true;
     if (t.length < minLen) return false;
     const letters = t.replace(/[^0-9A-Za-z]+/g, "").length;
     if (letters / Math.max(t.length, 1) < minRatio) return false;
@@ -2154,8 +2182,8 @@ chrome.alarms.onAlarm.addListener((alarm) => {
   async function waitForCompositeAssistantFinish(opts) {
     const o = opts || {};
     const wall = Date.now() + (o.captureWallMs != null ? o.captureWallMs : 180000);
-    const stableNeed = o.stableElapsedMs != null ? o.stableElapsedMs : 1500;
-    const pollMs = o.compositePollMs != null ? o.compositePollMs : 700;
+    const stableNeed = o.stableElapsedMs != null ? o.stableElapsedMs : 700;
+    const pollMs = o.compositePollMs != null ? o.compositePollMs : 220;
     const usableMin = o.minLen != null ? o.minLen : 25;
     const statusExtra = () => ({
       rejectEcho: o.rejectPromptEcho || "",
@@ -2241,7 +2269,12 @@ chrome.alarms.onAlarm.addListener((alarm) => {
     const shouldStop = () => {
       if (Date.now() >= deadline) return true;
       if (isGenerating()) return true;
-      return getAssistantMessageList().length > baselineCount;
+      if (getAssistantMessageList().length > baselineCount) return true;
+      const snap = getLatestAssistantTextSnapshot({
+        baselineAssistantCount: baselineCount,
+        minRawLen: 1,
+      });
+      return !!(snap && snap.trim());
     };
 
     if (shouldStop()) return;
@@ -2339,6 +2372,7 @@ chrome.alarms.onAlarm.addListener((alarm) => {
   function getLiveRelayAssistantSnapshot(opts) {
     const o = opts || {};
     const b = o.baselineAssistantCount;
+    const allowHidden = o.allowHidden === true;
     if (typeof b !== "number" || b < 0) {
       return getLatestAssistantTextSnapshot(o);
     }
@@ -2347,11 +2381,11 @@ chrome.alarms.onAlarm.addListener((alarm) => {
       return "";
     }
     const streaming = isStopGeneratingControlVisible();
-    const minRaw = streaming ? 1 : o.minRawLen != null ? o.minRawLen : 4;
+    const minRaw = streaming ? 1 : o.minRawLen != null ? o.minRawLen : 1;
     for (let i = nodes.length - 1; i >= b; i -= 1) {
       const el = nodes[i];
       if (!(el instanceof HTMLElement)) continue;
-      if (!isElementVisible(el)) continue;
+      if (!allowHidden && !isElementVisible(el)) continue;
       let text = extractAssistantTurnText(el);
       text = applyRejectEcho(text, o.rejectPromptEcho || "");
       const t = text.trim();
@@ -2370,18 +2404,19 @@ chrome.alarms.onAlarm.addListener((alarm) => {
    */
   function getLatestAssistantTextSnapshot(opts) {
     const o = opts || {};
-    const minRaw = o.minRawLen != null ? o.minRawLen : 8;
+    const minRaw = o.minRawLen != null ? o.minRawLen : 1;
 
     if (typeof o.baselineAssistantCount === "number" && o.baselineAssistantCount >= 0) {
       const nodes = getAssistantMessageList();
       const b = o.baselineAssistantCount;
+      const allowHidden = o.allowHidden === true;
       if (nodes.length <= b) {
         return "";
       }
       for (let i = nodes.length - 1; i >= b; i -= 1) {
         const el = nodes[i];
         if (!(el instanceof HTMLElement)) continue;
-        if (!isElementVisible(el)) continue;
+        if (!allowHidden && !isElementVisible(el)) continue;
         let text = extractAssistantTurnText(el);
         text = applyRejectEcho(text, o.rejectPromptEcho);
         if (text.length < minRaw) continue;
@@ -2654,12 +2689,14 @@ chrome.alarms.onAlarm.addListener((alarm) => {
       typeof baselineAssistantCount === "number"
         ? baselineAssistantCount
         : getAssistantMessageList().length;
-    runLiveAnswerRelayTicker(requestId, rejectEcho || "", undefined, undefined, baseline);
+    activeInterviewRequestId = String(requestId || "").trim();
+    activeBaselineAssistantCount = baseline;
+    runLiveAnswerRelayTicker(requestId, rejectEcho || "", undefined, undefined, baseline, false);
     (async () => {
       try {
         const answer = await captureAssistantResponseWithRetries(baseline, {
           rejectPromptEcho: rejectEcho || "",
-          minLen: 20,
+          minLen: 1,
           retryAttempts: 3,
           retryDelayMs: 400,
           statusPhase: "insert_prompt",
@@ -2676,6 +2713,9 @@ chrome.alarms.onAlarm.addListener((alarm) => {
 
   /** Interview WebSocket runs in the background service worker; we only send frames over runtime messaging. */
   let wsStreamTimer = null;
+  let liveRelayObserver = null;
+  let liveRelayThrottleTimer = null;
+  let liveRelayGeneration = 0;
 
   function wsSend(obj) {
     try {
@@ -2690,36 +2730,120 @@ chrome.alarms.onAlarm.addListener((alarm) => {
       clearInterval(wsStreamTimer);
       wsStreamTimer = null;
     }
+    if (liveRelayThrottleTimer) {
+      clearTimeout(liveRelayThrottleTimer);
+      liveRelayThrottleTimer = null;
+    }
+    if (liveRelayObserver) {
+      try {
+        liveRelayObserver.disconnect();
+      } catch (_e) {}
+      liveRelayObserver = null;
+    }
+    liveRelayGeneration += 1;
   }
 
-  /** Poll DOM every tickMs; emit LIVE_ANSWER at most once per minEmitMs while text grows (WS or HTTP relay to live.py). */
-  function runLiveAnswerRelayTicker(requestId, promptEcho, tickMs, minEmitMs, baselineAssistantCount) {
-    const tick = tickMs != null ? tickMs : 100;
-    const minGap = minEmitMs != null ? minEmitMs : 100;
+  /**
+   * MutationObserver-first LIVE_ANSWER relay (works when tab timers are throttled).
+   * Throttled LIVE sends; slow interval backup; FINAL when text stable ~2s and composer idle.
+   */
+  function runLiveAnswerRelayTicker(requestId, promptEcho, tickMs, minEmitMs, baselineAssistantCount, enableStabilityFinal) {
+    void tickMs;
+    void minEmitMs;
+    const doStabilityFinal = enableStabilityFinal === true;
+    const baseline =
+      typeof baselineAssistantCount === "number" && baselineAssistantCount >= 0
+        ? baselineAssistantCount
+        : getAssistantMessageList().length;
     clearWsStreamWatch();
-    let lastSentLive = 0;
-    let lastLiveSnap = "";
-    wsStreamTimer = setInterval(() => {
-      if (!requestId) return;
-      const now = Date.now();
-      const snap = getLiveRelayAssistantSnapshot({
+    const myGen = liveRelayGeneration;
+    const THROTTLE_MS = 400;
+    const BACKUP_MS = 1200;
+    const STABLE_FINAL_MS = 2000;
+
+    let lastLiveSent = "";
+    let lastSnapForStability = "";
+    let stableSince = Date.now();
+    let finalSent = false;
+
+    function snapshot() {
+      return getLiveRelayAssistantSnapshot({
         rejectPromptEcho: promptEcho || "",
-        minRawLen: 4,
-        baselineAssistantCount:
-          typeof baselineAssistantCount === "number" && baselineAssistantCount >= 0
-            ? baselineAssistantCount
-            : undefined,
+        minRawLen: 1,
+        allowHidden: true,
+        baselineAssistantCount: baseline,
       });
-      if (snap && snap !== lastLiveSnap && now - lastSentLive >= minGap) {
-        lastLiveSnap = snap;
-        lastSentLive = now;
-        console.log("[Interview Assistant] LIVE_ANSWER pre-result", {
-          request_id: requestId,
-          length: snap.length,
-        });
-        wsSend({ type: "LIVE_ANSWER", request_id: requestId, text: snap });
+    }
+
+    function maybeSendLive(snap) {
+      const t = String(snap || "").trim();
+      if (!t || !requestId) return;
+      if (activeInterviewRequestId && requestId !== activeInterviewRequestId) return;
+      if (t === lastLiveSent) return;
+      lastLiveSent = t;
+      wsSend({ type: "LIVE_ANSWER", request_id: requestId, text: snap });
+    }
+
+    function maybeSendFinal(snap) {
+      if (!doStabilityFinal) return;
+      const t = String(snap || "").trim();
+      if (!t || finalSent || !requestId) return;
+      if (myGen !== liveRelayGeneration) return;
+      if (activeInterviewRequestId && requestId !== activeInterviewRequestId) return;
+      if (isStopGeneratingControlVisible()) return;
+      if (!isComposerIdleAfterAssistantTurn()) return;
+      finalSent = true;
+      wsSend({ type: "FINAL_ANSWER", request_id: requestId, answer: t });
+      clearWsStreamWatch();
+    }
+
+    function flush() {
+      if (finalSent || myGen !== liveRelayGeneration) return;
+      if (!requestId) return;
+      if (activeInterviewRequestId && requestId !== activeInterviewRequestId) return;
+      const snap = snapshot();
+      const t = String(snap || "").trim();
+      if (t && t !== lastSnapForStability) {
+        lastSnapForStability = t;
+        stableSince = Date.now();
+        maybeSendLive(snap);
+        return;
       }
-    }, tick);
+      if (!t) return;
+      const now = Date.now();
+      if (doStabilityFinal && now - stableSince >= STABLE_FINAL_MS) {
+        maybeSendFinal(snap);
+      }
+    }
+
+    function scheduleFlush() {
+      if (finalSent || myGen !== liveRelayGeneration) return;
+      if (liveRelayThrottleTimer) return;
+      liveRelayThrottleTimer = setTimeout(() => {
+        liveRelayThrottleTimer = null;
+        flush();
+      }, THROTTLE_MS);
+    }
+
+    liveRelayObserver = new MutationObserver(() => {
+      scheduleFlush();
+    });
+    try {
+      liveRelayObserver.observe(document.body, {
+        subtree: true,
+        childList: true,
+        characterData: true,
+        attributes: true,
+      });
+    } catch (_e) {
+      liveRelayObserver = null;
+    }
+
+    wsStreamTimer = setInterval(() => {
+      scheduleFlush();
+    }, BACKUP_MS);
+
+    scheduleFlush();
   }
 
   function startWsResponseWatch(requestId, baselineAssistantCount, promptEcho) {
@@ -2727,22 +2851,34 @@ chrome.alarms.onAlarm.addListener((alarm) => {
       typeof baselineAssistantCount === "number"
         ? baselineAssistantCount
         : getAssistantMessageList().length;
-    runLiveAnswerRelayTicker(requestId, promptEcho, undefined, undefined, baseline);
+    activeInterviewRequestId = String(requestId || "").trim();
+    activeBaselineAssistantCount = baseline;
+    runLiveAnswerRelayTicker(requestId, promptEcho, undefined, undefined, baseline, true);
+
+    const rid = String(requestId || "").trim();
+    const genAtStart = liveRelayGeneration;
 
     (async () => {
       try {
-        const answer = await captureAssistantResponseWithRetries(baseline, {
-          rejectPromptEcho: promptEcho || "",
-          minLen: 15,
-          retryAttempts: 3,
-          retryDelayMs: 450,
-          statusPhase: "ws_interview",
-          statusExtras: { request_id: requestId },
-        });
+        await wait(200000);
+        if (genAtStart !== liveRelayGeneration) return;
+        if (!rid || (activeInterviewRequestId && rid !== activeInterviewRequestId)) return;
+        const answer = (
+          await captureAssistantResponseWithRetries(baseline, {
+            rejectPromptEcho: promptEcho || "",
+            minLen: 1,
+            retryAttempts: 2,
+            retryDelayMs: 400,
+            stableElapsedMs: 1200,
+            compositePollMs: 400,
+            statusPhase: "ws_interview_fallback",
+            statusExtras: { request_id: rid },
+          })
+        ).trim();
         clearWsStreamWatch();
-        if (answer) {
-          wsSend({ type: "FINAL_ANSWER", request_id: requestId, answer });
-        } else {
+        if (answer && (!activeInterviewRequestId || rid === activeInterviewRequestId)) {
+          wsSend({ type: "FINAL_ANSWER", request_id: rid, answer });
+        } else if (!answer) {
           wsSend({ type: "STATUS", level: "error", message: "no_assistant_reply" });
         }
       } catch (_e) {
@@ -2843,7 +2979,7 @@ chrome.alarms.onAlarm.addListener((alarm) => {
 
       const answer = await captureAssistantResponseWithRetries(baselineAi, {
         rejectPromptEcho: prompt,
-        minLen: 25,
+        minLen: 1,
         retryAttempts: 3,
         retryDelayMs: 450,
         postSubmitDelayMs: 350,
@@ -2852,15 +2988,7 @@ chrome.alarms.onAlarm.addListener((alarm) => {
         statusPhase: prepPhase,
         statusExtras: { job_id: jobId },
       });
-
-      if (!answer || answer.length < 15) {
-        iaLog("[prep] FAIL no_assistant_reply", { answerLen: (answer || "").length });
-        await postPrepComplete(jobId, "", "no_assistant_reply");
-        return { ok: false, error: "no_assistant_reply" };
-      }
-
-      iaLog("[prep] OK posting result", { jobId, answerChars: answer.length });
-      await postPrepComplete(jobId, answer, "");
+      await postPrepComplete(jobId, answer || "", "");
       return { ok: true };
     } catch (err) {
       iaLog("[prep] FAIL exception", err && err.message ? err.message : err);
@@ -3919,10 +4047,12 @@ from PySide6.QtWidgets import (
     QHBoxLayout,
     QLabel,
     QPushButton,
+    QSplitter,
     QScrollArea,
     QSizePolicy,
     QSlider,
     QStackedWidget,
+    QTextEdit,
     QToolButton,
     QVBoxLayout,
     QWidget,
@@ -3942,6 +4072,11 @@ from ws_bridge import InterviewWSServer
 
 
 LIVE_CAPTIONS_WINDOW_NAME = "Live Captions"
+
+# Must match extension/background.js inactive-tab warning (shown only in GPT pane).
+_GPT_EXT_INACTIVE_TAB_MSG = (
+    "ChatGPT tab was not active; live pre-result may be delayed."
+)
 
 
 def _default_windows_live_captions_exe() -> Path:
@@ -4012,6 +4147,8 @@ _boundary_shift_candidate_hits = 0
 last_end_key_at = 0.0
 last_delete_key_at = 0.0
 END_KEY_COOLDOWN_SECONDS = 0.8
+HOME_KEY_COOLDOWN_SECONDS = 0.45
+last_home_key_at = 0.0
 
 # Last finalized GPT answer for global paste hotkeys (F9 = paste, Shift+F9 = select-all + delete + paste).
 last_gpt_answer_for_paste = ""
@@ -4224,7 +4361,7 @@ def handle_ws_extension_payload(payload: dict) -> None:
     if typ == "LIVE_ANSWER":
         rid = str(payload.get("request_id", "")).strip()
         text = str(payload.get("text", ""))
-        if rid and pending_request_id and rid == pending_request_id and text:
+        if rid and pending_request_id and rid == pending_request_id and (text or "").strip():
             _last_live_poll_for_rid = (rid, text)
             queue_gpt_stream_partial(text)
         return
@@ -4241,6 +4378,9 @@ def handle_ws_extension_payload(payload: dict) -> None:
         return
     if typ == "STATUS":
         msg = str(payload.get("message", "")).strip()
+        if msg == _GPT_EXT_INACTIVE_TAB_MSG:
+            ui_queue.put({"type": "gpt_ext_status", "text": msg})
+            return
         if msg:
             queue_ui_message(f"Extension: {msg}", "left")
 
@@ -4276,6 +4416,17 @@ class InterviewWindow(QWidget):
         self.main_stack: QStackedWidget | None = None
         self.active_draft_label: QLabel | None = None
         self.active_draft_row: QWidget | None = None
+        self.active_draft_panel: QFrame | None = None
+        self._home_edit_active = False
+        self._frozen_draft_text = ""
+        self._caption_edit_text_edit: QTextEdit | None = None
+        self._caption_edit_panel: QFrame | None = None
+        self._caption_edit_cap_id: str | None = None
+        self._caption_edit_sent_once = False
+        self._allow_draft_updates_during_edit = False
+        self._splitter_initialized = False
+        self.gpt_result_history: list[str] = []
+        self.gpt_history_index = -1
         self.gpt_stream_row: QWidget | None = None
         self.gpt_stream_panel: QFrame | None = None
         self.gpt_stream_label: QLabel | None = None
@@ -4360,12 +4511,12 @@ class InterviewWindow(QWidget):
         topbar.addWidget(self.close_btn)
         shell_layout.addLayout(topbar)
 
-        self.scroll = QScrollArea()
-        self.scroll.setWidgetResizable(True)
-        self.scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
-        self.scroll.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
-        self.scroll.setFrameShape(QFrame.NoFrame)
-        self.scroll.setStyleSheet(
+        self.caption_scroll = QScrollArea()
+        self.caption_scroll.setWidgetResizable(True)
+        self.caption_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.caption_scroll.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        self.caption_scroll.setFrameShape(QFrame.NoFrame)
+        self.caption_scroll.setStyleSheet(
             "QScrollArea { background: transparent; border: none; }"
             "QScrollBar:vertical { width: 10px; background: rgba(0,0,0,24); border-radius: 5px; margin: 2px; }"
             "QScrollBar::handle:vertical { min-height: 24px; background: rgba(57,73,171,160); border-radius: 5px; }"
@@ -4379,8 +4530,8 @@ class InterviewWindow(QWidget):
         # Auto-scroll is gated on "interviewer is actively saying" (live caption draft updates).
         self._interviewer_speaking_until = 0.0
         self._interviewer_speaking_window_seconds = 2.0
-        self.scroll.viewport().installEventFilter(self)
-        sb = self.scroll.verticalScrollBar()
+        self.caption_scroll.viewport().installEventFilter(self)
+        sb = self.caption_scroll.verticalScrollBar()
         sb.installEventFilter(self)
         sb.actionTriggered.connect(self._on_scrollbar_user_action)
         sb.sliderPressed.connect(self._mark_user_scroll_activity)
@@ -4392,13 +4543,79 @@ class InterviewWindow(QWidget):
         self.content_layout.setContentsMargins(0, 0, 0, 0)
         self.content_layout.setSpacing(10)
         self.content_layout.addStretch(1)
-        self.scroll.setWidget(self.content)
+        self.caption_scroll.setWidget(self.content)
+
+        self.gpt_result_panel = QFrame()
+        self.gpt_result_panel.setObjectName("GptResultPanel")
+        self.gpt_result_panel.setStyleSheet(
+            "QFrame#GptResultPanel { background: rgba(255,255,255,0.55); border: 1px solid rgba(17,17,17,70); }"
+        )
+        gpt_layout = QVBoxLayout(self.gpt_result_panel)
+        gpt_layout.setContentsMargins(10, 10, 10, 10)
+        gpt_layout.setSpacing(6)
+        self.gpt_result_title = QLabel("0/0")
+        self.gpt_result_title.setStyleSheet("font-size: 12px; font-weight: 700; color: #333;")
+        self.gpt_ext_status_label = QLabel("")
+        self.gpt_ext_status_label.setWordWrap(True)
+        self.gpt_ext_status_label.setStyleSheet(
+            "font-size: 10px; color: #a05000; padding: 0 0 4px 0; background: transparent;"
+        )
+        self.gpt_ext_status_label.hide()
+        self.gpt_result_body = QTextEdit()
+        self.gpt_result_body.setReadOnly(True)
+        self.gpt_result_body.setAcceptRichText(False)
+        self.gpt_result_body.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        self.gpt_result_body.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.gpt_result_body.setStyleSheet(
+            f"QTextEdit {{ color: {TEXT_COLOR}; background: transparent; border: none; font-size: 16px; font-weight: 700; }}"
+        )
+        controls_row = QHBoxLayout()
+        controls_row.setContentsMargins(0, 0, 0, 0)
+        controls_row.setSpacing(6)
+        self.gpt_copy_btn = QToolButton()
+        self.gpt_prev_btn = QToolButton()
+        self.gpt_next_btn = QToolButton()
+        self.gpt_copy_btn.setIcon(self._build_copy_glyph_svg_icon(14, "#455a64"))
+        self.gpt_prev_btn.setIcon(self._build_prev_chevron_svg_icon(14, "#455a64"))
+        self.gpt_next_btn.setIcon(self._build_next_chevron_svg_icon(14, "#455a64"))
+        self.gpt_prev_btn.setIconSize(QSize(14, 14))
+        self.gpt_next_btn.setIconSize(QSize(14, 14))
+        for _btn, _tip in (
+            (self.gpt_copy_btn, "Copy result"),
+            (self.gpt_prev_btn, "Previous result"),
+            (self.gpt_next_btn, "Next result"),
+        ):
+            _btn.setCursor(Qt.PointingHandCursor)
+            _btn.setToolTip(_tip)
+            _btn.setFixedSize(24, 24)
+            _btn.setStyleSheet(
+                "QToolButton { border: none; border-radius: 12px; background: transparent; font-weight: 700; }"
+                "QToolButton:hover { background: rgba(0, 0, 0, 0.10); }"
+            )
+        self.gpt_copy_btn.clicked.connect(self._copy_current_gpt_result)
+        self.gpt_prev_btn.clicked.connect(self._show_prev_gpt_result)
+        self.gpt_next_btn.clicked.connect(self._show_next_gpt_result)
+        controls_row.addWidget(self.gpt_copy_btn)
+        controls_row.addWidget(self.gpt_prev_btn)
+        controls_row.addWidget(self.gpt_next_btn)
+        controls_row.addStretch(1)
+        gpt_layout.addWidget(self.gpt_result_title)
+        gpt_layout.addWidget(self.gpt_ext_status_label)
+        gpt_layout.addWidget(self.gpt_result_body, 1)
+        gpt_layout.addLayout(controls_row)
+        self._refresh_gpt_history_nav()
+
+        self.interview_splitter = QSplitter(Qt.Orientation.Vertical)
+        self.interview_splitter.addWidget(self.caption_scroll)
+        self.interview_splitter.addWidget(self.gpt_result_panel)
+        self.interview_splitter.setChildrenCollapsible(False)
 
         self.interview_page = QWidget()
         interview_layout = QVBoxLayout(self.interview_page)
         interview_layout.setContentsMargins(0, 0, 0, 0)
         interview_layout.setSpacing(0)
-        interview_layout.addWidget(self.scroll)
+        interview_layout.addWidget(self.interview_splitter)
+        self.scroll = self.caption_scroll
 
         self.main_stack = QStackedWidget()
         self.main_stack.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
@@ -4422,6 +4639,10 @@ class InterviewWindow(QWidget):
         self.anim_timer = QTimer(self)
         self.anim_timer.timeout.connect(self.tick_status_animation)
         self.anim_timer.start(350)
+
+        self.caption_autoscroll_timer = QTimer(self)
+        self.caption_autoscroll_timer.timeout.connect(self._tick_caption_autoscroll)
+        self.caption_autoscroll_timer.start(500)
 
         self.resize_timer = QTimer(self)
         self.resize_timer.setSingleShot(True)
@@ -4500,6 +4721,7 @@ class InterviewWindow(QWidget):
             self.prep_widget.shutdown_for_handoff()
         if self.main_stack is not None:
             self.main_stack.setCurrentIndex(1)
+            QTimer.singleShot(0, self._apply_initial_splitter_sizes)
         restart_live_caption_exe()
 
         def _focus_session_window() -> None:
@@ -4558,6 +4780,54 @@ class InterviewWindow(QWidget):
 <rect x="9" y="9" width="13" height="13" rx="2" ry="2"/>
 <path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/>
 </svg>"""
+        renderer = QSvgRenderer(svg.encode("utf-8"))
+        pixmap = QPixmap(size, size)
+        pixmap.fill(Qt.GlobalColor.transparent)
+        painter = QPainter(pixmap)
+        renderer.render(painter)
+        painter.end()
+        return QIcon(pixmap)
+
+    @staticmethod
+    def _build_prev_chevron_svg_icon(size: int, color: str) -> QIcon:
+        svg = f"""<svg xmlns="http://www.w3.org/2000/svg" width="{size}" height="{size}" viewBox="0 0 24 24" fill="none" stroke="{color}" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round">
+<polyline points="15 18 9 12 15 6"/></svg>"""
+        renderer = QSvgRenderer(svg.encode("utf-8"))
+        pixmap = QPixmap(size, size)
+        pixmap.fill(Qt.GlobalColor.transparent)
+        painter = QPainter(pixmap)
+        renderer.render(painter)
+        painter.end()
+        return QIcon(pixmap)
+
+    @staticmethod
+    def _build_next_chevron_svg_icon(size: int, color: str) -> QIcon:
+        svg = f"""<svg xmlns="http://www.w3.org/2000/svg" width="{size}" height="{size}" viewBox="0 0 24 24" fill="none" stroke="{color}" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round">
+<polyline points="9 18 15 12 9 6"/></svg>"""
+        renderer = QSvgRenderer(svg.encode("utf-8"))
+        pixmap = QPixmap(size, size)
+        pixmap.fill(Qt.GlobalColor.transparent)
+        painter = QPainter(pixmap)
+        renderer.render(painter)
+        painter.end()
+        return QIcon(pixmap)
+
+    @staticmethod
+    def _build_x_cancel_svg_icon(size: int, color: str) -> QIcon:
+        svg = f"""<svg xmlns="http://www.w3.org/2000/svg" width="{size}" height="{size}" viewBox="0 0 24 24" fill="none" stroke="{color}" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
+<path d="M18 6L6 18M6 6l12 12"/></svg>"""
+        renderer = QSvgRenderer(svg.encode("utf-8"))
+        pixmap = QPixmap(size, size)
+        pixmap.fill(Qt.GlobalColor.transparent)
+        painter = QPainter(pixmap)
+        renderer.render(painter)
+        painter.end()
+        return QIcon(pixmap)
+
+    @staticmethod
+    def _build_send_plane_svg_icon(size: int, color: str) -> QIcon:
+        svg = f"""<svg xmlns="http://www.w3.org/2000/svg" width="{size}" height="{size}" viewBox="0 0 24 24" fill="{color}">
+<path d="M2 21l23-9L2 3v7l15 2-15 2v7z"/></svg>"""
         renderer = QSvgRenderer(svg.encode("utf-8"))
         pixmap = QPixmap(size, size)
         pixmap.fill(Qt.GlobalColor.transparent)
@@ -4700,11 +4970,95 @@ class InterviewWindow(QWidget):
     def showEvent(self, event):
         super().showEvent(event)
         self._sync_round_window_mask()
+        self._apply_initial_splitter_sizes()
 
     def resizeEvent(self, event):
         self._sync_round_window_mask()
         self.resize_timer.start(20)
+        if not self._splitter_initialized:
+            QTimer.singleShot(0, self._apply_initial_splitter_sizes)
         super().resizeEvent(event)
+
+    def _apply_initial_splitter_sizes(self) -> None:
+        if not hasattr(self, "interview_splitter") or self.interview_splitter is None:
+            return
+        total = max(1, self.interview_splitter.height())
+        top = max(120, int(total * 0.30))
+        bottom = max(180, total - top)
+        self.interview_splitter.setSizes([top, bottom])
+        self._splitter_initialized = True
+
+    def _tick_caption_autoscroll(self) -> None:
+        if self._home_edit_active:
+            return
+        bar = self.caption_scroll.verticalScrollBar()
+        bar.setValue(bar.maximum())
+
+    def _set_gpt_result_text(self, text: str) -> None:
+        self.gpt_result_body.setPlainText((text or "").strip() or " ")
+
+    def set_gpt_extension_status_line(self, text: str) -> None:
+        lab = getattr(self, "gpt_ext_status_label", None)
+        if lab is None:
+            return
+        t = (text or "").strip()
+        if not t:
+            lab.hide()
+            lab.clear()
+            return
+        lab.setText(t)
+        lab.show()
+
+    def _refresh_gpt_history_nav(self) -> None:
+        if not hasattr(self, "gpt_prev_btn") or not hasattr(self, "gpt_next_btn"):
+            return
+        n = len(self.gpt_result_history)
+        idx = int(self.gpt_history_index)
+        self.gpt_prev_btn.setEnabled(n > 0 and idx > 0)
+        self.gpt_next_btn.setEnabled(n > 0 and idx >= 0 and idx < (n - 1))
+        if n <= 0 or idx < 0:
+            self.gpt_result_title.setText("0/0")
+        else:
+            self.gpt_result_title.setText(f"{idx + 1}/{n}")
+
+    def _push_gpt_result_history(self, text: str) -> None:
+        body = (text or "").strip()
+        if not body:
+            return
+        if self.gpt_result_history and self.gpt_result_history[-1] == body:
+            self.gpt_history_index = len(self.gpt_result_history) - 1
+            self._refresh_gpt_history_nav()
+            return
+        self.gpt_result_history.append(body)
+        self.gpt_history_index = len(self.gpt_result_history) - 1
+        self._refresh_gpt_history_nav()
+
+    def _copy_current_gpt_result(self) -> None:
+        txt = (self.gpt_result_body.toPlainText() or "").strip()
+        QApplication.clipboard().setText(txt)
+        self.gpt_copy_btn.setIcon(self._build_tick_svg_icon(14, "#2e7d32"))
+
+        def _restore_copy_icon() -> None:
+            try:
+                self.gpt_copy_btn.setIcon(self._build_copy_glyph_svg_icon(14, "#455a64"))
+            except Exception:
+                pass
+
+        QTimer.singleShot(900, _restore_copy_icon)
+
+    def _show_prev_gpt_result(self) -> None:
+        if self.gpt_history_index <= 0:
+            return
+        self.gpt_history_index -= 1
+        self._set_gpt_result_text(self.gpt_result_history[self.gpt_history_index])
+        self._refresh_gpt_history_nav()
+
+    def _show_next_gpt_result(self) -> None:
+        if self.gpt_history_index < 0 or self.gpt_history_index >= len(self.gpt_result_history) - 1:
+            return
+        self.gpt_history_index += 1
+        self._set_gpt_result_text(self.gpt_result_history[self.gpt_history_index])
+        self._refresh_gpt_history_nav()
 
     def bubble_width(self) -> int:
         inner = self.shell.width() - 28
@@ -4810,6 +5164,9 @@ class InterviewWindow(QWidget):
         self.scroll_to_bottom()
 
     def show_or_update_draft(self, text: str):
+        if self._home_edit_active and not self._allow_draft_updates_during_edit:
+            self._frozen_draft_text = text or ""
+            return
         if self.active_draft_label is None:
             row, panel, label = self.create_row(
                 "right", with_copy_button=True, copy_tooltip="Copy GPT prompt"
@@ -4819,6 +5176,7 @@ class InterviewWindow(QWidget):
             self.content_layout.insertWidget(stretch_index, row)
             panel.setFixedWidth(self.bubble_width())
             self.active_draft_row = row
+            self.active_draft_panel = panel
             self.active_draft_label = label
         else:
             self.active_draft_label.setText(text or " ")
@@ -4831,7 +5189,6 @@ class InterviewWindow(QWidget):
             self._interviewer_speaking_until = time.time() + float(
                 getattr(self, "_interviewer_speaking_window_seconds", 2.0)
             )
-        self.scroll_to_bottom()
 
     def finalize_draft(self, text: str, clipboard_prompt: str | None = None):
         if self.active_draft_label is not None:
@@ -4844,161 +5201,257 @@ class InterviewWindow(QWidget):
             )
             self.active_draft_label = None
             self.active_draft_row = None
-            self.scroll_to_bottom()
+            self.active_draft_panel = None
+            self._tick_caption_autoscroll()
             return
         self.add_text_row(text, "right", clipboard_prompt)
 
     def create_new_empty_draft(self):
+        self._frozen_draft_text = ""
         if self.active_draft_label is None:
             self.show_or_update_draft("")
 
+    def _try_enter_caption_edit_hotkey(self) -> None:
+        if self._home_edit_active:
+            if self._caption_edit_text_edit is not None:
+                self._caption_edit_text_edit.setFocus()
+                self._caption_edit_text_edit.selectAll()
+            return
+        if self.active_draft_label is None or self.active_draft_panel is None:
+            return
+        label_text = (self.active_draft_label.text() or "").strip()
+        # Consume current pending chunk so new live draft does not repeat the caption being edited.
+        consumed_text = (snapshot_chunk_since_last_end() or "").strip()
+        text = consumed_text or label_text
+        if not text:
+            return
+        self._home_edit_active = True
+        self._caption_edit_cap_id = str(uuid.uuid4())
+        self._caption_edit_sent_once = False
+        self._frozen_draft_text = ""
+        self._allow_draft_updates_during_edit = False
+        self.active_draft_label = None
+
+        panel = self.active_draft_panel
+        lay = panel.layout()
+        if lay is None:
+            return
+        while lay.count():
+            it = lay.takeAt(0)
+            w = it.widget()
+            if w is not None:
+                w.setParent(None)
+                w.deleteLater()
+
+        te = QTextEdit(panel)
+        te.setPlainText(text)
+        te.setAcceptRichText(False)
+        panel_h = int(panel.height() or panel.sizeHint().height() or 72)
+        edit_h = max(88, (panel_h - 38) * 2)
+        edit_h = min(edit_h, 320)
+        te.setFixedHeight(edit_h)
+        te.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        te.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        te.setStyleSheet(
+            f"QTextEdit {{ color: {TEXT_COLOR}; background: rgba(255,255,255,0.92); border: 1px solid rgba(17,17,17,100); padding: 6px; font-size: 15px; font-weight: 600; }}"
+        )
+        lay.addWidget(te)
+        btn_row = QHBoxLayout()
+        btn_row.addStretch(1)
+        reject_btn = QToolButton(panel)
+        send_btn = QToolButton(panel)
+        reject_btn.setIcon(self._build_x_cancel_svg_icon(18, "#c62828"))
+        send_btn.setIcon(self._build_send_plane_svg_icon(18, "#1565c0"))
+        reject_btn.setToolTip("Reject")
+        send_btn.setToolTip("Send")
+        reject_btn.setCursor(Qt.PointingHandCursor)
+        send_btn.setCursor(Qt.PointingHandCursor)
+        reject_btn.setIconSize(QSize(14, 14))
+        send_btn.setIconSize(QSize(14, 14))
+        reject_btn.setFixedSize(20, 20)
+        send_btn.setFixedSize(20, 20)
+        reject_btn.setStyleSheet(
+            "QToolButton { border: none; border-radius: 10px; background: transparent; }"
+            "QToolButton:hover { background: rgba(0, 0, 0, 0.08); }"
+        )
+        send_btn.setStyleSheet(
+            "QToolButton { border: none; border-radius: 10px; background: transparent; }"
+            "QToolButton:hover { background: rgba(0, 0, 0, 0.08); }"
+        )
+        reject_btn.clicked.connect(lambda _c=False, cid=self._caption_edit_cap_id: self._finish_caption_edit(True, cid))
+        send_btn.clicked.connect(lambda _c=False, cid=self._caption_edit_cap_id: self._finish_caption_edit(False, cid))
+        btn_row.addWidget(reject_btn)
+        btn_row.addWidget(send_btn)
+        lay.addLayout(btn_row)
+        self._caption_edit_panel = panel
+        self._caption_edit_text_edit = te
+        panel.adjustSize()
+        te.setFocus()
+        te.selectAll()
+        # Immediately create a fresh draft row so new interviewer speech continues there
+        # while this row stays dedicated to edit-only controls.
+        self._allow_draft_updates_during_edit = True
+        self.create_new_empty_draft()
+
+    def _restore_active_draft_panel_as_final(self, text: str, clipboard_prompt: str | None = None) -> None:
+        panel = self._caption_edit_panel
+        if panel is None:
+            self.add_text_row(text, "right", clipboard_prompt)
+            return
+        lay = panel.layout()
+        if lay is None:
+            lay = QVBoxLayout(panel)
+            lay.setContentsMargins(0, 0, 0, 0)
+            lay.setSpacing(8)
+        while lay.count():
+            it = lay.takeAt(0)
+            w = it.widget()
+            if w is not None:
+                w.setParent(None)
+                w.deleteLater()
+        label = QLabel()
+        label.setWordWrap(True)
+        label.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        label.setStyleSheet(
+            f"QLabel {{ color: {TEXT_COLOR}; background: transparent; border: none; font-size: 16px; font-weight: 700; }}"
+        )
+        label.setText(text or " ")
+        _, default_p = build_chunk_prompts(text or "", prompt_store, template_override=_session_chunk_template)
+        label.setProperty("copy_text", clipboard_prompt if clipboard_prompt is not None else default_p)
+        lay.addWidget(label)
+        actions = QHBoxLayout()
+        actions.setContentsMargins(0, 0, 0, 2)
+        actions.setSpacing(4)
+        actions.addStretch(1)
+        copy_btn = QToolButton(panel)
+        copy_btn.setIcon(self._build_copy_glyph_svg_icon(14, "#455a64"))
+        copy_btn.setIconSize(QSize(14, 14))
+        copy_btn.setCursor(Qt.PointingHandCursor)
+        copy_btn.setToolTip("Copy GPT prompt")
+        copy_btn.setFixedSize(20, 20)
+        copy_btn.setStyleSheet(
+            "QToolButton { border: none; border-radius: 10px; background: transparent; }"
+            "QToolButton:hover { background: rgba(0, 0, 0, 0.10); }"
+        )
+        copy_btn.clicked.connect(
+            lambda _checked=False, btn=copy_btn, lbl=label: InterviewWindow._on_copy_bubble_clicked(btn, lbl)
+        )
+        actions.addWidget(copy_btn)
+        lay.addLayout(actions)
+        panel.setFixedWidth(self.bubble_width())
+        panel.adjustSize()
+
+    def _finish_caption_edit(self, reject: bool, cap_id: str | None) -> None:
+        if not self._home_edit_active:
+            return
+        if cap_id is None or cap_id != self._caption_edit_cap_id:
+            return
+        if self._caption_edit_sent_once:
+            return
+        self._caption_edit_sent_once = True
+        te = self._caption_edit_text_edit
+        panel = self._caption_edit_panel
+        if te is None or panel is None:
+            self._home_edit_active = False
+            return
+        edited = te.toPlainText().strip()
+        if reject:
+            self._restore_active_draft_panel_as_final(edited, None)
+        else:
+            _, clip_prompt = build_chunk_prompts(
+                edited, prompt_store, template_override=_session_chunk_template
+            )
+            self._restore_active_draft_panel_as_final(edited, clip_prompt)
+            if edited:
+                threading.Thread(target=process_chunk, args=(edited,), daemon=True).start()
+        # Keep current active draft row (created after entering edit) for ongoing interviewer speech.
+        self._tick_caption_autoscroll()
+        self._caption_edit_text_edit = None
+        self._caption_edit_panel = None
+        self._caption_edit_cap_id = None
+        self._caption_edit_sent_once = False
+        self._home_edit_active = False
+        self._allow_draft_updates_during_edit = False
+        if self._frozen_draft_text:
+            self.show_or_update_draft(self._frozen_draft_text)
+            self._frozen_draft_text = ""
+
+    def _spawn_new_draft_while_editing(self) -> None:
+        if not self._home_edit_active:
+            return
+        self._allow_draft_updates_during_edit = True
+        self.create_new_empty_draft()
+
     def start_status_animation(self, kind: str, base_text: str):
         if kind == "gpt":
-            self._remove_all_gpt_status_rows()
+            self._set_gpt_result_text(base_text or "Generating...")
+            return
         row, panel, label = self.create_row("left")
         panel.setFixedWidth(self.bubble_width())
         status = StatusRow(label, base_text, row, panel)
         label.setText(self.format_status(base_text, status.step))
         self.status_rows[kind].append(status)
         self.insert_before_draft(row)
-        self.scroll_to_bottom()
 
     def replace_status_text(self, kind: str, text: str):
+        if kind == "gpt":
+            self._set_gpt_result_text(text or " ")
+            return
         if not self.status_rows[kind]:
             return
         status = self.status_rows[kind][-1]
         status.running = False
         status.label.setText(text or " ")
-        self.scroll_to_bottom()
 
     def _remove_all_gpt_status_rows(self) -> None:
-        for st in list(self.status_rows.get("gpt", [])):
-            if st.panel is not None:
-                try:
-                    self.message_panels.remove(st.panel)
-                except ValueError:
-                    pass
-            if st.row is not None:
-                self.content_layout.removeWidget(st.row)
-                st.row.deleteLater()
         self.status_rows["gpt"] = []
 
     def _remove_gpt_fallback_notice_row(self) -> None:
-        if self.gpt_fallback_notice_panel is not None:
-            try:
-                self.message_panels.remove(self.gpt_fallback_notice_panel)
-            except ValueError:
-                pass
-        if self.gpt_fallback_notice_row is not None:
-            self.content_layout.removeWidget(self.gpt_fallback_notice_row)
-            self.gpt_fallback_notice_row.deleteLater()
         self.gpt_fallback_notice_row = None
         self.gpt_fallback_notice_panel = None
         self.gpt_fallback_notice_label = None
 
     def show_gpt_fallback_notice(self, text: str) -> None:
-        self._remove_gpt_fallback_notice_row()
-        row, panel, label = self.create_row("left")
-        label.setText((text or "").strip() or " ")
-        label.setStyleSheet(
-            f"QLabel {{ color: #8a5a00; background: transparent; border: none; "
-            f"font-size: 14px; font-weight: 600; }}"
-        )
-        self.insert_before_draft(row)
-        panel.setFixedWidth(self.bubble_width())
-        self.gpt_fallback_notice_row = row
-        self.gpt_fallback_notice_panel = panel
-        self.gpt_fallback_notice_label = label
-        self.scroll_to_bottom()
+        self._set_gpt_result_text((text or "").strip() or " ")
 
     def begin_gpt_thinking_phase(self, thinking_text: str) -> None:
-        # Do not stack a static "Gpt processing…" row after streaming has already begun (timer race with HTTP notice).
-        if self.gpt_stream_label is not None:
-            return
-        self.start_status_animation("gpt", thinking_text or "Gpt processing")
+        self._set_gpt_result_text(thinking_text or "Generating...")
 
     def apply_gpt_session_start(self, http_notice: str, thinking_text: str) -> None:
-        """One GPT turn: optional HTTP notice, then animated thinking (notice removed first)."""
+        self.set_gpt_extension_status_line("")
         self._remove_gpt_fallback_notice_row()
         self._remove_all_gpt_status_rows()
         self._remove_gpt_stream_row()
         notice = (http_notice or "").strip()
-        think = (thinking_text or "Gpt processing").strip() or "Gpt processing"
         if notice:
-
-            def _after_notice() -> None:
-                self._remove_gpt_fallback_notice_row()
-                self.begin_gpt_thinking_phase(think)
-
-            self.show_gpt_fallback_notice(notice)
-            QTimer.singleShot(450, _after_notice)
+            self._set_gpt_result_text(notice)
         else:
-            self.begin_gpt_thinking_phase(think)
+            _ = thinking_text
+            self._set_gpt_result_text("Generating...")
+        self._refresh_gpt_history_nav()
 
     def _remove_gpt_stream_row(self) -> None:
-        if self.gpt_stream_panel is not None:
-            try:
-                self.message_panels.remove(self.gpt_stream_panel)
-            except ValueError:
-                pass
-        if self.gpt_stream_row is not None:
-            self.content_layout.removeWidget(self.gpt_stream_row)
-            self.gpt_stream_row.deleteLater()
         self.gpt_stream_row = None
         self.gpt_stream_panel = None
         self.gpt_stream_label = None
 
     def show_or_update_gpt_stream_partial(self, text: str) -> None:
-        """Left-aligned streaming GPT text while the model is still generating."""
         body = (text or "").strip()
         if not body:
             return
-        if self.gpt_stream_label is None:
-            self._remove_gpt_fallback_notice_row()
-            self._remove_all_gpt_status_rows()
-            row, panel, label = self.create_row("left", with_copy_button=True)
-            label.setStyleSheet(
-                f"QLabel {{ color: {TEXT_COLOR}; background: transparent; border: none; "
-                f"font-size: 16px; font-weight: 700; font-style: italic; }}"
-            )
-            self.insert_before_draft(row)
-            panel.setFixedWidth(self.bubble_width())
-            self.gpt_stream_row = row
-            self.gpt_stream_panel = panel
-            self.gpt_stream_label = label
-        if self.gpt_stream_label is None:
-            return
-        self.gpt_stream_label.setText(body)
-        if self.gpt_stream_panel is not None:
-            self.gpt_stream_panel.setFixedWidth(self.bubble_width())
-        self.scroll_to_bottom()
+        self._set_gpt_result_text(body)
 
     def finalize_gpt_stream_to_answer_row(self, answer: str) -> None:
-        """Keep the same left bubble used for pre-results, restyle it to the final answer (no jump to a new 'input' row)."""
+        self.set_gpt_extension_status_line("")
         self._remove_gpt_fallback_notice_row()
         self._remove_all_gpt_status_rows()
         ans = (answer or "").strip()
-        if self.gpt_stream_label is not None:
-            shown = ans or (self.gpt_stream_label.text() or "").strip()
-            if shown:
-                self.gpt_stream_label.setText(shown)
-                self.gpt_stream_label.setStyleSheet(
-                    f"QLabel {{ color: {TEXT_COLOR}; background: transparent; border: none; "
-                    f"font-size: 16px; font-weight: 700; font-style: normal; }}"
-                )
-                _remember_last_gpt_answer(shown)
-            else:
-                self._remove_gpt_stream_row()
-            self.gpt_stream_row = None
-            self.gpt_stream_panel = None
-            self.gpt_stream_label = None
-            self.scroll_to_bottom()
-            return
         self._remove_gpt_stream_row()
-        if ans:
-            _remember_last_gpt_answer(ans)
-            self.add_text_row(ans, "left")
-        self.scroll_to_bottom()
+        shown = ans or (self.gpt_result_body.toPlainText() or "").strip()
+        self._set_gpt_result_text(shown)
+        if shown:
+            self._push_gpt_result_history(shown)
+            _remember_last_gpt_answer(shown)
 
     def format_status(self, base: str, step: int) -> str:
         dot_count = 1 + (step % 3)
@@ -5090,8 +5543,16 @@ class InterviewWindow(QWidget):
                 self.show_or_update_gpt_stream_partial(event.get("text", ""))
             elif t == "gpt_final":
                 self.finalize_gpt_stream_to_answer_row(event.get("text", ""))
+            elif t == "gpt_ext_status":
+                self.set_gpt_extension_status_line(str(event.get("text", "") or ""))
             elif t == "new_empty_draft":
                 self.create_new_empty_draft()
+            elif t == "caption_edit_hotkey":
+                self._try_enter_caption_edit_hotkey()
+            elif t == "caption_edit_reject_hotkey":
+                self._finish_caption_edit(True, self._caption_edit_cap_id)
+            elif t == "caption_edit_spawn_new_draft":
+                self._spawn_new_draft_while_editing()
             elif t == "message":
                 self.add_text_row(event.get("text", ""), event.get("side", "left"))
             elif t == "f9_paste":
@@ -5164,6 +5625,18 @@ def queue_gpt_session_start(http_notice: str, thinking_text: str) -> None:
 
 def queue_new_empty_draft():
     ui_queue.put({"type": "new_empty_draft"})
+
+
+def queue_caption_edit_hotkey():
+    ui_queue.put({"type": "caption_edit_hotkey"})
+
+
+def queue_caption_edit_reject_hotkey():
+    ui_queue.put({"type": "caption_edit_reject_hotkey"})
+
+
+def queue_caption_edit_spawn_new_draft():
+    ui_queue.put({"type": "caption_edit_spawn_new_draft"})
 
 
 def _suffix_prefix_overlap_len(a: str, b: str, max_chars: int) -> int:
@@ -5288,7 +5761,7 @@ def process_chunk(raw_chunk):
 
 
 def on_press(key):
-    global last_end_key_at, last_delete_key_at
+    global last_end_key_at, last_delete_key_at, last_home_key_at
     global _shift_physically_down, last_f9_key_at
     try:
         if key in (keyboard.Key.shift, keyboard.Key.shift_l, keyboard.Key.shift_r):
@@ -5310,11 +5783,23 @@ def on_press(key):
             replace_all = _shift_physically_down
             threading.Thread(target=_inject_last_gpt_paste, args=(replace_all,), daemon=True).start()
             return
+        if key == keyboard.Key.home:
+            now = time.time()
+            if now - last_home_key_at < HOME_KEY_COOLDOWN_SECONDS:
+                return
+            last_home_key_at = now
+            queue_caption_edit_hotkey()
+            return
         if key == keyboard.Key.end:
             now = time.time()
             if now - last_end_key_at < END_KEY_COOLDOWN_SECONDS:
                 return
             last_end_key_at = now
+            if _main_interview_window is not None and bool(
+                getattr(_main_interview_window, "_home_edit_active", False)
+            ):
+                queue_caption_edit_spawn_new_draft()
+                return
             text = snapshot_chunk_since_last_end()
             if text:
                 _, clip_prompt = build_chunk_prompts(
@@ -5464,7 +5949,7 @@ if __name__ == "__main__":
 ./live.txt
 ================================================================================
 
-What version please? What version of the Llama model you were training? Now, what version? What was the version of Llama model you were training? Yeah, what version of Llama? OK. I think OK, tell me what did you do there? How did you train the train, the model? What was your role specifically that? What challenges did you face and how did you resolve them? Just one example, one example. Tell me what was the issue? How did you fix it? Mark any follow UPS appreciate it. Awesome Junior, thank you for your time. Uh, we'll get back to your vendor OK. Thank you. Thank you. Thank you. Bye, bye.
+Tell moe about yourself. Tell me about family. Tell me about yourself. Tell me about yourself. Tell me about current project.
 
 ================================================================================
 ./pipeline.py
@@ -6480,10 +6965,10 @@ PrepWizardWindow = PrepWizardWidget  # backward-compatible name
       "client_id": "587b1f99-6109-488a-9223-3c0ed706314a",
       "label": "Chrome client 587b1f",
       "registered_at": 1778170979,
-      "last_registered_at": 1778251254,
-      "resume_summary": "CANDIDATE BRIEFING\n\n\nPOSITIONING\n\n\n\n\nLead AI Engineer / senior AI platform engineer with 12+ years across AI engineering, data engineering, backend APIs, cloud infrastructure, and production ML systems.\n\n\nStrongest identity: practical GenAI/RAG engineer who can connect LLM systems to real enterprise data, APIs, observability, governance, and production deployment.\n\n\n\n\nCORE STRENGTHS\n\n\n\n\nBuilding production LLM, RAG, agentic AI, and copilots using Python, LangChain, LangGraph, OpenAI APIs, Hugging Face, and vector databases.\n\n\nDesigning ingestion, indexing, embedding, vector search, reranking, and contextual retrieval pipelines.\n\n\nBackend AI service development with FastAPI, REST APIs, gRPC, GraphQL, secure API integrations, and service orchestration.\n\n\nCloud-native AI deployment using Docker, Kubernetes, AWS, GCP, and Azure.\n\n\nML/data engineering foundations with Spark, SQL, ETL/ELT, feature engineering, batch and streaming pipelines.\n\n\nMLOps practices including CI/CD, regression testing, A/B testing, evaluation workflows, model monitoring, drift detection, and production-readiness reviews.\n\n\nObservability and reliability work: structured logging, telemetry, alerting, SLO tracking, latency/cost/reliability controls.\n\n\nCross-functional technical leadership across product, data, platform, security, and engineering stakeholders.\n\n\n\n\nBEST PROJECT / EXPERIENCE THEMES\n\n\n\n\nPricing intelligence GenAI/RAG workflows at Eagle Analytix for ticket pricing analytics, retrieval over pricing/inventory/sales data, and AI copilots for analysis.\n\n\nEnterprise knowledge integration: taking messy business data through ingestion, embeddings, vector search, retrieval, and usable AI workflows.\n\n\nProductionizing LLM systems: moving from proof of value to hardened APIs, deployment, testing, monitoring, governance, and continuous improvement.\n\n\nDistributed AI/ML platform work: training/inference pipelines, GPU bottleneck optimization, serving APIs, retrieval/reranking, and model quality monitoring.\n\n\nData platform background: healthcare search optimization, fraud/risk data pipelines, Spark/SQL processing, streaming pipelines, and cloud analytics systems.\n\n\n\n\nSYSTEMS THEY CAN CLAIM EXPERIENCE WITH\n\n\n\n\nAPIs/backend: Python, FastAPI, REST, gRPC, GraphQL, OpenAPI/Swagger, microservices, secure API integration.\n\n\nAI/ML: LLMs, RAG, AI agents, copilots, LangChain, LangGraph, OpenAI APIs, Anthropic Claude, Gemini, Hugging Face, PyTorch, prompt engineering, tool calling, memory, guardrails, LLM evaluation.\n\n\nRetrieval/data: vector databases, embedding pipelines, vector search, reranking, curated retrieval datasets, Spark, SQL, ETL/ELT, streaming and batch pipelines, feature engineering.\n\n\nCloud/infrastructure: AWS, GCP, Azure, Docker, Kubernetes, distributed systems, scalable inference services, GPU infrastructure, high availability, fault tolerance.\n\n\nMLOps/observability: CI/CD, model serving, evaluation workflows, regression tests, A/B tests, model monitoring, drift detection, structured logging, telemetry, alerting, SLOs.\n\n\nEnterprise workflows: data integration, production support, governance, privacy/security collaboration, model risk, cost/latency/reliability controls.\n\n\n\n\nSTRONG TALKING POINTS\n\n\n\n\nCan explain how to design a RAG system end to end: data ingestion, chunking/indexing, embeddings, vector retrieval, reranking/context assembly, prompt orchestration, evaluation, and production monitoring.\n\n\nCan talk about agentic workflows pragmatically: use agents where tool calling, memory, retrieval, and multi-step orchestration add",
-      "jd_summary": "JOB INTERVIEW BRIEFING\n\n\nROLE REALITY\n\n\n\n\nThis is a hands-on enterprise AI solution engineer role focused on turning business problems into AI workflows, copilots, agents, and automations.\n\n\nDay to day is likely stakeholder discovery, rapid prototyping, API/system integration, production hardening, governance alignment, and reusable AI pattern development.\n\n\n\n\nMUST PROVE\n\n\n\n\nCan translate vague business needs into concrete AI-enabled technical solutions.\n\n\nHas built LLM workflows, agents, copilots, or automations beyond simple chatbot demos.\n\n\nCan integrate AI systems with enterprise platforms using secure APIs and orchestration patterns.\n\n\nUnderstands RAG, enterprise knowledge integration, prompt/workflow design, and production deployment.\n\n\nCan move from proof of value to production with reliability, scalability, supportability, monitoring, and iteration.\n\n\nCan work across business, product, data, security, and engineering teams.\n\n\nUnderstands responsible AI, model risk, privacy, compliance, governance, and data protection.\n\n\nCan create reusable standards, templates, and patterns for broader enterprise AI adoption.\n\n\n\n\nLIKELY INTERVIEW THEMES\n\n\n\n\n\u201cTell me about a recent AI/LL",
-      "interview_gpt_brief": "JOB INTERVIEW BRIEFING\n\n\nROLE REALITY\n\n\n\n\nThis is a hands-on enterprise AI solution engineer role focused on turning business problems into AI workflows, copilots, agents, and automations.\n\n\nDay to day is likely stakeholder discovery, rapid prototyping, API/system integration, production hardening, governance alignment, and reusable AI pattern development.\n\n\n\n\nMUST PROVE\n\n\n\n\nCan translate vague business needs into concrete AI-enabled technical solutions.\n\n\nHas built LLM workflows, agents, copilots, or automations beyond simple chatbot demos.\n\n\nCan integrate AI systems with enterprise platforms using secure APIs and orchestration patterns.\n\n\nUnderstands RAG, enterprise knowledge integration, prompt/workflow design, and production deployment.\n\n\nCan move from proof of value to production with reliability, scalability, supportability, monitoring, and iteration.\n\n\nCan work across business, product, data, security, and engineering teams.\n\n\nUnderstands responsible AI, model risk, privacy, compliance, governance, and data protection.\n\n\nCan create reusable standards, templates, and patterns for broader enterprise AI adoption.\n\n\n\n\nLIKELY INTERVIEW THEMES\n\n\n\n\n\u201cTell me about a recent AI/LL"
+      "last_registered_at": 1778289844,
+      "resume_summary": "CANDIDATE BRIEFING\n\nPOSITIONING\n\nLead AI / analytics engineer with 12+ years across AI systems, ML pipelines, backend APIs, data platforms, and distributed systems.\n\nStrongest identity: production-focused AI engineer who connects LLM/RAG workflows, data engineering, APIs, observability, and stakeholder-facing analytics products.\n\nCORE STRENGTHS\n\nDesigning production RAG and agentic AI workflows with LangChain, LangGraph, embeddings, vector retrieval, metadata filtering, tool calling, validation, and fallback routing.\n\nBuilding Python/FastAPI backend services that expose AI, analytics, recommendation, and inference capabilities through REST, GraphQL, or gRPC patterns.\n\nCreating large-scale data and feature pipelines using Python, SQL, PySpark, Spark, Databricks, Snowflake, and Kafka.\n\nImproving AI output quality through retrieval optimization, chunking, reranking, analyst feedback, heuristic checks, evaluation, and regression testing.\n\nDeploying and operating AI/ML services with Docker, Kubernetes, CI/CD, AWS, GCP-aligned patterns, GitHub Actions, Jenkins, and release automation.\n\nObservability for AI and distributed systems using Prometheus, Grafana, Datadog, structured logging, tracing, dashboards, drift detection, and SLO monitoring.\n\nTranslating product, analyst, healthcare, risk, or broker needs into reliable ML/AI system designs.\n\nMentoring engineers, leading architecture reviews, documenting system boundaries, and partnering with product and leadership.\n\nBEST PROJECT / EXPERIENCE THEMES\n\nPricing intelligence and broker assistant platform: combined enterprise data, feature pipelines, RAG, agent orchestration, recommendation services, and conversational AI.\n\nLLM / RAG productionization: retrieval quality, grounding, explainability, validation layers, evaluation loops, and fallback behavior rather than just prompt changes.\n\nML/search/recommendation systems: healthcare provider search, fraud feature pipelines, retrieval/reranking, and recommendation quality improvements.\n\nDistributed data systems: streaming, ETL, warehouse modeling, Spark optimization, Kafka pipelines, Snowflake/Databricks-style workflows.\n\nProduction reliability: API performance, inference latency, telemetry, drift monitoring, CI/CD, Kubernetes deployment, and incident-oriented debugging.\n\nSYSTEMS THEY CAN CLAIM EXPERIENCE WITH\n\nAPIs/backend: Python, FastAPI, REST APIs, GraphQL, gRPC, Java, backend microservices, enterprise integrations.\n\nAI/ML: LangChain, LangGraph, RAG, embeddings, vector databases, retrieval optimization, reranking, LLM workflows, chatbot workflows, PyTorch, Scikit-learn, HuggingFace concepts.\n\nData: SQL, PySpark, Spark, Kafka, ETL, data modeling, feature engineering, data validation, Snowflake, Databricks, large-scale datasets.\n\nCloud/platform: AWS, GCP-aligned cloud-native patterns, Docker, Kubernetes, CI/CD, GitHub Actions, Jenkins.\n\nObservability/MLOps: Prometheus, Grafana, Datadog, structured logging, tracing, OpenTelemetry, SLOs, model versioning, regression tests, drift detection, A/B testing.\n\nDomain systems: pricing intelligence, broker analytics, LLM experimentation, healthcare search, fraud/risk analytics, cloud data pipelines, distributed microservices.\n\nSTRONG TALKING POINTS\n\nCan explain how to move from a vague business need to an AI architecture: data ingestion, feature preparation, retrieval, orchestration, validation, API layer, monitoring, and feedback loops.\n\nStrong answer angle: \u201cI usually improve RAG quality by fixing retrieval, chunking, metadata, reranking, and evaluation before changing models.\u201d\n\nCan speak credibly about non-deterministic AI reliability: validation layers, heuristic checks, regression tests, analyst review, fallback routing, and production observability.\n\nCan connect AI features to real product workflows, especially pricing assistants, chatbot-style interfaces, and recommendation systems.\n\nCan discuss latency and reliability trade-offs in inference APIs, retrieval pipelines, Spark jobs, and distributed services.\n\nCan position leadership as architecture ownership, mentoring, roadmap sequencing, documentation, and raising production standards.\n\nWEAK OR RISK AREAS\n\nAvoid over-claiming exact ownership at very large companies unless asked; frame Meta, Stripe, Snowflake, and Netflix work as components, collaboration, or platform support where appropriate.\n\nBe careful with highly specific metrics; use only the provided ones: ~30% broker lookup time reduction, ~20% search accuracy improvement, ~25% batch/SQL latency reduction, ~30% throughput improvement.\n\nGCP is described as \u201cGCP-aligned patterns\u201d in places, so avoid claiming deep hands-on ownership of specific GCP services unless the conversation confirms it.\n\nTensorFlow, LlamaIndex, OpenAI API are listed as concepts; do not present them as the main production stack.\n\nChrome extension product is mentioned only under Eagle Analytix; keep details high-level unless asked.\n\nEducation and company names are strong signals, but answers should focus on systems and practical engineering rather than brand names.\n\nNATURAL ANSWER STYLE\n\nSound like a senior hands-on lead: practical, architecture-aware, calm, and specific.\n\nUse first-person framing around trade-offs: reliability, latency, retrieval quality, evaluation, system boundaries, and production support.\n\nAvoid sounding like a pure researcher; emphasize building, shipping, monitoring, debugging, and improving real AI/data systems.\n\nBest tone: confident but not inflated, with concrete examples and clear explanation of why design choices were made.",
+      "jd_summary": "JOB INTERVIEW BRIEFING\n\nROLE REALITY\n\nThis role likely builds and supports practical AI-enabled analytics systems, especially RAG, chatbot, and agentic workflows connected to enterprise data.\n\nDay to day will combine AI application engineering, data pipeline work, API/backend integration, and collaboration with analytics or business stakeholders.\n\nMUST PROVE\n\nHands-on experience building agentic AI, LangChain, RAG, or chatbot systems, not just theoretical LLM knowledge.\n\nAbility to connect LLM workflows to real enterprise data through retrieval, embeddings, orchestration, and validation.\n\nStrong Python engineering and backend/API experience for deploying AI workflows into usable products.\n\nData engineering ability: orchestration, data modeling, ETL/ELT, feature pipelines, and working with structured data.\n\nFamiliarity with platforms like Databricks, Snowflake, or GCP.\n\nAbility to explain how AI outputs are evaluated, monitored, improved, and made reliable in production.\n\nLead-level judgment: architecture trade-offs, stakeholder communication, mentoring, and ownership.\n\nLIKELY INTERVIEW THEMES\n\n\u201cTell me about an AI project you built end to end.\u201d\n\nRAG architecture: ingestion, chunking, embeddings, vector search, retrieval quality, reranking, grounding, and evaluation.\n\nAgentic AI workflows: tools, memory, routing, validation, fallbacks, and guardrails.\n\nData engineering foundations: orchestration, data models, warehouse/lakehouse patterns, batch pipelines, and data quality.\n\nProduction readiness: observability, latency, reliability, CI/CD, monitoring, and debugging.\n\nLeadership: how the candidate guides technical decisions, handles ambiguity, and partners with non-technical stakeholders.\n\nSYSTEM DESIGN EXPECTATIONS\n\nDesign a chatbot or AI assistant over enterprise data.\n\nDesign a RAG pipeline using Databricks/Snowflake/GCP-backed data sources.\n\nDesign an agentic workflow that can retrieve data, call tools, validate outputs, and return explainable answers.\n\nDesign analytics pipelines that prepare raw business data for AI/ML or reporting.\n\nDesign monitoring and evaluation for non-deterministic LLM outputs.\n\nExplain how to move an AI prototype into production with APIs, orchestration, CI/CD, and observability.\n\nSTRONG KEYWORDS TO USE NATURALLY\n\nAgentic AI\n\nLangChain\n\nRAG\n\nChatbot workflows\n\nEmbeddings\n\nVector search\n\nRetrieval quality\n\nMetadata filtering\n\nReranking\n\nGrounding\n\nTool calling\n\nValidation layers\n\nFallback routing\n\nEvaluation framework\n\nData orchestration\n\nData modeling\n\nDatabricks\n\nSnowflake\n\nGCP\n\nPython\n\nFastAPI\n\nProduction ML pipelines\n\nObservability\n\nRED FLAGS TO AVOID\n\nSounding like the AI experience is only prompt engineering or experimentation.\n\nOver-focusing on model choice instead of data quality, retrieval quality, evaluation, and production reliability.\n\nBeing vague about hands-on LangChain/RAG/chatbot implementation details.\n\nNot being able to explain how enterprise data becomes usable context for AI systems.\n\nIgnoring data engineering responsibilities.\n\nClaiming \u201cagentic AI\u201d without explaining tools, routing, memory, validation, or control flow.\n\nTalking only about research or notebooks instead of deployable systems.\n\nOver-claiming deep expertise in platforms not actually used hands-on.\n\nBEST ANSWER ANGLE\n\nPosition the candidate as a hands-on lead who builds production AI analytics systems by combining RAG, agent orchestration, backend APIs, data pipelines, and observability.\n\nEmphasize practical AI reliability: better retrieval, structured data prep, evaluation loops, validation layers, fallback behavior, and monitoring rather than just calling an LLM.",
+      "interview_gpt_brief": "READY\nREADY\nREADY\nREADY\nREADY\nREADY\nREADY\nREADY\nREADY"
     }
   ],
   "selected_client_id": "587b1f99-6109-488a-9223-3c0ed706314a"

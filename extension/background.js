@@ -27,8 +27,8 @@ function rememberPrepTabId(tabId) {
 }
 
 /**
- * Same tab the HTTP /next-prompt path uses: bridged prep tab first, then storage, then focused-window ChatGPT only
- * (never first match across all Chrome windows).
+ * Bound ChatGPT tab for live interview: bridged prep tab, then storage, then active ChatGPT
+ * in the focused or current Chrome window only (never arbitrary background tabs).
  */
 async function resolveInterviewTargetTabId() {
   const tryId = async (id) => {
@@ -60,12 +60,6 @@ async function resolveInterviewTargetTabId() {
   tabs = await chrome.tabs.query({ active: true, lastFocusedWindow: true, url: chatgptUrls });
   if (tabs.length && tabs[0].id != null) return tabs[0].id;
 
-  tabs = await chrome.tabs.query({ currentWindow: true, url: chatgptUrls });
-  if (tabs.length) {
-    const sorted = [...tabs].sort((a, b) => (b.lastAccessed || 0) - (a.lastAccessed || 0));
-    if (sorted[0].id != null) return sorted[0].id;
-  }
-
   return null;
 }
 
@@ -90,6 +84,36 @@ async function forwardInterviewWsToTab(msg) {
   if (tabId == null) {
     console.warn("[Interview Assistant bg] interview WS: no ChatGPT tab for", msg && msg.type);
     return;
+  }
+  let wasInactive = false;
+  try {
+    const tab = await chrome.tabs.get(tabId).catch(() => null);
+    if (tab) {
+      wasInactive = !tab.active;
+      try {
+        const win = await chrome.windows.get(tab.windowId).catch(() => null);
+        if (win && !win.focused) wasInactive = true;
+      } catch (_e) {
+        wasInactive = true;
+      }
+    }
+    await chrome.tabs.update(tabId, { active: true }).catch(() => {});
+    if (tab && tab.windowId != null) {
+      await chrome.windows.update(tab.windowId, { focused: true }).catch(() => {});
+    }
+    if (wasInactive && interviewWs && interviewWs.readyState === WebSocket.OPEN) {
+      try {
+        interviewWs.send(
+          JSON.stringify({
+            type: "STATUS",
+            level: "warning",
+            message: "ChatGPT tab was not active; live pre-result may be delayed.",
+          })
+        );
+      } catch (_e) {}
+    }
+  } catch (_e) {
+    /* still try to deliver payload */
   }
   try {
     await chrome.tabs.sendMessage(tabId, { type: "IA_INTERVIEW_WS_PUSH", payload: msg });

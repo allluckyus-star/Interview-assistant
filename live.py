@@ -49,6 +49,11 @@ from ws_bridge import InterviewWSServer
 
 LIVE_CAPTIONS_WINDOW_NAME = "Live Captions"
 
+# Must match extension/background.js inactive-tab warning (shown only in GPT pane).
+_GPT_EXT_INACTIVE_TAB_MSG = (
+    "ChatGPT tab was not active; live pre-result may be delayed."
+)
+
 
 def _default_windows_live_captions_exe() -> Path:
     windir = os.environ.get("SystemRoot") or os.environ.get("WINDIR") or r"C:\Windows"
@@ -332,7 +337,7 @@ def handle_ws_extension_payload(payload: dict) -> None:
     if typ == "LIVE_ANSWER":
         rid = str(payload.get("request_id", "")).strip()
         text = str(payload.get("text", ""))
-        if rid and pending_request_id and rid == pending_request_id and text:
+        if rid and pending_request_id and rid == pending_request_id and (text or "").strip():
             _last_live_poll_for_rid = (rid, text)
             queue_gpt_stream_partial(text)
         return
@@ -349,6 +354,9 @@ def handle_ws_extension_payload(payload: dict) -> None:
         return
     if typ == "STATUS":
         msg = str(payload.get("message", "")).strip()
+        if msg == _GPT_EXT_INACTIVE_TAB_MSG:
+            ui_queue.put({"type": "gpt_ext_status", "text": msg})
+            return
         if msg:
             queue_ui_message(f"Extension: {msg}", "left")
 
@@ -523,6 +531,12 @@ class InterviewWindow(QWidget):
         gpt_layout.setSpacing(6)
         self.gpt_result_title = QLabel("0/0")
         self.gpt_result_title.setStyleSheet("font-size: 12px; font-weight: 700; color: #333;")
+        self.gpt_ext_status_label = QLabel("")
+        self.gpt_ext_status_label.setWordWrap(True)
+        self.gpt_ext_status_label.setStyleSheet(
+            "font-size: 10px; color: #a05000; padding: 0 0 4px 0; background: transparent;"
+        )
+        self.gpt_ext_status_label.hide()
         self.gpt_result_body = QTextEdit()
         self.gpt_result_body.setReadOnly(True)
         self.gpt_result_body.setAcceptRichText(False)
@@ -562,6 +576,7 @@ class InterviewWindow(QWidget):
         controls_row.addWidget(self.gpt_next_btn)
         controls_row.addStretch(1)
         gpt_layout.addWidget(self.gpt_result_title)
+        gpt_layout.addWidget(self.gpt_ext_status_label)
         gpt_layout.addWidget(self.gpt_result_body, 1)
         gpt_layout.addLayout(controls_row)
         self._refresh_gpt_history_nav()
@@ -957,6 +972,18 @@ class InterviewWindow(QWidget):
 
     def _set_gpt_result_text(self, text: str) -> None:
         self.gpt_result_body.setPlainText((text or "").strip() or " ")
+
+    def set_gpt_extension_status_line(self, text: str) -> None:
+        lab = getattr(self, "gpt_ext_status_label", None)
+        if lab is None:
+            return
+        t = (text or "").strip()
+        if not t:
+            lab.hide()
+            lab.clear()
+            return
+        lab.setText(t)
+        lab.show()
 
     def _refresh_gpt_history_nav(self) -> None:
         if not hasattr(self, "gpt_prev_btn") or not hasattr(self, "gpt_next_btn"):
@@ -1367,6 +1394,7 @@ class InterviewWindow(QWidget):
         self._set_gpt_result_text(thinking_text or "Generating...")
 
     def apply_gpt_session_start(self, http_notice: str, thinking_text: str) -> None:
+        self.set_gpt_extension_status_line("")
         self._remove_gpt_fallback_notice_row()
         self._remove_all_gpt_status_rows()
         self._remove_gpt_stream_row()
@@ -1390,6 +1418,7 @@ class InterviewWindow(QWidget):
         self._set_gpt_result_text(body)
 
     def finalize_gpt_stream_to_answer_row(self, answer: str) -> None:
+        self.set_gpt_extension_status_line("")
         self._remove_gpt_fallback_notice_row()
         self._remove_all_gpt_status_rows()
         ans = (answer or "").strip()
@@ -1490,6 +1519,8 @@ class InterviewWindow(QWidget):
                 self.show_or_update_gpt_stream_partial(event.get("text", ""))
             elif t == "gpt_final":
                 self.finalize_gpt_stream_to_answer_row(event.get("text", ""))
+            elif t == "gpt_ext_status":
+                self.set_gpt_extension_status_line(str(event.get("text", "") or ""))
             elif t == "new_empty_draft":
                 self.create_new_empty_draft()
             elif t == "caption_edit_hotkey":

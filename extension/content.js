@@ -522,6 +522,7 @@
   function getLiveRelayAssistantSnapshot(opts) {
     const o = opts || {};
     const b = o.baselineAssistantCount;
+    const allowHidden = o.allowHidden === true;
     if (typeof b !== "number" || b < 0) {
       return getLatestAssistantTextSnapshot(o);
     }
@@ -534,7 +535,7 @@
     for (let i = nodes.length - 1; i >= b; i -= 1) {
       const el = nodes[i];
       if (!(el instanceof HTMLElement)) continue;
-      if (!isElementVisible(el)) continue;
+      if (!allowHidden && !isElementVisible(el)) continue;
       let text = extractAssistantTurnText(el);
       text = applyRejectEcho(text, o.rejectPromptEcho || "");
       const t = text.trim();
@@ -558,13 +559,14 @@
     if (typeof o.baselineAssistantCount === "number" && o.baselineAssistantCount >= 0) {
       const nodes = getAssistantMessageList();
       const b = o.baselineAssistantCount;
+      const allowHidden = o.allowHidden === true;
       if (nodes.length <= b) {
         return "";
       }
       for (let i = nodes.length - 1; i >= b; i -= 1) {
         const el = nodes[i];
         if (!(el instanceof HTMLElement)) continue;
-        if (!isElementVisible(el)) continue;
+        if (!allowHidden && !isElementVisible(el)) continue;
         let text = extractAssistantTurnText(el);
         text = applyRejectEcho(text, o.rejectPromptEcho);
         if (text.length < minRaw) continue;
@@ -839,7 +841,7 @@
         : getAssistantMessageList().length;
     activeInterviewRequestId = String(requestId || "").trim();
     activeBaselineAssistantCount = baseline;
-    runLiveAnswerRelayTicker(requestId, rejectEcho || "", undefined, undefined, baseline);
+    runLiveAnswerRelayTicker(requestId, rejectEcho || "", undefined, undefined, baseline, false);
     (async () => {
       try {
         const answer = await captureAssistantResponseWithRetries(baseline, {
@@ -861,6 +863,9 @@
 
   /** Interview WebSocket runs in the background service worker; we only send frames over runtime messaging. */
   let wsStreamTimer = null;
+  let liveRelayObserver = null;
+  let liveRelayThrottleTimer = null;
+  let liveRelayGeneration = 0;
 
   function wsSend(obj) {
     try {
@@ -875,39 +880,120 @@
       clearInterval(wsStreamTimer);
       wsStreamTimer = null;
     }
+    if (liveRelayThrottleTimer) {
+      clearTimeout(liveRelayThrottleTimer);
+      liveRelayThrottleTimer = null;
+    }
+    if (liveRelayObserver) {
+      try {
+        liveRelayObserver.disconnect();
+      } catch (_e) {}
+      liveRelayObserver = null;
+    }
+    liveRelayGeneration += 1;
   }
 
-  /** Poll DOM every tickMs; emit LIVE_ANSWER at most once per minEmitMs while text grows (WS or HTTP relay to live.py). */
-  function runLiveAnswerRelayTicker(requestId, promptEcho, tickMs, minEmitMs, baselineAssistantCount) {
-    const tick = tickMs != null ? tickMs : 100;
-    const minGap = minEmitMs != null ? minEmitMs : 100;
+  /**
+   * MutationObserver-first LIVE_ANSWER relay (works when tab timers are throttled).
+   * Throttled LIVE sends; slow interval backup; FINAL when text stable ~2s and composer idle.
+   */
+  function runLiveAnswerRelayTicker(requestId, promptEcho, tickMs, minEmitMs, baselineAssistantCount, enableStabilityFinal) {
+    void tickMs;
+    void minEmitMs;
+    const doStabilityFinal = enableStabilityFinal === true;
+    const baseline =
+      typeof baselineAssistantCount === "number" && baselineAssistantCount >= 0
+        ? baselineAssistantCount
+        : getAssistantMessageList().length;
     clearWsStreamWatch();
-    let lastSentLive = 0;
-    let lastLiveSnap = "";
-    wsStreamTimer = setInterval(() => {
+    const myGen = liveRelayGeneration;
+    const THROTTLE_MS = 400;
+    const BACKUP_MS = 1200;
+    const STABLE_FINAL_MS = 2000;
+
+    let lastLiveSent = "";
+    let lastSnapForStability = "";
+    let stableSince = Date.now();
+    let finalSent = false;
+
+    function snapshot() {
+      return getLiveRelayAssistantSnapshot({
+        rejectPromptEcho: promptEcho || "",
+        minRawLen: 1,
+        allowHidden: true,
+        baselineAssistantCount: baseline,
+      });
+    }
+
+    function maybeSendLive(snap) {
+      const t = String(snap || "").trim();
+      if (!t || !requestId) return;
+      if (activeInterviewRequestId && requestId !== activeInterviewRequestId) return;
+      if (t === lastLiveSent) return;
+      lastLiveSent = t;
+      wsSend({ type: "LIVE_ANSWER", request_id: requestId, text: snap });
+    }
+
+    function maybeSendFinal(snap) {
+      if (!doStabilityFinal) return;
+      const t = String(snap || "").trim();
+      if (!t || finalSent || !requestId) return;
+      if (myGen !== liveRelayGeneration) return;
+      if (activeInterviewRequestId && requestId !== activeInterviewRequestId) return;
+      if (isStopGeneratingControlVisible()) return;
+      if (!isComposerIdleAfterAssistantTurn()) return;
+      finalSent = true;
+      wsSend({ type: "FINAL_ANSWER", request_id: requestId, answer: t });
+      clearWsStreamWatch();
+    }
+
+    function flush() {
+      if (finalSent || myGen !== liveRelayGeneration) return;
       if (!requestId) return;
       if (activeInterviewRequestId && requestId !== activeInterviewRequestId) return;
-      const now = Date.now();
-      const snap = getLiveRelayAssistantSnapshot({
-        rejectPromptEcho: promptEcho || "",
-        minRawLen: 4,
-        baselineAssistantCount:
-          typeof baselineAssistantCount === "number" && baselineAssistantCount >= 0
-            ? baselineAssistantCount
-            : undefined,
-      });
-      if (snap && snap !== lastLiveSnap && now - lastSentLive >= minGap) {
-        lastLiveSnap = snap;
-        lastSentLive = now;
-        console.log("[Interview Assistant] LIVE_ANSWER pre-result", {
-          request_id: requestId,
-          length: snap.length,
-        });
-        if (!activeInterviewRequestId || requestId === activeInterviewRequestId) {
-          wsSend({ type: "LIVE_ANSWER", request_id: requestId, text: snap });
-        }
+      const snap = snapshot();
+      const t = String(snap || "").trim();
+      if (t && t !== lastSnapForStability) {
+        lastSnapForStability = t;
+        stableSince = Date.now();
+        maybeSendLive(snap);
+        return;
       }
-    }, tick);
+      if (!t) return;
+      const now = Date.now();
+      if (doStabilityFinal && now - stableSince >= STABLE_FINAL_MS) {
+        maybeSendFinal(snap);
+      }
+    }
+
+    function scheduleFlush() {
+      if (finalSent || myGen !== liveRelayGeneration) return;
+      if (liveRelayThrottleTimer) return;
+      liveRelayThrottleTimer = setTimeout(() => {
+        liveRelayThrottleTimer = null;
+        flush();
+      }, THROTTLE_MS);
+    }
+
+    liveRelayObserver = new MutationObserver(() => {
+      scheduleFlush();
+    });
+    try {
+      liveRelayObserver.observe(document.body, {
+        subtree: true,
+        childList: true,
+        characterData: true,
+        attributes: true,
+      });
+    } catch (_e) {
+      liveRelayObserver = null;
+    }
+
+    wsStreamTimer = setInterval(() => {
+      scheduleFlush();
+    }, BACKUP_MS);
+
+    scheduleFlush();
   }
 
   function startWsResponseWatch(requestId, baselineAssistantCount, promptEcho) {
@@ -917,24 +1003,32 @@
         : getAssistantMessageList().length;
     activeInterviewRequestId = String(requestId || "").trim();
     activeBaselineAssistantCount = baseline;
-    runLiveAnswerRelayTicker(requestId, promptEcho, undefined, undefined, baseline);
+    runLiveAnswerRelayTicker(requestId, promptEcho, undefined, undefined, baseline, true);
+
+    const rid = String(requestId || "").trim();
+    const genAtStart = liveRelayGeneration;
 
     (async () => {
       try {
-        const answer = await captureAssistantResponseWithRetries(baseline, {
-          rejectPromptEcho: promptEcho || "",
-          minLen: 1,
-          retryAttempts: 3,
-          retryDelayMs: 180,
-          stableElapsedMs: 450,
-          compositePollMs: 120,
-          statusPhase: "ws_interview",
-          statusExtras: { request_id: requestId },
-        });
+        await wait(200000);
+        if (genAtStart !== liveRelayGeneration) return;
+        if (!rid || (activeInterviewRequestId && rid !== activeInterviewRequestId)) return;
+        const answer = (
+          await captureAssistantResponseWithRetries(baseline, {
+            rejectPromptEcho: promptEcho || "",
+            minLen: 1,
+            retryAttempts: 2,
+            retryDelayMs: 400,
+            stableElapsedMs: 1200,
+            compositePollMs: 400,
+            statusPhase: "ws_interview_fallback",
+            statusExtras: { request_id: rid },
+          })
+        ).trim();
         clearWsStreamWatch();
-        if (answer && (!activeInterviewRequestId || requestId === activeInterviewRequestId)) {
-          wsSend({ type: "FINAL_ANSWER", request_id: requestId, answer });
-        } else {
+        if (answer && (!activeInterviewRequestId || rid === activeInterviewRequestId)) {
+          wsSend({ type: "FINAL_ANSWER", request_id: rid, answer });
+        } else if (!answer) {
           wsSend({ type: "STATUS", level: "error", message: "no_assistant_reply" });
         }
       } catch (_e) {
@@ -1032,13 +1126,7 @@
       const prepPhase = String(message.phase || "prep_capture").replace(/[^a-z0-9_-]/gi, "_");
       iaLog("[prep] submitted; capturing assistant reply", { prepPhase, jobId });
       await reportGptStatus("prep_sent", { phase: prepPhase, job_id: jobId, rejectEcho: prompt }, true);
-      if (prepPhase === "interview_gpt_setup") {
-        // Step 4 only: do not wait for assistant capture.
-        await postPrepComplete(jobId, "", "");
-        return { ok: true };
-      }
 
-      // Step 2/3: keep capturing result text.
       const answer = await captureAssistantResponseWithRetries(baselineAi, {
         rejectPromptEcho: prompt,
         minLen: 1,
