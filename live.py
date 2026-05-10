@@ -43,6 +43,7 @@ from bridge_server import (
     set_selected_client_id,
 )
 from pipeline import build_chunk_prompts, process_caption_chunk
+from deploy_extension import ensure_extension_deployed
 from prep_wizard import PrepWizardWidget
 from ws_bridge import InterviewWSServer
 
@@ -426,8 +427,12 @@ class InterviewWindow(QWidget):
         self.status_rows: dict[str, list[StatusRow]] = {"llama": [], "gpt": []}
         self.message_panels: list[QWidget] = []
 
+        # Tool window: no taskbar button on Windows; we do not use the system tray.
         self.setWindowFlags(
-            Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint | Qt.WindowType.NoDropShadowWindowHint
+            Qt.WindowType.Tool
+            | Qt.FramelessWindowHint
+            | Qt.WindowStaysOnTopHint
+            | Qt.WindowType.NoDropShadowWindowHint
         )
         self.setAttribute(Qt.WA_TranslucentBackground, True)
         self.setObjectName("InterviewWindow")
@@ -1870,6 +1875,7 @@ def poll_latest_answer_loop():
 
 def main():
     global _main_interview_window
+    ensure_extension_deployed()
     with open("live.txt", "w", encoding="utf-8") as file:
         file.write("")
 
