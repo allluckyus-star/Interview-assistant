@@ -144,6 +144,10 @@ _session_chunk_template: str | None = None
 _http_fallback_notified = False
 # Dedupe live partial updates from /interview-live polling.
 _last_live_poll_for_rid: Tuple[str, str] = ("", "")
+# Typed-directly-in-ChatGPT mirror (extension must use same id — see extension/content.js).
+MANUAL_GPT_REQUEST_ID = "__manual_chatgpt_tab__"
+_last_manual_live_poll_for_rid: Tuple[str, str] = ("", "")
+_last_manual_final_seen: str = ""
 
 prompt_store = PromptStore()
 bridge = PromptBridgeServer(prompt_store)
@@ -327,8 +331,25 @@ def _fetch_interview_live_http(request_id: str) -> str:
 
 
 def handle_ws_extension_payload(payload: dict) -> None:
-    global pending_request_id, last_answer_request_id, _last_live_poll_for_rid
+    global pending_request_id, last_answer_request_id, _last_live_poll_for_rid, _last_manual_final_seen
     typ = str(payload.get("type", "")).strip()
+    if typ == "MANUAL_GPT_LIVE":
+        # Latest assistant text when the user typed in ChatGPT (no caption / bridge prompt).
+        if pending_request_id:
+            return
+        text = str(payload.get("text", "")).strip()
+        if text:
+            queue_gpt_stream_partial(text)
+        return
+    if typ == "MANUAL_GPT_FINAL":
+        if pending_request_id:
+            return
+        answer = str(payload.get("answer", "")).strip()
+        if not answer or answer == _last_manual_final_seen:
+            return
+        _last_manual_final_seen = answer
+        queue_gpt_final(answer, push_history=False)
+        return
     if typ == "LIVE_ANSWER":
         rid = str(payload.get("request_id", "")).strip()
         text = str(payload.get("text", ""))
@@ -344,6 +365,7 @@ def handle_ws_extension_payload(payload: dict) -> None:
         last_answer_request_id = rid
         pending_request_id = ""
         _last_live_poll_for_rid = ("", "")
+        _last_manual_final_seen = ""
         prompt_store.set_answer(rid, answer)
         queue_gpt_final(answer)
         return
@@ -522,7 +544,7 @@ class InterviewWindow(QWidget):
         gpt_layout = QVBoxLayout(self.gpt_result_panel)
         gpt_layout.setContentsMargins(10, 10, 10, 10)
         gpt_layout.setSpacing(6)
-        self.gpt_result_title = QLabel("0/0")
+        self.gpt_result_title = QLabel("ChatGPT RESULT")
         self.gpt_result_title.setStyleSheet("font-size: 12px; font-weight: 700; color: #333;")
         self.gpt_result_body = QTextEdit()
         self.gpt_result_body.setReadOnly(True)
@@ -536,36 +558,21 @@ class InterviewWindow(QWidget):
         controls_row.setContentsMargins(0, 0, 0, 0)
         controls_row.setSpacing(6)
         self.gpt_copy_btn = QToolButton()
-        self.gpt_prev_btn = QToolButton()
-        self.gpt_next_btn = QToolButton()
         self.gpt_copy_btn.setIcon(self._build_copy_glyph_svg_icon(14, "#455a64"))
-        self.gpt_prev_btn.setIcon(self._build_prev_chevron_svg_icon(14, "#455a64"))
-        self.gpt_next_btn.setIcon(self._build_next_chevron_svg_icon(14, "#455a64"))
-        self.gpt_prev_btn.setIconSize(QSize(14, 14))
-        self.gpt_next_btn.setIconSize(QSize(14, 14))
-        for _btn, _tip in (
-            (self.gpt_copy_btn, "Copy result"),
-            (self.gpt_prev_btn, "Previous result"),
-            (self.gpt_next_btn, "Next result"),
-        ):
-            _btn.setCursor(Qt.PointingHandCursor)
-            _btn.setToolTip(_tip)
-            _btn.setFixedSize(24, 24)
-            _btn.setStyleSheet(
-                "QToolButton { border: none; border-radius: 12px; background: transparent; font-weight: 700; }"
-                "QToolButton:hover { background: rgba(0, 0, 0, 0.10); }"
-            )
+        self.gpt_copy_btn.setIconSize(QSize(14, 14))
+        self.gpt_copy_btn.setCursor(Qt.PointingHandCursor)
+        self.gpt_copy_btn.setToolTip("Copy result")
+        self.gpt_copy_btn.setFixedSize(24, 24)
+        self.gpt_copy_btn.setStyleSheet(
+            "QToolButton { border: none; border-radius: 12px; background: transparent; font-weight: 700; }"
+            "QToolButton:hover { background: rgba(0, 0, 0, 0.10); }"
+        )
         self.gpt_copy_btn.clicked.connect(self._copy_current_gpt_result)
-        self.gpt_prev_btn.clicked.connect(self._show_prev_gpt_result)
-        self.gpt_next_btn.clicked.connect(self._show_next_gpt_result)
         controls_row.addWidget(self.gpt_copy_btn)
-        controls_row.addWidget(self.gpt_prev_btn)
-        controls_row.addWidget(self.gpt_next_btn)
         controls_row.addStretch(1)
         gpt_layout.addWidget(self.gpt_result_title)
         gpt_layout.addWidget(self.gpt_result_body, 1)
         gpt_layout.addLayout(controls_row)
-        self._refresh_gpt_history_nav()
 
         self.interview_splitter = QSplitter(Qt.Orientation.Vertical)
         self.interview_splitter.addWidget(self.caption_scroll)
@@ -742,30 +749,6 @@ class InterviewWindow(QWidget):
 <rect x="9" y="9" width="13" height="13" rx="2" ry="2"/>
 <path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/>
 </svg>"""
-        renderer = QSvgRenderer(svg.encode("utf-8"))
-        pixmap = QPixmap(size, size)
-        pixmap.fill(Qt.GlobalColor.transparent)
-        painter = QPainter(pixmap)
-        renderer.render(painter)
-        painter.end()
-        return QIcon(pixmap)
-
-    @staticmethod
-    def _build_prev_chevron_svg_icon(size: int, color: str) -> QIcon:
-        svg = f"""<svg xmlns="http://www.w3.org/2000/svg" width="{size}" height="{size}" viewBox="0 0 24 24" fill="none" stroke="{color}" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round">
-<polyline points="15 18 9 12 15 6"/></svg>"""
-        renderer = QSvgRenderer(svg.encode("utf-8"))
-        pixmap = QPixmap(size, size)
-        pixmap.fill(Qt.GlobalColor.transparent)
-        painter = QPainter(pixmap)
-        renderer.render(painter)
-        painter.end()
-        return QIcon(pixmap)
-
-    @staticmethod
-    def _build_next_chevron_svg_icon(size: int, color: str) -> QIcon:
-        svg = f"""<svg xmlns="http://www.w3.org/2000/svg" width="{size}" height="{size}" viewBox="0 0 24 24" fill="none" stroke="{color}" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round">
-<polyline points="9 18 15 12 9 6"/></svg>"""
         renderer = QSvgRenderer(svg.encode("utf-8"))
         pixmap = QPixmap(size, size)
         pixmap.fill(Qt.GlobalColor.transparent)
@@ -972,16 +955,8 @@ class InterviewWindow(QWidget):
         self.gpt_result_body.setPlainText((text or "").strip() or " ")
 
     def _refresh_gpt_history_nav(self) -> None:
-        if not hasattr(self, "gpt_prev_btn") or not hasattr(self, "gpt_next_btn"):
-            return
-        n = len(self.gpt_result_history)
-        idx = int(self.gpt_history_index)
-        self.gpt_prev_btn.setEnabled(n > 0 and idx > 0)
-        self.gpt_next_btn.setEnabled(n > 0 and idx >= 0 and idx < (n - 1))
-        if n <= 0 or idx < 0:
-            self.gpt_result_title.setText("0/0")
-        else:
-            self.gpt_result_title.setText(f"{idx + 1}/{n}")
+        """History nav UI removed; title stays fixed as ChatGPT RESULT."""
+        return
 
     def _push_gpt_result_history(self, text: str) -> None:
         body = (text or "").strip()
@@ -1007,20 +982,6 @@ class InterviewWindow(QWidget):
                 pass
 
         QTimer.singleShot(900, _restore_copy_icon)
-
-    def _show_prev_gpt_result(self) -> None:
-        if self.gpt_history_index <= 0:
-            return
-        self.gpt_history_index -= 1
-        self._set_gpt_result_text(self.gpt_result_history[self.gpt_history_index])
-        self._refresh_gpt_history_nav()
-
-    def _show_next_gpt_result(self) -> None:
-        if self.gpt_history_index < 0 or self.gpt_history_index >= len(self.gpt_result_history) - 1:
-            return
-        self.gpt_history_index += 1
-        self._set_gpt_result_text(self.gpt_result_history[self.gpt_history_index])
-        self._refresh_gpt_history_nav()
 
     def bubble_width(self) -> int:
         inner = self.shell.width() - 28
@@ -1402,7 +1363,7 @@ class InterviewWindow(QWidget):
             return
         self._set_gpt_result_text(body)
 
-    def finalize_gpt_stream_to_answer_row(self, answer: str) -> None:
+    def finalize_gpt_stream_to_answer_row(self, answer: str, *, push_history: bool = True) -> None:
         self._remove_gpt_fallback_notice_row()
         self._remove_all_gpt_status_rows()
         ans = (answer or "").strip()
@@ -1410,7 +1371,12 @@ class InterviewWindow(QWidget):
         shown = ans or (self.gpt_result_body.toPlainText() or "").strip()
         self._set_gpt_result_text(shown)
         if shown:
-            self._push_gpt_result_history(shown)
+            if push_history:
+                self._push_gpt_result_history(shown)
+            else:
+                self.gpt_result_history = [shown]
+                self.gpt_history_index = 0
+                self._refresh_gpt_history_nav()
             _remember_last_gpt_answer(shown)
 
     def format_status(self, base: str, step: int) -> str:
@@ -1502,7 +1468,10 @@ class InterviewWindow(QWidget):
             elif t == "gpt_stream":
                 self.show_or_update_gpt_stream_partial(event.get("text", ""))
             elif t == "gpt_final":
-                self.finalize_gpt_stream_to_answer_row(event.get("text", ""))
+                self.finalize_gpt_stream_to_answer_row(
+                    event.get("text", ""),
+                    push_history=bool(event.get("push_history", True)),
+                )
             elif t == "new_empty_draft":
                 self.create_new_empty_draft()
             elif t == "caption_edit_hotkey":
@@ -1566,9 +1535,9 @@ def queue_gpt_stream_partial(text: str) -> None:
     ui_queue.put({"type": "gpt_stream", "text": text})
 
 
-def queue_gpt_final(answer: str) -> None:
+def queue_gpt_final(answer: str, *, push_history: bool = True) -> None:
     _remember_last_gpt_answer(answer)
-    ui_queue.put({"type": "gpt_final", "text": answer})
+    ui_queue.put({"type": "gpt_final", "text": answer, "push_history": push_history})
 
 
 def queue_gpt_session_start(http_notice: str, thinking_text: str) -> None:
@@ -1854,6 +1823,7 @@ def run_capture_loop():
 
 def poll_latest_answer_loop():
     global pending_request_id, last_answer_request_id, _last_live_poll_for_rid
+    global _last_manual_live_poll_for_rid, _last_manual_final_seen
     while app_running:
         sleep_s = 1.0
         try:
@@ -1880,6 +1850,19 @@ def poll_latest_answer_loop():
                 if live_txt and (pend, live_txt) != _last_live_poll_for_rid:
                     _last_live_poll_for_rid = (pend, live_txt)
                     queue_gpt_stream_partial(live_txt)
+            else:
+                # HTTP fallback for manually typed ChatGPT replies (when WebSocket is down).
+                man_live = _fetch_interview_live_http(MANUAL_GPT_REQUEST_ID)
+                if man_live and (MANUAL_GPT_REQUEST_ID, man_live) != _last_manual_live_poll_for_rid:
+                    _last_manual_live_poll_for_rid = (MANUAL_GPT_REQUEST_ID, man_live)
+                    queue_gpt_stream_partial(man_live)
+                if (
+                    request_id == MANUAL_GPT_REQUEST_ID
+                    and answer
+                    and answer != _last_manual_final_seen
+                ):
+                    _last_manual_final_seen = answer
+                    queue_gpt_final(answer, push_history=False)
         except Exception:
             pass
         time.sleep(sleep_s)

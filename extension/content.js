@@ -8,6 +8,17 @@
   let lastGptStateFailNotified = 0;
   let activeInterviewRequestId = "";
   let activeBaselineAssistantCount = -1;
+  /** Must match live.py `MANUAL_GPT_REQUEST_ID` */
+  const MANUAL_GPT_RID = "__manual_chatgpt_tab__";
+  let prepCaptureBusy = false;
+  let cachedClientId = "";
+  let manualGptObserver = null;
+  let manualGptInterval = null;
+  let lastManualLiveEmitAt = 0;
+  let lastManualLivePayload = "";
+  let manualStableText = "";
+  let manualStableSince = 0;
+  let lastManualFinalPayload = "";
 
   /** DevTools on the ChatGPT tab — prep/GPT progress (not the Python terminal). */
   function iaLog(...args) {
@@ -995,6 +1006,7 @@
   }
 
   async function runPrepJob(message) {
+    prepCaptureBusy = true;
     const jobId = message.jobId || "";
     const prompt = message.prompt || "";
     iaLog("[prep] RUN_PREP_JOB start", { jobId, phase: message.phase, promptChars: (prompt || "").length });
@@ -1056,7 +1068,83 @@
       iaLog("[prep] FAIL exception", err && err.message ? err.message : err);
       await postPrepComplete(jobId, "", String(err && err.message ? err.message : err));
       return { ok: false, error: String(err) };
+    } finally {
+      prepCaptureBusy = false;
     }
+  }
+
+  function getManualLatestAssistantText() {
+    const t = sanitizeAssistantText(
+      getLatestAssistantTextSnapshot({
+        rejectPromptEcho: "",
+        minRawLen: 1,
+        usableMinChars: 2,
+        minAlphaRatio: 0.02,
+      })
+    ).trim();
+    if (/^(thinking([….]|\.*)?)$/i.test(t)) return "";
+    return t;
+  }
+
+  function manualCaptureAllowed() {
+    if (prepCaptureBusy) return false;
+    if (wsStreamTimer) return false;
+    return true;
+  }
+
+  function pulseManualGptTabRelay() {
+    if (!manualCaptureAllowed() || !cachedClientId) return;
+    const trimmed = getManualLatestAssistantText();
+    const now = Date.now();
+    if (isStopGeneratingControlVisible()) {
+      lastManualFinalPayload = "";
+    }
+    if (trimmed && trimmed !== lastManualLivePayload && now - lastManualLiveEmitAt >= 400) {
+      lastManualLiveEmitAt = now;
+      lastManualLivePayload = trimmed;
+      wsSend({ type: "MANUAL_GPT_LIVE", request_id: MANUAL_GPT_RID, text: trimmed });
+    }
+    if (trimmed !== manualStableText) {
+      manualStableText = trimmed;
+      manualStableSince = now;
+    }
+    const thinking = /^(thinking([….]|\.*)?)$/i.test(trimmed);
+    if (
+      trimmed &&
+      !thinking &&
+      !isStopGeneratingControlVisible() &&
+      isComposerIdleAfterAssistantTurn() &&
+      now - manualStableSince >= 2000 &&
+      trimmed === manualStableText &&
+      trimmed !== lastManualFinalPayload
+    ) {
+      lastManualFinalPayload = trimmed;
+      wsSend({ type: "MANUAL_GPT_FINAL", request_id: MANUAL_GPT_RID, answer: trimmed });
+    }
+  }
+
+  function startManualGptTabWatcher() {
+    if (!cachedClientId) return;
+    if (manualGptInterval) {
+      clearInterval(manualGptInterval);
+      manualGptInterval = null;
+    }
+    if (manualGptObserver) {
+      try {
+        manualGptObserver.disconnect();
+      } catch (_e) {}
+      manualGptObserver = null;
+    }
+    manualGptObserver = new MutationObserver(() => pulseManualGptTabRelay());
+    try {
+      manualGptObserver.observe(document.body, {
+        subtree: true,
+        childList: true,
+        characterData: true,
+        attributes: true,
+      });
+    } catch (_e) {}
+    manualGptInterval = setInterval(pulseManualGptTabRelay, 400);
   }
 
   chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
@@ -1115,5 +1203,20 @@
 
     return true;
   });
+
+  try {
+    chrome.storage.local.get(["clientId"], (d) => {
+      cachedClientId = String((d && d.clientId) || "").trim();
+      if (cachedClientId) startManualGptTabWatcher();
+    });
+  } catch (_e) {}
+  try {
+    chrome.storage.onChanged.addListener((changes, area) => {
+      if (area !== "local" || !changes.clientId) return;
+      const nv = changes.clientId.newValue;
+      cachedClientId = nv != null ? String(nv).trim() : "";
+      if (cachedClientId) startManualGptTabWatcher();
+    });
+  } catch (_e) {}
 
 })();

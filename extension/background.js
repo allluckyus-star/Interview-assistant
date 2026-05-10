@@ -3,6 +3,7 @@ const PREP_JOB_BASE = "http://127.0.0.1:8765/prep/job";
 const PREP_EXT_STATUS_URL = "http://127.0.0.1:8765/prep/extension-status";
 const WS_INTERVIEW_BASE = "ws://127.0.0.1:8766/ws";
 const INTERVIEW_LIVE_URL = "http://127.0.0.1:8765/interview-live";
+const ANSWER_ENDPOINT_BG = "http://127.0.0.1:8765/answer";
 /** One-shot alarm name; rescheduled each tick (Chrome recurring alarms are min 1 minute). */
 const BRIDGE_TICK_ALARM = "bridgeTick";
 const TICK_MS = 2000;
@@ -541,18 +542,31 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
       try {
         if (interviewWs && interviewWs.readyState === WebSocket.OPEN) {
           interviewWs.send(JSON.stringify(p));
-        } else if (p.type === "LIVE_ANSWER") {
-          const rid = String(p.request_id || "").trim();
-          if (!rid) {
-            sendResponse({ ok: true });
-            return;
+        } else {
+          const pt = String(p.type || "");
+          if (pt === "LIVE_ANSWER" || pt === "MANUAL_GPT_LIVE") {
+            const rid = String(p.request_id || "").trim();
+            if (!rid) {
+              sendResponse({ ok: true });
+              return;
+            }
+            const text = p.text != null ? String(p.text) : "";
+            await fetch(INTERVIEW_LIVE_URL, {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({ request_id: rid, text }),
+            });
+          } else if (pt === "MANUAL_GPT_FINAL") {
+            const rid = String(p.request_id || "").trim();
+            const answer = p.answer != null ? String(p.answer).trim() : "";
+            if (rid && answer) {
+              await fetch(ANSWER_ENDPOINT_BG, {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({ request_id: rid, answer }),
+              });
+            }
           }
-          const text = p.text != null ? String(p.text) : "";
-          await fetch(INTERVIEW_LIVE_URL, {
-            method: "POST",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({ request_id: rid, text }),
-          });
         }
       } catch (e) {
         console.warn("[Interview Assistant bg] interview WS / interview-live send", e);
