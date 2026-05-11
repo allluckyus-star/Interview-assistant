@@ -122,7 +122,7 @@ END_KEY_COOLDOWN_SECONDS = 0.8
 HOME_KEY_COOLDOWN_SECONDS = 0.45
 last_home_key_at = 0.0
 
-# Last finalized GPT answer for global paste hotkeys (F9 = paste, Shift+F9 = select-all + delete + paste).
+# Text F9 / Shift+F9 paste: finalized answers plus current streaming partial while a reply is in progress.
 last_gpt_answer_for_paste = ""
 last_f9_key_at = 0.0
 F9_COOLDOWN_SECONDS = 0.45
@@ -521,7 +521,7 @@ class InterviewWindow(QWidget):
         # Pause auto-scroll while the user is interacting (wheel / drag / arrows).
         # Cooldown extends on each interaction; after last scroll event + this many seconds, timer resumes sticking to bottom.
         self._user_scroll_cooldown_until = 0.0
-        self._user_scroll_cooldown_seconds = 3.0
+        self._user_scroll_cooldown_seconds = 1.5
         self._suppress_user_scroll_signal = False
         # Auto-scroll is gated on "interviewer is actively saying" (live caption draft updates).
         self._interviewer_speaking_until = 0.0
@@ -1367,6 +1367,7 @@ class InterviewWindow(QWidget):
         if not body:
             return
         self._set_gpt_result_text(body)
+        _remember_last_gpt_answer(body)
 
     def finalize_gpt_stream_to_answer_row(self, answer: str, *, push_history: bool = True) -> None:
         self._remove_gpt_fallback_notice_row()
