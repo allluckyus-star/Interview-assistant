@@ -246,8 +246,12 @@
     if (!el) return "";
     const md = el.querySelector(".markdown, [class*='markdown-new-styling'], [class*='prose']");
     const fromMd = md ? (md.innerText || "").trim() : "";
-    if (fromMd.length >= 8) return fromMd;
-    return (el.innerText || "").trim();
+    const fromWhole = (el.innerText || "").trim();
+    // Keep markdown quality when available, but prefer the full turn text when it is richer
+    // (cards/boxes/buttons/tool outputs often live outside the markdown subtree).
+    if (!fromMd) return fromWhole;
+    if (!fromWhole) return fromMd;
+    return fromWhole.length >= fromMd.length ? fromWhole : fromMd;
   }
 
   function applyRejectEcho(text, promptEcho) {
@@ -1074,16 +1078,19 @@
   }
 
   function getManualLatestAssistantText() {
-    const t = sanitizeAssistantText(
-      getLatestAssistantTextSnapshot({
-        rejectPromptEcho: "",
-        minRawLen: 1,
-        usableMinChars: 2,
-        minAlphaRatio: 0.02,
-      })
-    ).trim();
-    if (/^(thinking([….]|\.*)?)$/i.test(t)) return "";
-    return t;
+    // For manual mirroring, anchor to DOM order (latest turn), not visibility.
+    // ChatGPT virtualized viewport/scroll can hide the newest bubble and make visible-only
+    // selectors jump back to an older answer.
+    const nodes = getAssistantMessageList();
+    for (let i = nodes.length - 1; i >= 0; i -= 1) {
+      const el = nodes[i];
+      if (!(el instanceof HTMLElement)) continue;
+      const t = sanitizeAssistantText(extractAssistantTurnText(el)).trim();
+      if (!t) continue;
+      if (/^(thinking([….]|\.*)?)$/i.test(t)) continue;
+      return t;
+    }
+    return "";
   }
 
   function manualCaptureAllowed() {

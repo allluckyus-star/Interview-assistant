@@ -131,6 +131,7 @@ _shift_physically_down = False
 _interview_ws = None  # InterviewWSServer instance after prep completes
 _main_interview_window = None  # InterviewWindow — strong ref after handoff
 _active_interview_client_id = ""  # Client chosen in prep wizard for this live session only.
+_keyboard_listener = None  # pynput.Listener — stopped on window close so the process can exit
 
 ui_queue: queue.Queue = queue.Queue()
 app_running = True
@@ -394,6 +395,9 @@ class InterviewWindow(QWidget):
         start_with_prep: bool = True,
     ):
         super().__init__()
+        # Top-level QWidget does not quit QApplication on close by default; without this,
+        # the window hides but python.exe keeps running (still in Task Manager).
+        self.setAttribute(Qt.WidgetAttribute.WA_QuitOnClose, True)
         self.drag_offset = None
         self.resize_margin = 8
         self.resize_edges = None
@@ -904,9 +908,26 @@ class InterviewWindow(QWidget):
         super().mouseReleaseEvent(event)
 
     def closeEvent(self, event):
-        global app_running
+        global app_running, _keyboard_listener, _interview_ws
         app_running = False
+        try:
+            bridge.stop()
+        except Exception:
+            pass
+        try:
+            if _interview_ws is not None:
+                _interview_ws.stop()
+        except Exception:
+            pass
+        try:
+            if _keyboard_listener is not None:
+                _keyboard_listener.stop()
+        except Exception:
+            pass
         super().closeEvent(event)
+        app_inst = QApplication.instance()
+        if app_inst is not None:
+            app_inst.quit()
 
     def _sync_round_window_mask(self) -> None:
         """Clip the HWND to the same rounded rect as the shell QSS so the frosted bg edge matches the window."""
@@ -1757,8 +1778,11 @@ def on_release(key):
 
 
 def start_listener():
-    with keyboard.Listener(on_press=on_press, on_release=on_release) as listener:
-        listener.join()
+    global _keyboard_listener
+    _keyboard_listener = keyboard.Listener(on_press=on_press, on_release=on_release)
+    _keyboard_listener.start()
+    _keyboard_listener.join()
+    _keyboard_listener = None
 
 
 def run_capture_loop():

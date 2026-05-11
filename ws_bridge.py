@@ -47,6 +47,20 @@ class InterviewWSServer:
         async with websockets.serve(handler, WS_HOST, WS_PORT):
             await asyncio.Future()
 
+    def stop(self) -> None:
+        """Request the asyncio loop to stop (frees WS_PORT; thread may exit uncleanly)."""
+        loop = self._loop
+        if loop is None:
+            return
+
+        def _stop() -> None:
+            loop.stop()
+
+        try:
+            loop.call_soon_threadsafe(_stop)
+        except RuntimeError:
+            pass
+
     async def _handle_connection(self, websocket: Any, path: str) -> None:
         from urllib.parse import parse_qs, urlparse
 
