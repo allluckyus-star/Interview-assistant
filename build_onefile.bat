@@ -10,7 +10,7 @@ pyinstaller interview-assistant.spec --noconfirm
 if errorlevel 1 goto :err
 
 echo.
-echo Done: dist\InterviewAssistant.exe
+echo Done: dist\InterviewAssistant.exe (one file)
 pause
 exit /b 0
 

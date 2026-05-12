@@ -1,6 +1,7 @@
 # -*- mode: python ; coding: utf-8 -*-
 # Build: pyinstaller interview-assistant.spec
-# Output: dist/InterviewAssistant.exe
+# Output: single file dist/InterviewAssistant.exe (onefile).
+# Main window always uses exclude-from-capture on Windows (SetWindowDisplayAffinity in live.py).
 
 a = Analysis(
     ["live.py"],
@@ -24,6 +25,7 @@ exe = EXE(
     a.datas,
     [],
     name="InterviewAssistant",
+    onefile=True,
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,

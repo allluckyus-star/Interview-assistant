@@ -15,7 +15,7 @@ from pynput import keyboard
 import uiautomation as auto
 
 from PySide6.QtCore import QEvent, QSize, Qt, QTimer
-from PySide6.QtGui import QIcon, QMouseEvent, QPainter, QPainterPath, QPixmap, QRegion
+from PySide6.QtGui import QGuiApplication, QIcon, QMouseEvent, QPainter, QPainterPath, QPixmap, QRegion
 from PySide6.QtSvg import QSvgRenderer
 from PySide6.QtWidgets import (
     QApplication,
@@ -88,16 +88,43 @@ def restart_live_caption_exe() -> None:
     time.sleep(1.0)
 
 
-# Windows 10 2004+: many capture APIs omit this window; local display unchanged (SetWindowDisplayAffinity).
+# Windows 10 2004+: SetWindowDisplayAffinity — see _desired_display_affinity_for_window for per-display policy.
+_WDA_NONE = 0
 _WDA_EXCLUDEFROMCAPTURE = 0x00000011
+# Force WDA_EXCLUDEFROMCAPTURE on every display (may be invisible on some USB-HDMI secondaries).
+_ENV_STRICT_CAPTURE_EXCLUDE_EVERYWHERE = "INTERVIEW_ASSISTANT_STRICT_CAPTURE_EXCLUDE_EVERYWHERE"
 
 
-def _interview_env_truthy(name: str) -> bool:
-    v = (os.environ.get(name) or "").strip().lower()
+def _env_strict_capture_exclude_everywhere() -> bool:
+    v = (os.environ.get(_ENV_STRICT_CAPTURE_EXCLUDE_EVERYWHERE) or "").strip().lower()
     return v in ("1", "true", "yes", "on")
 
 
-def _win32_set_window_exclude_from_capture(hwnd: int) -> bool:
+def _desired_display_affinity_for_window(w: QWidget) -> int:
+    """Return affinity for the window based on which display holds its center.
+
+    Default: full exclude-from-capture on the **primary** (main) display only. On any **other**
+    display (typical USB-HDMI / extended monitor), use ``WDA_NONE`` so DWM still paints the window
+    locally — many secondary paths fail to show ``WDA_EXCLUDEFROMCAPTURE`` windows at all. That
+    tradeoff means snipping or sharing **that** monitor can include the app.
+
+    Set ``INTERVIEW_ASSISTANT_STRICT_CAPTURE_EXCLUDE_EVERYWHERE=1`` to always use exclude on every
+    display (stronger stealth; you may get a blank window again on HDMI).
+    """
+    if os.name != "nt":
+        return _WDA_NONE
+    if _env_strict_capture_exclude_everywhere():
+        return _WDA_EXCLUDEFROMCAPTURE
+    scr = QGuiApplication.screenAt(w.geometry().center())
+    pri = QGuiApplication.primaryScreen()
+    if scr is None or pri is None:
+        return _WDA_EXCLUDEFROMCAPTURE
+    if scr is not pri:
+        return _WDA_NONE
+    return _WDA_EXCLUDEFROMCAPTURE
+
+
+def _win32_set_window_display_affinity(hwnd: int, affinity: int) -> bool:
     if os.name != "nt" or not hwnd:
         return False
     import ctypes
@@ -105,7 +132,9 @@ def _win32_set_window_exclude_from_capture(hwnd: int) -> bool:
     user32 = ctypes.windll.user32
     user32.SetWindowDisplayAffinity.argtypes = [ctypes.c_void_p, ctypes.c_uint32]
     user32.SetWindowDisplayAffinity.restype = ctypes.c_int
-    return bool(user32.SetWindowDisplayAffinity(ctypes.c_void_p(hwnd), ctypes.c_uint32(_WDA_EXCLUDEFROMCAPTURE)))
+    return bool(
+        user32.SetWindowDisplayAffinity(ctypes.c_void_p(hwnd), ctypes.c_uint32(int(affinity)))
+    )
 
 
 RESUME_TEXT = "Paste your resume content here."
@@ -430,7 +459,7 @@ class InterviewWindow(QWidget):
         self.min_h = 320
         self._bridge_base = bridge_base.rstrip("/")
         self._start_with_prep = start_with_prep
-        self._exclude_from_capture = _interview_env_truthy("INTERVIEW_ASSISTANT_EXCLUDE_FROM_CAPTURE")
+        self._exclude_from_capture = os.name == "nt"
         self.prep_widget: PrepWizardWidget | None = None
         self.main_stack: QStackedWidget | None = None
         self.active_draft_label: QLabel | None = None
@@ -649,6 +678,11 @@ class InterviewWindow(QWidget):
         self.resize_timer = QTimer(self)
         self.resize_timer.setSingleShot(True)
         self.resize_timer.timeout.connect(self.refresh_panel_widths)
+
+        self._exclude_capture_geom_timer = QTimer(self)
+        self._exclude_capture_geom_timer.setSingleShot(True)
+        self._exclude_capture_geom_timer.setInterval(80)
+        self._exclude_capture_geom_timer.timeout.connect(self._sync_exclude_capture_after_geometry)
 
         # Hover cursor updates should work before clicking.
         self._enable_hover_tracking(self)
@@ -930,6 +964,11 @@ class InterviewWindow(QWidget):
         self.resize_start_pos = None
         self._update_cursor(event.position().toPoint())
         super().mouseReleaseEvent(event)
+        self._schedule_sync_exclude_capture_after_geometry()
+
+    def moveEvent(self, event):
+        super().moveEvent(event)
+        self._schedule_sync_exclude_capture_after_geometry()
 
     def closeEvent(self, event):
         global app_running, _keyboard_listener, _interview_ws
@@ -968,19 +1007,47 @@ class InterviewWindow(QWidget):
         self._apply_initial_splitter_sizes()
         if self._exclude_from_capture:
             QTimer.singleShot(0, self._apply_exclude_from_capture_if_enabled)
+            QTimer.singleShot(120, self._sync_exclude_capture_after_geometry)
+
+    def _schedule_sync_exclude_capture_after_geometry(self) -> None:
+        if not self._exclude_from_capture:
+            return
+        self._exclude_capture_geom_timer.start()
+
+    def _sync_exclude_capture_after_geometry(self) -> None:
+        if not self._exclude_from_capture or not self.isVisible():
+            return
+        self._sync_round_window_mask()
+        self._apply_exclude_from_capture_if_enabled()
+
+    def _apply_display_affinity_only(self) -> None:
+        if not self._exclude_from_capture or not self.isVisible():
+            return
+        hwnd = int(self.winId())
+        if hwnd:
+            aff = _desired_display_affinity_for_window(self)
+            _win32_set_window_display_affinity(hwnd, aff)
 
     def _apply_exclude_from_capture_if_enabled(self) -> None:
         if not self._exclude_from_capture or not self.isVisible():
             return
         hwnd = int(self.winId())
-        if hwnd:
-            _win32_set_window_exclude_from_capture(hwnd)
+        if not hwnd:
+            return
+        scr = QGuiApplication.screenAt(self.geometry().center())
+        prev = getattr(self, "_affinity_bump_screen", None)
+        if scr is not prev:
+            self._affinity_bump_screen = scr
+            for ms in (100, 400, 850):
+                QTimer.singleShot(ms, self._apply_display_affinity_only)
+        self._apply_display_affinity_only()
 
     def resizeEvent(self, event):
         self._sync_round_window_mask()
         self.resize_timer.start(20)
         if not self._splitter_initialized:
             QTimer.singleShot(0, self._apply_initial_splitter_sizes)
+        self._schedule_sync_exclude_capture_after_geometry()
         super().resizeEvent(event)
 
     def _apply_initial_splitter_sizes(self) -> None:
