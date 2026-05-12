@@ -103,8 +103,11 @@ APP_SHELL_CORNER_RADIUS_PX = 0
 capture_lock = threading.Lock()
 # Rolling normalized caption from Live Captions (not trimmed while listening).
 refined_full_caption = ""
+previous_refined_text = ""
+fixed_caption = ""
 # Character index in refined_full_caption where the next End slice starts (inclusive).
 next_chunk_start_index = 0
+next_chunk_start_text = ""
 # After End (or Delete skip), full caption text at that moment — used to realign the index when
 # Live Captions retroactively edits earlier words without changing total length much.
 _caption_chunk_anchor_prefix = ""
@@ -1602,24 +1605,55 @@ def _suffix_prefix_overlap_len(a: str, b: str, max_chars: int) -> int:
     return 0
 
 
-def _realign_chunk_boundary(new_text: str, anchor_prefix: str, fallback_idx: int) -> tuple[int, bool]:
-    """Map chunk start index into new_text.
+def _realign_chunk_boundary(new_text: str, anchor_full: str, fallback_idx: int) -> tuple[int, bool]:
+    """Map next_chunk_start_index into new_text after refined_full_caption changed.
 
-    Returns (index, is_confident). Low-confidence mappings are handled conservatively by caller.
+    anchor_full is refined_full_caption at last End/Delete (full snapshot).
+    fallback_idx is the cursor before this frame, clamped to the pre-update string length.
+
+    Returns (index, is_confident). Prefer append-only (startswith), else tail matches with tie-break
+    near fallback_idx (Live Captions may repeat phrases; first find() is often wrong).
     """
     n = len(new_text)
     fb = max(0, min(int(fallback_idx), n))
-    anchor = str(anchor_prefix or "")
-    if not anchor:
+    af = str(anchor_full or "")
+    if not af:
         return fb, False
-    if new_text.startswith(anchor):
-        return min(len(anchor), n), True
-    tail_len = min(_CHUNK_ANCHOR_TAIL_CHARS, len(anchor))
-    tail = anchor[-tail_len:] if tail_len else anchor
-    pos = new_text.find(tail)
-    if pos >= 0:
-        return min(pos + len(tail), n), True
-    overlap = _suffix_prefix_overlap_len(anchor, new_text, tail_len)
+    if len(new_text) >= len(af) and new_text.startswith(af):
+        return min(len(af), n), True
+    tail_len = min(_CHUNK_ANCHOR_TAIL_CHARS, len(af))
+    tail = af[-tail_len:] if tail_len else ""
+    if len(tail) < 8:
+        overlap = _suffix_prefix_overlap_len(af, new_text, max(_MIN_STRONG_OVERLAP_CHARS, len(tail)))
+        if overlap >= _MIN_STRONG_OVERLAP_CHARS:
+            return min(overlap, n), True
+        return fb, False
+    target = min(fb, n)
+    max_reasonable_dist = max(320, len(af) // 3, len(new_text) // 4)
+    best_pos = -1
+    best_dist: int | None = None
+    search_from = 0
+    while True:
+        pos = new_text.find(tail, search_from)
+        if pos < 0:
+            break
+        mapped_end = pos + len(tail)
+        dist = abs(mapped_end - target)
+        if (
+            best_dist is None
+            or dist < best_dist
+            or (dist == best_dist and pos > best_pos)
+        ):
+            best_pos, best_dist = pos, dist
+        search_from = pos + 1
+    if best_pos >= 0 and best_dist is not None and best_dist <= max_reasonable_dist:
+        return min(best_pos + len(tail), n), True
+    rp = new_text.rfind(tail)
+    if rp >= 0:
+        mapped_r = rp + len(tail)
+        if abs(mapped_r - target) <= max_reasonable_dist:
+            return min(mapped_r, n), True
+    overlap = _suffix_prefix_overlap_len(af, new_text, tail_len)
     if overlap >= _MIN_STRONG_OVERLAP_CHARS:
         return min(overlap, n), True
     if n > _BOUNDARY_VISIBLE_TAIL_FALLBACK_CHARS and fb >= n:
@@ -1786,8 +1820,9 @@ def start_listener():
 
 
 def run_capture_loop():
-    global refined_full_caption, next_chunk_start_index, _caption_chunk_anchor_prefix
-    global _boundary_shift_candidate_idx, _boundary_shift_candidate_hits
+    global refined_full_caption, next_chunk_start_index, _caption_chunk_anchor_prefix, previous_refined_text
+    global _boundary_shift_candidate_idx, _boundary_shift_candidate_hits, fixed_caption
+    global next_chunk_start_text
     with auto.UIAutomationInitializerInThread():
         window = auto.WindowControl(Name=LIVE_CAPTIONS_WINDOW_NAME)
         while app_running:
@@ -1808,44 +1843,28 @@ def run_capture_loop():
 
                 with capture_lock:
                     old_full = refined_full_caption
-                    if old_full and refined_text:
-                        # If source still includes already-trimmed head text, align to existing buffer start
-                        # so the trimmed head does not come back while listening.
-                        pos = refined_text.find(old_full)
-                        if pos > 0:
-                            refined_text = refined_text[pos:]
-                    if refined_full_caption == refined_text:
-                        time.sleep(0.2)
-                        continue
-                    prev_start = next_chunk_start_index
-                    candidate_start, confident = _realign_chunk_boundary(
-                        refined_text, _caption_chunk_anchor_prefix, prev_start
-                    )
-                    if (
-                        not confident
-                        and abs(candidate_start - prev_start) >= _BOUNDARY_SHIFT_CONFIRM_CHARS
-                    ):
-                        if _boundary_shift_candidate_idx == candidate_start:
-                            _boundary_shift_candidate_hits += 1
-                        else:
-                            _boundary_shift_candidate_idx = candidate_start
-                            _boundary_shift_candidate_hits = 1
-                        if _boundary_shift_candidate_hits < _BOUNDARY_SHIFT_CONFIRM_FRAMES:
-                            candidate_start = prev_start
+                    old_next = next_chunk_start_index
+                    # print(len(refined_full_caption), len(previous_refined_text), len(refined_text))
+                    if len(previous_refined_text) - len(refined_text) > 100:
+                        proper_index = previous_refined_text.find(refined_text[:500])
+                        if proper_index >= 0:
+                            fixed_caption += previous_refined_text[:proper_index]
+
+                    refined_full_caption = fixed_caption + refined_text
+                    previous_refined_text = refined_text
+                    new_full = refined_full_caption
+                    if _caption_chunk_anchor_prefix:
+                        mapped, _ = _realign_chunk_boundary(
+                            new_full,
+                            _caption_chunk_anchor_prefix,
+                            min(old_next, len(old_full)),
+                        )
+                        next_chunk_start_index = max(0, min(mapped, len(new_full)))
                     else:
-                        _boundary_shift_candidate_idx = -1
-                        _boundary_shift_candidate_hits = 0
-                    next_chunk_start_index = candidate_start
-                    if len(refined_text) < next_chunk_start_index:
-                        next_chunk_start_index = len(refined_text)
-                    refined_full_caption = refined_text
-                    start = next_chunk_start_index
-                    draft_tail = refined_full_caption[start:]
-                    cap_for_file = refined_full_caption
+                        next_chunk_start_index = max(0, min(old_next, len(new_full)))
+                    draft_tail = refined_full_caption[next_chunk_start_index:]
 
                 queue_draft_input(draft_tail)
-                with open("live.txt", "w", encoding="utf-8") as file:
-                    file.write(cap_for_file)
             except Exception:
                 time.sleep(0.3)
             time.sleep(0.2)
