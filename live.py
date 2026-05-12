@@ -88,6 +88,26 @@ def restart_live_caption_exe() -> None:
     time.sleep(1.0)
 
 
+# Windows 10 2004+: many capture APIs omit this window; local display unchanged (SetWindowDisplayAffinity).
+_WDA_EXCLUDEFROMCAPTURE = 0x00000011
+
+
+def _interview_env_truthy(name: str) -> bool:
+    v = (os.environ.get(name) or "").strip().lower()
+    return v in ("1", "true", "yes", "on")
+
+
+def _win32_set_window_exclude_from_capture(hwnd: int) -> bool:
+    if os.name != "nt" or not hwnd:
+        return False
+    import ctypes
+
+    user32 = ctypes.windll.user32
+    user32.SetWindowDisplayAffinity.argtypes = [ctypes.c_void_p, ctypes.c_uint32]
+    user32.SetWindowDisplayAffinity.restype = ctypes.c_int
+    return bool(user32.SetWindowDisplayAffinity(ctypes.c_void_p(hwnd), ctypes.c_uint32(_WDA_EXCLUDEFROMCAPTURE)))
+
+
 RESUME_TEXT = "Paste your resume content here."
 JOB_DESCRIPTION_TEXT = "Paste job description here."
 ADDITIONAL_CONTEXT_TEXT = (
@@ -410,6 +430,7 @@ class InterviewWindow(QWidget):
         self.min_h = 320
         self._bridge_base = bridge_base.rstrip("/")
         self._start_with_prep = start_with_prep
+        self._exclude_from_capture = _interview_env_truthy("INTERVIEW_ASSISTANT_EXCLUDE_FROM_CAPTURE")
         self.prep_widget: PrepWizardWidget | None = None
         self.main_stack: QStackedWidget | None = None
         self.active_draft_label: QLabel | None = None
@@ -945,6 +966,15 @@ class InterviewWindow(QWidget):
         super().showEvent(event)
         self._sync_round_window_mask()
         self._apply_initial_splitter_sizes()
+        if self._exclude_from_capture:
+            QTimer.singleShot(0, self._apply_exclude_from_capture_if_enabled)
+
+    def _apply_exclude_from_capture_if_enabled(self) -> None:
+        if not self._exclude_from_capture or not self.isVisible():
+            return
+        hwnd = int(self.winId())
+        if hwnd:
+            _win32_set_window_exclude_from_capture(hwnd)
 
     def resizeEvent(self, event):
         self._sync_round_window_mask()
