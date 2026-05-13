@@ -7,163 +7,23 @@ const LEGACY_JD_DRAFT = "jdDraft";
 const shell = document.getElementById("shell");
 const panelResume = document.getElementById("panelResume");
 const panelJD = document.getElementById("panelJD");
-const panelPrompts = document.getElementById("panelPrompts");
 const btnResume = document.getElementById("btnResume");
 const btnJD = document.getElementById("btnJD");
-const btnPrompts = document.getElementById("btnPrompts");
 const resumeText = document.getElementById("resumeText");
 const jdText = document.getElementById("jdText");
 const bridgeErr = document.getElementById("bridgeErr");
 const registerStatus = document.getElementById("registerStatus");
 
-/** All four prompt templates the app can override from the extension. */
+/** Template keys still migrated between profile stems in chrome.storage (not edited or synced from popup). */
 const TEMPLATE_KEYS = ["resume_summary", "jd_summary", "initial_interview", "chunk_interview"];
-const TEMPLATE_FIELDS = {
-  resume_summary: document.getElementById("tplResumeSummary"),
-  jd_summary: document.getElementById("tplJdSummary"),
-  initial_interview: document.getElementById("tplInitialInterview"),
-  chunk_interview: document.getElementById("tplChunkInterview"),
-};
 
 const W_MENU = 248;
 const W_PANEL = 280;
-const W_PANEL_PROMPTS = 420;
-
-/** Defaults shown the first time a profile opens the Prompts panel; identical to what live.py used as fixed prompts. */
-const DEFAULT_TEMPLATES = {
-  resume_summary: `You are an expert technical interviewer assistant.
-
-Task:
-Summarize the candidate's resume into a concise, structured briefing for real-time interview support.
-
-Rules:
-
-* Output ONLY the final summary (no explanation)
-* Keep it concise but information-dense
-* Focus on signal, not fluff
-* No generic phrases
-
----
-
-Structure:
-
-1. CORE PROFILE (2–3 lines)
-
-* Years of experience
-* Primary role (AI / backend / full-stack / etc.)
-* Key domains
-
-2. KEY SKILLS
-
-* List top technical strengths
-* Prioritize production-level skills
-
-3. SYSTEM EXPERIENCE
-
-* What kinds of systems they built (e.g., ML pipelines, APIs, distributed systems)
-
-4. STRENGTH SIGNALS
-
-* What makes them strong (e.g., scalability, ownership, optimization)
-
-5. WEAK / MISSING AREAS (IMPORTANT)
-
-* Gaps relative to modern expectations
-
----
-
-Tone:
-
-* Direct
-* Technical
-* Interview-ready
-
----
-
-INPUT RESUME:
-{resume_text}`,
-  jd_summary: `You are an expert hiring manager.
-
-Task:
-Analyze the job description and extract what the interviewer ACTUALLY cares about.
-
-Rules:
-
-* Output ONLY the structured summary
-* Be precise and realistic
-* Avoid repeating the JD verbatim
-
----
-
-Structure:
-
-1. ROLE CORE
-
-* What this role really is (not title, actual function)
-
-2. MUST-HAVE SKILLS (CRITICAL)
-
-* Non-negotiable requirements
-
-3. IMPORTANT SKILLS
-
-* Strongly preferred but flexible
-
-4. NICE-TO-HAVE
-
-* Bonus skills
-
-5. SYSTEM EXPECTATIONS
-
-* What systems candidate should be able to build
-
-6. INTERVIEW FOCUS
-
-* What interviewer will likely test (VERY IMPORTANT)
-
-7. RED FLAGS
-
-* What will cause rejection
-
----
-
-Tone:
-
-* Hiring manager perspective
-* Practical, not theoretical
-
----
-
-INPUT JOB DESCRIPTION:
-{jd_text}`,
-  initial_interview: `You are helping a candidate during a live technical interview.
-
-You will receive short excerpts of what the interviewer said (as captions). When sent, reply with only the exact words the candidate should say next — concise, first person, no meta commentary.
-
-Static resume and job context were already provided in earlier messages in this chat. Do not ask for them again.
-
-Reply with one short sentence confirming you are ready, then stop.`,
-  chunk_interview: `You are generating what the candidate should say in an interview.
-
-Hard rules (non-negotiable):
-- Output only the final answer text the candidate should speak.
-- No explanation, no analysis, no headings, no labels, no bullet list unless interviewer explicitly asked for a list.
-- Use first person.
-- Keep concise and natural, interview-ready tone.
-- If multiple questions are present, answer them in asked order in compact paragraph form.
-- If there is no clear question, output one short clarification question only.
-
-Interviewer intent (cleaned):
-{cleaned_interviewer_intent}
-`,
-};
 
 let resumeOpen = false;
 let jdOpen = false;
-let promptsOpen = false;
 let saveResumeTimer = null;
 let saveJdTimer = null;
-const saveTplTimers = { resume_summary: null, jd_summary: null, initial_interview: null, chunk_interview: null };
 /** Cached profile stem for beforeunload (sync API only). */
 let cachedProfileStem = "";
 
@@ -191,10 +51,6 @@ window.addEventListener("beforeunload", () => {
     [profileResumeKey(cachedProfileStem)]: resumeText.value,
     [profileJdKey(cachedProfileStem)]: jdText.value,
   };
-  for (const k of TEMPLATE_KEYS) {
-    const el = TEMPLATE_FIELDS[k];
-    if (el) patch[profileTemplateKey(cachedProfileStem, k)] = el.value;
-  }
   chrome.storage.local.set(patch);
 });
 
@@ -202,7 +58,6 @@ function syncShellWidth() {
   let w = W_MENU;
   if (resumeOpen) w += W_PANEL;
   if (jdOpen) w += W_PANEL;
-  if (promptsOpen) w += W_PANEL_PROMPTS;
   shell.style.width = `${w}px`;
 }
 
@@ -306,24 +161,9 @@ async function loadPersistedIntoTextareas() {
   await migrateLegacyDraftsIfNeeded(stem);
   const rKey = profileResumeKey(stem);
   const jKey = profileJdKey(stem);
-  const tplKeys = TEMPLATE_KEYS.map((k) => profileTemplateKey(stem, k));
-  const data = await chrome.storage.local.get([rKey, jKey, ...tplKeys]);
+  const data = await chrome.storage.local.get([rKey, jKey]);
   if (data[rKey] != null) resumeText.value = String(data[rKey]);
   if (data[jKey] != null) jdText.value = String(data[jKey]);
-  const seedPatch = {};
-  for (const k of TEMPLATE_KEYS) {
-    const el = TEMPLATE_FIELDS[k];
-    if (!el) continue;
-    const stored = data[profileTemplateKey(stem, k)];
-    const hasStored = stored != null && String(stored).trim().length > 0;
-    if (hasStored) {
-      el.value = String(stored);
-    } else if (DEFAULT_TEMPLATES[k]) {
-      el.value = DEFAULT_TEMPLATES[k];
-      seedPatch[profileTemplateKey(stem, k)] = el.value;
-    }
-  }
-  if (Object.keys(seedPatch).length) await chrome.storage.local.set(seedPatch);
 }
 
 /** Bridge reachability only — resume/JD text live in the extension profile store. */
@@ -369,45 +209,6 @@ async function postJd(text) {
   }
 }
 
-async function postTemplate(key, text) {
-  if (!TEMPLATE_KEYS.includes(key)) return;
-  try {
-    const clientId = await getOrCreateClientId();
-    await fetch(`${BRIDGE}/context/template/${encodeURIComponent(key)}`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ text, client_id: clientId }),
-    });
-    setBridgeError("");
-  } catch (_e) {
-    setBridgeError(`Could not push ${key} prompt to bridge (saved locally in extension)`);
-  }
-}
-
-async function persistProfileTemplateNow(key) {
-  if (!TEMPLATE_KEYS.includes(key)) return;
-  if (!cachedProfileStem) await refreshProfileStemCache();
-  if (!cachedProfileStem) return;
-  const el = TEMPLATE_FIELDS[key];
-  if (!el) return;
-  await chrome.storage.local.set({ [profileTemplateKey(cachedProfileStem, key)]: el.value });
-}
-
-async function pushTemplateToBridgeSession(key) {
-  if (!TEMPLATE_KEYS.includes(key)) return;
-  await persistProfileTemplateNow(key);
-  const el = TEMPLATE_FIELDS[key];
-  await postTemplate(key, el ? el.value : "");
-}
-
-function scheduleSaveTemplateDraft(key) {
-  if (!TEMPLATE_KEYS.includes(key)) return;
-  clearTimeout(saveTplTimers[key]);
-  saveTplTimers[key] = setTimeout(() => {
-    void pushTemplateToBridgeSession(key);
-  }, 400);
-}
-
 async function persistProfileResumeNow() {
   if (!cachedProfileStem) await refreshProfileStemCache();
   if (!cachedProfileStem) return;
@@ -445,7 +246,6 @@ async function pushJdToBridgeSession() {
   await postJd(jdText.value);
 }
 
-/** Close any currently open panel except the one named, persisting + pushing its content. */
 async function closeOtherPanels(except) {
   if (except !== "resume" && resumeOpen) {
     resumeOpen = false;
@@ -460,13 +260,6 @@ async function closeOtherPanels(except) {
     btnJD.classList.remove("toggle-on");
     panelJD.setAttribute("aria-hidden", "true");
     await pushJdToBridgeSession();
-  }
-  if (except !== "prompts" && promptsOpen) {
-    promptsOpen = false;
-    panelPrompts.classList.remove("open");
-    btnPrompts.classList.remove("toggle-on");
-    panelPrompts.setAttribute("aria-hidden", "true");
-    for (const k of TEMPLATE_KEYS) await pushTemplateToBridgeSession(k);
   }
 }
 
@@ -518,35 +311,6 @@ jdText.addEventListener("input", scheduleSaveJdDraft);
 jdText.addEventListener("blur", () => {
   void pushJdToBridgeSession();
 });
-
-btnPrompts.addEventListener("click", async () => {
-  const wasOpen = promptsOpen;
-  promptsOpen = !promptsOpen;
-  panelPrompts.classList.toggle("open", promptsOpen);
-  btnPrompts.classList.toggle("toggle-on", promptsOpen);
-  panelPrompts.setAttribute("aria-hidden", promptsOpen ? "false" : "true");
-  if (promptsOpen) await closeOtherPanels("prompts");
-  syncShellWidth();
-  if (promptsOpen) {
-    for (const k of TEMPLATE_KEYS) {
-      const el = TEMPLATE_FIELDS[k];
-      if (el && el.value.trim()) await pushTemplateToBridgeSession(k);
-    }
-    return;
-  }
-  if (wasOpen) {
-    for (const k of TEMPLATE_KEYS) await pushTemplateToBridgeSession(k);
-  }
-});
-
-for (const k of TEMPLATE_KEYS) {
-  const el = TEMPLATE_FIELDS[k];
-  if (!el) continue;
-  el.addEventListener("input", () => scheduleSaveTemplateDraft(k));
-  el.addEventListener("blur", () => {
-    void pushTemplateToBridgeSession(k);
-  });
-}
 
 async function refreshRegistryStatus() {
   try {
@@ -614,7 +378,6 @@ async function registerClient() {
     await loadPersistedIntoTextareas();
     await pushResumeToBridgeSession();
     await pushJdToBridgeSession();
-    for (const k of TEMPLATE_KEYS) await pushTemplateToBridgeSession(k);
     await refreshRegistryStatus();
   } catch (_e) {
     registerStatus.textContent = "Status: Please register";
@@ -632,7 +395,6 @@ async function bootstrap() {
   await loadPersistedIntoTextareas();
   await pushResumeToBridgeSession();
   await pushJdToBridgeSession();
-  for (const k of TEMPLATE_KEYS) await pushTemplateToBridgeSession(k);
   await pingBridge();
   await refreshRegistryStatus();
   setInterval(refreshRegistryStatus, 2000);

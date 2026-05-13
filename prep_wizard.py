@@ -9,6 +9,7 @@ from typing import Any
 from urllib.parse import quote
 
 from PySide6.QtCore import QEasingCurve, QPropertyAnimation, Qt, QThread, QTimer, Signal
+from PySide6.QtGui import QGuiApplication
 from PySide6.QtWidgets import (
     QFrame,
     QGraphicsOpacityEffect,
@@ -49,6 +50,9 @@ def _http_post_json(base: str, path: str, payload: dict[str, Any]) -> tuple[dict
             return json.loads(raw), exc.code
         except json.JSONDecodeError:
             return {"ok": False, "error": raw or str(exc)}, exc.code
+    except OSError as exc:
+        # Bridge stopped, tab closed, or RST mid-request (e.g. WinError 10053).
+        return {"ok": False, "error": str(exc)}, 0
 
 
 _TEMPLATE_KEYS = ("resume_summary", "jd_summary", "initial_interview", "chunk_interview")
@@ -282,6 +286,14 @@ class PrepWizardWidget(QWidget):
         v.addStretch(2)
         return page
 
+    def _prep_action_button_width_px(self) -> int:
+        """Half of ~30% primary width — main and Skip share this width."""
+        scr = QGuiApplication.primaryScreen()
+        if scr is None:
+            return 160
+        aw = max(640, scr.availableGeometry().width())
+        return max(140, min(260, int(aw * 0.15)))
+
     def _build_step2(self) -> QWidget:
         page = QWidget()
         v = QVBoxLayout(page)
@@ -305,9 +317,9 @@ class PrepWizardWidget(QWidget):
         )
         self.step2_error.hide()
         v.addWidget(self.step2_error)
-        self.btn_resume_summary = QPushButton("Get resume summary")
-        self.btn_resume_summary.setMinimumHeight(52)
-        self.btn_resume_summary.setMinimumWidth(300)
+        bw = self._prep_action_button_width_px()
+        self.btn_resume_summary = QPushButton("Get Resume summary")
+        self.btn_resume_summary.setFixedSize(bw, 52)
         self.btn_resume_summary.setCursor(Qt.PointingHandCursor)
         self.btn_resume_summary.setStyleSheet(
             "QPushButton { padding: 14px 28px; border-radius: 14px; background: #3949ab; color: white; "
@@ -317,7 +329,6 @@ class PrepWizardWidget(QWidget):
             "QPushButton:disabled { background: #9e9e9e; color: #eceff1; }"
         )
         self.btn_resume_summary.clicked.connect(self._on_resume_summary_clicked)
-        v.addWidget(self.btn_resume_summary)
         self.step2_success = QLabel("")
         self.step2_success.setAlignment(Qt.AlignHCenter)
         self.step2_success.setWordWrap(True)
@@ -326,6 +337,26 @@ class PrepWizardWidget(QWidget):
         )
         self.step2_success.hide()
         v.addWidget(self.step2_success)
+        self.step2_skip = QPushButton("Skip to interview")
+        self.step2_skip.setFixedSize(bw, 52)
+        self.step2_skip.setCursor(Qt.PointingHandCursor)
+        self.step2_skip.setStyleSheet(
+            "QPushButton { padding: 8px 18px; border-radius: 14px; background: #eceff1; color: #37474f; "
+            "font-weight: 700; font-size: 13px; border: 1px solid #b0bec5; }"
+            "QPushButton:hover { background: #cfd8dc; }"
+        )
+        self.step2_skip.clicked.connect(self._skip_to_interview)
+        step2_actions = QWidget()
+        sav = QVBoxLayout(step2_actions)
+        sav.setContentsMargins(0, 0, 0, 0)
+        sav.setSpacing(12)
+        sav.addWidget(self.btn_resume_summary, 0, Qt.AlignmentFlag.AlignHCenter)
+        sav.addWidget(self.step2_skip, 0, Qt.AlignmentFlag.AlignHCenter)
+        skip2 = QHBoxLayout()
+        skip2.addStretch(1)
+        skip2.addWidget(step2_actions)
+        skip2.addStretch(1)
+        v.addLayout(skip2)
         v.addStretch(2)
         return page
 
@@ -352,9 +383,9 @@ class PrepWizardWidget(QWidget):
         )
         self.step3_error.hide()
         v.addWidget(self.step3_error)
-        self.btn_jd_summary = QPushButton("Get job description summary")
-        self.btn_jd_summary.setMinimumHeight(52)
-        self.btn_jd_summary.setMinimumWidth(300)
+        bw3 = self._prep_action_button_width_px()
+        self.btn_jd_summary = QPushButton("Get JD summary")
+        self.btn_jd_summary.setFixedSize(bw3, 52)
         self.btn_jd_summary.setCursor(Qt.PointingHandCursor)
         self.btn_jd_summary.setStyleSheet(
             "QPushButton { padding: 14px 28px; border-radius: 14px; background: #3949ab; color: white; "
@@ -364,7 +395,6 @@ class PrepWizardWidget(QWidget):
             "QPushButton:disabled { background: #9e9e9e; color: #eceff1; }"
         )
         self.btn_jd_summary.clicked.connect(self._on_jd_summary_clicked)
-        v.addWidget(self.btn_jd_summary)
         self.step3_success = QLabel("")
         self.step3_success.setAlignment(Qt.AlignHCenter)
         self.step3_success.setWordWrap(True)
@@ -373,6 +403,26 @@ class PrepWizardWidget(QWidget):
         )
         self.step3_success.hide()
         v.addWidget(self.step3_success)
+        self.step3_skip = QPushButton("Skip to interview")
+        self.step3_skip.setFixedSize(bw3, 52)
+        self.step3_skip.setCursor(Qt.PointingHandCursor)
+        self.step3_skip.setStyleSheet(
+            "QPushButton { padding: 8px 18px; border-radius: 14px; background: #eceff1; color: #37474f; "
+            "font-weight: 700; font-size: 13px; border: 1px solid #b0bec5; }"
+            "QPushButton:hover { background: #cfd8dc; }"
+        )
+        self.step3_skip.clicked.connect(self._skip_to_interview)
+        step3_actions = QWidget()
+        s3v = QVBoxLayout(step3_actions)
+        s3v.setContentsMargins(0, 0, 0, 0)
+        s3v.setSpacing(12)
+        s3v.addWidget(self.btn_jd_summary, 0, Qt.AlignmentFlag.AlignHCenter)
+        s3v.addWidget(self.step3_skip, 0, Qt.AlignmentFlag.AlignHCenter)
+        skip3 = QHBoxLayout()
+        skip3.addStretch(1)
+        skip3.addWidget(step3_actions)
+        skip3.addStretch(1)
+        v.addLayout(skip3)
         v.addStretch(2)
         return page
 
@@ -399,9 +449,9 @@ class PrepWizardWidget(QWidget):
         )
         self.step4_error.hide()
         v.addWidget(self.step4_error)
-        self.btn_interview_setup = QPushButton("Prepare ChatGPT for interview")
-        self.btn_interview_setup.setMinimumHeight(52)
-        self.btn_interview_setup.setMinimumWidth(300)
+        bw4 = self._prep_action_button_width_px()
+        self.btn_interview_setup = QPushButton("Prepare interview")
+        self.btn_interview_setup.setFixedSize(bw4, 52)
         self.btn_interview_setup.setCursor(Qt.PointingHandCursor)
         self.btn_interview_setup.setStyleSheet(
             "QPushButton { padding: 14px 28px; border-radius: 14px; background: #3949ab; color: white; "
@@ -411,7 +461,6 @@ class PrepWizardWidget(QWidget):
             "QPushButton:disabled { background: #9e9e9e; color: #eceff1; }"
         )
         self.btn_interview_setup.clicked.connect(self._on_interview_setup_clicked)
-        v.addWidget(self.btn_interview_setup)
         self.step4_success = QLabel("")
         self.step4_success.setAlignment(Qt.AlignHCenter)
         self.step4_success.setWordWrap(True)
@@ -420,20 +469,62 @@ class PrepWizardWidget(QWidget):
         )
         self.step4_success.hide()
         v.addWidget(self.step4_success)
+        self.step4_skip = QPushButton("Skip to interview")
+        self.step4_skip.setFixedSize(bw4, 52)
+        self.step4_skip.setCursor(Qt.PointingHandCursor)
+        self.step4_skip.setStyleSheet(
+            "QPushButton { padding: 8px 18px; border-radius: 14px; background: #eceff1; color: #37474f; "
+            "font-weight: 700; font-size: 13px; border: 1px solid #b0bec5; }"
+            "QPushButton:hover { background: #cfd8dc; }"
+        )
+        self.step4_skip.clicked.connect(self._skip_to_interview)
+        step4_actions = QWidget()
+        s4v = QVBoxLayout(step4_actions)
+        s4v.setContentsMargins(0, 0, 0, 0)
+        s4v.setSpacing(12)
+        s4v.addWidget(self.btn_interview_setup, 0, Qt.AlignmentFlag.AlignHCenter)
+        s4v.addWidget(self.step4_skip, 0, Qt.AlignmentFlag.AlignHCenter)
+        skip4 = QHBoxLayout()
+        skip4.addStretch(1)
+        skip4.addWidget(step4_actions)
+        skip4.addStretch(1)
+        v.addLayout(skip4)
         v.addStretch(2)
         return page
 
     def closeEvent(self, event) -> None:  # noqa: N802
-        self._abandon_register_wait = True
+        self._stop_register_wait_thread()
         self._resume_listen_timer.stop()
         self._jd_listen_timer.stop()
         self._step4_listen_timer.stop()
         self._prep_poll_timer.stop()
         super().closeEvent(event)
 
+    def _stop_register_wait_thread(self) -> None:
+        """Join or detach the step-1 long-poll thread so it is not running when this widget is destroyed."""
+        t = self._reg_thread
+        if t is None:
+            return
+        self._abandon_register_wait = True
+        try:
+            t.outcome.disconnect(self._on_register_wait_outcome)
+        except TypeError:
+            pass
+        try:
+            t.finished.disconnect(self._on_register_thread_finished)
+        except TypeError:
+            pass
+        t.setParent(None)
+        self._reg_thread = None
+        if t.isRunning():
+            # Long-poll can block up to ~130s; do not wait for a clean return on close/handoff.
+            t.terminate()
+            t.wait(400)
+        t.deleteLater()
+
     def shutdown_for_handoff(self) -> None:
         """Stop timers/animation before the wizard widget is destroyed (avoids stray timeouts)."""
-        self._abandon_register_wait = True
+        self._stop_register_wait_thread()
         self._resume_listen_timer.stop()
         self._jd_listen_timer.stop()
         self._step4_listen_timer.stop()
@@ -601,9 +692,7 @@ class PrepWizardWidget(QWidget):
         else:
             self._resume_listen_timer.stop()
             self._jd_listen_timer.stop()
-            self.title_label.setText("Set Gpt for interview")
-            self.sub_label.setText("Processing.")
-            self.sub_label.show()
+            self.title_label.setText("Set ChatGPT for interview")
             self.bottom_hint.setText("")
             self._prepare_step4()
 
@@ -649,7 +738,7 @@ class PrepWizardWidget(QWidget):
             return ""
 
     def _template_for_selected(self, key: str) -> str:
-        """Fetch a per-client prompt template from the bridge (extension is the source of truth)."""
+        """Fetch a prompt template from the main app (bridge serves PromptStore / root .txt files)."""
         if key not in _TEMPLATE_KEYS:
             return ""
         rec = self._client_record()
@@ -673,14 +762,16 @@ class PrepWizardWidget(QWidget):
     def _prepare_step2(self) -> None:
         self.step2_success.hide()
         self.btn_resume_summary.setEnabled(True)
-        self.btn_resume_summary.setText("Get resume summary")
+        self.btn_resume_summary.setText("Get Resume summary")
         resume = self._resume_text_for_selected()
         template = self._template_for_selected("resume_summary")
         missing: list[str] = []
         if not resume:
             missing.append("resume in the extension")
         if not template:
-            missing.append("Prompt template #1 (resume summary) in the extension")
+            missing.append(
+                "resume summary prompt template (Settings → Prompts, or prompt_resume_summary.txt beside the app)"
+            )
         if missing:
             self.step2_waiting.setText("Waiting for: " + ", ".join(missing) + "…")
             self.step2_waiting.show()
@@ -715,7 +806,7 @@ class PrepWizardWidget(QWidget):
     def _prepare_step4(self) -> None:
         self.step4_success.hide()
         self.btn_interview_setup.setEnabled(True)
-        self.btn_interview_setup.setText("Prepare ChatGPT for interview")
+        self.btn_interview_setup.setText("Prepare interview")
         jd = self._jd_text_for_selected()
         initial_tpl = self._template_for_selected("initial_interview")
         chunk_tpl = self._template_for_selected("chunk_interview")
@@ -723,9 +814,13 @@ class PrepWizardWidget(QWidget):
         if not jd:
             missing.append("job description in the extension")
         if not initial_tpl:
-            missing.append("Prompt template #3 (initial interview) in the extension")
+            missing.append(
+                "initial interview prompt (Settings → Prompts, or prompt_initial_interview.txt beside the app)"
+            )
         if not chunk_tpl:
-            missing.append("Prompt template #4 (per-caption interview) in the extension")
+            missing.append(
+                "per-caption interview prompt (Settings → Prompts, or prompt_chunk_interview.txt beside the app)"
+            )
         if missing:
             self.step4_waiting.setText("Waiting for: " + ", ".join(missing) + "…")
             self.step4_waiting.show()
@@ -742,14 +837,16 @@ class PrepWizardWidget(QWidget):
     def _prepare_step3(self) -> None:
         self.step3_success.hide()
         self.btn_jd_summary.setEnabled(True)
-        self.btn_jd_summary.setText("Get job description summary")
+        self.btn_jd_summary.setText("Get JD summary")
         jd = self._jd_text_for_selected()
         template = self._template_for_selected("jd_summary")
         missing: list[str] = []
         if not jd:
             missing.append("job description in the extension")
         if not template:
-            missing.append("Prompt template #2 (JD summary) in the extension")
+            missing.append(
+                "JD summary prompt template (Settings → Prompts, or prompt_jd_summary.txt beside the app)"
+            )
         if missing:
             self.step3_waiting.setText("Waiting for: " + ", ".join(missing) + "…")
             self.step3_waiting.show()
@@ -790,7 +887,7 @@ class PrepWizardWidget(QWidget):
             return
         self._waiting_job_id = job_id
         self.btn_resume_summary.setEnabled(False)
-        self.btn_resume_summary.setText("Working… open ChatGPT if prompted")
+        self.btn_resume_summary.setText("Working…")
         self._resume_listen_timer.stop()
         self.step2_waiting.hide()
         self.step2_error.hide()
@@ -824,7 +921,7 @@ class PrepWizardWidget(QWidget):
             return
         self._waiting_job_id = job_id
         self.btn_jd_summary.setEnabled(False)
-        self.btn_jd_summary.setText("Working… open ChatGPT if prompted")
+        self.btn_jd_summary.setText("Working… ")
         self._jd_listen_timer.stop()
         self.step3_waiting.hide()
         self.step3_error.hide()
@@ -860,12 +957,43 @@ class PrepWizardWidget(QWidget):
             return
         self._waiting_job_id = job_id
         self.btn_interview_setup.setEnabled(False)
-        self.btn_interview_setup.setText("Working… open ChatGPT if prompted")
+        self.btn_interview_setup.setText("Working… ")
         self._step4_listen_timer.stop()
         self.step4_waiting.hide()
         self.step4_error.hide()
         self.step4_success.hide()
         self._prep_poll_timer.start()
+
+    def _skip_to_interview(self) -> None:
+        """Jump to the main interview (same as completing the wizard), best-effort sync with the bridge."""
+        cid = (self.selected_client_id or "").strip()
+        if not cid:
+            idx = self.stack.currentIndex()
+            msg = "Register the extension on step 1 first (no client id)."
+            if idx == 1:
+                self.step2_error.setText(msg)
+                self.step2_error.show()
+            elif idx == 2:
+                self.step3_error.setText(msg)
+                self.step3_error.show()
+            else:
+                self.step4_error.setText(msg)
+                self.step4_error.show()
+            return
+        self._prep_poll_timer.stop()
+        self._waiting_job_id = ""
+        try:
+            _http_post_json(self.bridge_base, "/prep/clear", {})
+        except OSError:
+            pass
+        self._resume_listen_timer.stop()
+        self._jd_listen_timer.stop()
+        self._step4_listen_timer.stop()
+        try:
+            _http_post_json(self.bridge_base, "/sync-store-to-selected-client", {})
+        except OSError:
+            pass
+        self.finished.emit((self.display_email or "").strip(), cid)
 
     def _on_prep_poll_tick(self) -> None:
         if not self._waiting_job_id:
@@ -908,7 +1036,7 @@ class PrepWizardWidget(QWidget):
                 self.step2_error.setText(f"Summary failed: {err}")
                 self.step2_error.show()
                 self.btn_resume_summary.setEnabled(True)
-                self.btn_resume_summary.setText("Get resume summary")
+                self.btn_resume_summary.setText("Get Resume summary")
                 _http_post_json(self.bridge_base, "/prep/clear", {})
                 self._prepare_step2()
             elif idx == 2:
@@ -916,7 +1044,7 @@ class PrepWizardWidget(QWidget):
                 self.step3_error.setText(f"Summary failed: {err}")
                 self.step3_error.show()
                 self.btn_jd_summary.setEnabled(True)
-                self.btn_jd_summary.setText("Get job description summary")
+                self.btn_jd_summary.setText("Get JD summary")
                 _http_post_json(self.bridge_base, "/prep/clear", {})
                 self._prepare_step3()
             elif idx == 3:
@@ -924,7 +1052,7 @@ class PrepWizardWidget(QWidget):
                 self.step4_error.setText(f"Summary failed: {err}")
                 self.step4_error.show()
                 self.btn_interview_setup.setEnabled(True)
-                self.btn_interview_setup.setText("Prepare ChatGPT for interview")
+                self.btn_interview_setup.setText("Prepare interview")
                 _http_post_json(self.bridge_base, "/prep/clear", {})
                 self._prepare_step4()
 

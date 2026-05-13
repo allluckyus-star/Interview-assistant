@@ -120,6 +120,8 @@ def _print_prep_ext_line(pl: Dict[str, Any]) -> None:
 
 TEMPLATE_KEYS = ("resume_summary", "jd_summary", "initial_interview", "chunk_interview")
 
+from app_prompt_files import load_prompt_templates_into_store, save_template_text
+
 
 def _empty_extension_doc_row() -> Dict[str, str]:
     row = {"resume": "", "jd": ""}
@@ -283,10 +285,11 @@ def get_register_event_snapshot() -> Dict[str, Any]:
         return _snapshot_register_event_unlocked()
 
 
-def get_registered_clients_api_payload() -> Dict[str, Any]:
+def get_registered_clients_api_payload(store: "PromptStore") -> Dict[str, Any]:
     """Registry for HTTP GET: sanitized rows + latest register event (in-memory).
 
-    Full resume_text / jd_text and prompt templates are merged from extension-backed RAM only.
+    Resume and JD text are merged from extension-backed RAM; prompt templates come from
+    the desktop app (PromptStore / root .txt files), not the extension.
     """
     data = load_registered_clients()
     merged_clients: List[Dict[str, Any]] = []
@@ -299,7 +302,7 @@ def get_registered_clients_api_payload() -> Dict[str, Any]:
         row["resume_text"] = docs["resume"]
         row["jd_text"] = docs["jd"]
         for key in TEMPLATE_KEYS:
-            row[f"tpl_{key}"] = docs.get(f"tpl_{key}", "")
+            row[f"tpl_{key}"] = store.get_template(key)
         merged_clients.append(row)
     out = {"clients": merged_clients, "selected_client_id": data.get("selected_client_id")}
     with _register_event_lock:
@@ -348,11 +351,11 @@ def get_selected_client_id() -> str | None:
     return str(sel).strip()
 
 
-def get_context_for_client_id(client_id: str) -> Dict[str, Any]:
-    """Resume/JD/templates for a client: latest POST from the extension (RAM), not disk files."""
+def get_context_for_client_id(client_id: str, store: "PromptStore") -> Dict[str, Any]:
+    """Resume/JD for this client from extension RAM; templates from the main app (store / .txt)."""
     cid = str(client_id or "").strip()
     docs = _extension_docs_row(cid)
-    templates = {k: str(docs.get(f"tpl_{k}") or "") for k in TEMPLATE_KEYS}
+    templates = {k: str(store.get_template(k) or "") for k in TEMPLATE_KEYS}
     return {
         "resume": docs["resume"],
         "job_description": docs["jd"],
@@ -505,8 +508,7 @@ def apply_selected_client_context_to_prompt_store(store: "PromptStore") -> Tuple
         jd = (c.get("jd_summary") or docs["jd"] or "").strip()
         store.set_resume_text(res)
         store.set_job_description_text(jd)
-        for tk in TEMPLATE_KEYS:
-            store.set_template(tk, str(docs.get(f"tpl_{tk}") or ""))
+        load_prompt_templates_into_store(store)
         break
     return display, rid
 
@@ -767,7 +769,7 @@ class PromptBridgeServer:
                     cid_list = qs.get("client_id") or []
                     cid = str(cid_list[0]).strip() if cid_list else ""
                     if cid:
-                        ctx = get_context_for_client_id(cid)
+                        ctx = get_context_for_client_id(cid, store)
                         self._send_json(
                             {
                                 "resume": ctx["resume"],
@@ -788,7 +790,7 @@ class PromptBridgeServer:
                     )
                     return
                 if parsed.path == "/registered-clients":
-                    self._send_json(get_registered_clients_api_payload(), 200)
+                    self._send_json(get_registered_clients_api_payload(store), 200)
                     return
                 if parsed.path == "/wait-register-event":
                     qs = parse_qs(parsed.query or "")
@@ -972,13 +974,10 @@ class PromptBridgeServer:
                     text = str(pl.get("text", ""))
                     post_cid = str(pl.get("client_id", "")).strip()
                     target = post_cid or (get_selected_client_id() or "")
+                    store.set_template(template_key, text)
+                    save_template_text(template_key, text)
                     if target:
                         sync_template_to_client_in_registry(target, template_key, text)
-                        sel = get_selected_client_id()
-                        if sel and str(sel).strip() == str(target).strip():
-                            store.set_template(template_key, text)
-                    else:
-                        store.set_template(template_key, text)
                     self._send_json({"status": "ok"}, 200)
                     return
                 if parsed.path == "/sync-store-to-selected-client":

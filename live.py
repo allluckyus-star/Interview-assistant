@@ -1,11 +1,14 @@
 import json
 import os
 import queue
+import sys
 import re
 import uuid
 import subprocess
 import threading
 import time
+from datetime import datetime
+import urllib.error
 import urllib.request
 from pathlib import Path
 from typing import Tuple
@@ -14,14 +17,29 @@ from urllib.parse import urlencode
 from pynput import keyboard
 import uiautomation as auto
 
-from PySide6.QtCore import QEvent, QSize, Qt, QTimer
-from PySide6.QtGui import QGuiApplication, QIcon, QMouseEvent, QPainter, QPainterPath, QPixmap, QRegion
+from PySide6.QtCore import (
+    QAbstractAnimation,
+    QEasingCurve,
+    QEvent,
+    QParallelAnimationGroup,
+    QPoint,
+    QPropertyAnimation,
+    QSize,
+    Qt,
+    QTimer,
+)
+from PySide6.QtGui import QAction, QGuiApplication, QIcon, QMouseEvent, QPainter, QPainterPath, QPixmap, QRegion
 from PySide6.QtSvg import QSvgRenderer
 from PySide6.QtWidgets import (
     QApplication,
+    QFileDialog,
     QFrame,
+    QGraphicsOpacityEffect,
     QHBoxLayout,
     QLabel,
+    QMenu,
+    QMessageBox,
+    QPlainTextEdit,
     QPushButton,
     QSplitter,
     QScrollArea,
@@ -33,6 +51,8 @@ from PySide6.QtWidgets import (
     QVBoxLayout,
     QWidget,
 )
+
+import app_prompt_files
 
 from bridge_server import (
     PromptBridgeServer,
@@ -88,32 +108,76 @@ def restart_live_caption_exe() -> None:
     time.sleep(1.0)
 
 
-# Windows 10 2004+: SetWindowDisplayAffinity — see _desired_display_affinity_for_window for per-display policy.
+# Windows 10 2004+: SetWindowDisplayAffinity — see _desired_display_affinity_for_window for policy.
 _WDA_NONE = 0
 _WDA_EXCLUDEFROMCAPTURE = 0x00000011
-# Force WDA_EXCLUDEFROMCAPTURE on every display (may be invisible on some USB-HDMI secondaries).
-_ENV_STRICT_CAPTURE_EXCLUDE_EVERYWHERE = "INTERVIEW_ASSISTANT_STRICT_CAPTURE_EXCLUDE_EVERYWHERE"
+# Legacy: exclude only on primary, WDA_NONE on other displays (weaker stealth; for bad USB-HDMI paths).
+_ENV_PRIMARY_ONLY_CAPTURE_EXCLUDE = "INTERVIEW_ASSISTANT_PRIMARY_ONLY_CAPTURE_EXCLUDE"
+_ENV_DEBUG_AFFINITY = "INTERVIEW_ASSISTANT_DEBUG_AFFINITY"
 
 
-def _env_strict_capture_exclude_everywhere() -> bool:
-    v = (os.environ.get(_ENV_STRICT_CAPTURE_EXCLUDE_EVERYWHERE) or "").strip().lower()
+def _env_primary_only_capture_exclude() -> bool:
+    v = (os.environ.get(_ENV_PRIMARY_ONLY_CAPTURE_EXCLUDE) or "").strip().lower()
     return v in ("1", "true", "yes", "on")
 
 
+def _env_debug_affinity() -> bool:
+    v = (os.environ.get(_ENV_DEBUG_AFFINITY) or "").strip().lower()
+    return v in ("1", "true", "yes", "on")
+
+
+def _affinity_constant_name(affinity: int) -> str:
+    if affinity == _WDA_NONE:
+        return "WDA_NONE"
+    if affinity == _WDA_EXCLUDEFROMCAPTURE:
+        return "WDA_EXCLUDEFROMCAPTURE"
+    return f"WDA_0x{int(affinity):x}"
+
+
+def _screen_key_at_window_center(w: QWidget) -> tuple:
+    scr = QGuiApplication.screenAt(w.geometry().center())
+    if scr is None:
+        return ("", None)
+    g = scr.geometry()
+    return (scr.name() or "", (g.x(), g.y(), g.width(), g.height()))
+
+
+def _primary_vs_screen_at_debug_suffix(w: QWidget) -> str:
+    pri = QGuiApplication.primaryScreen()
+    scr = QGuiApplication.screenAt(w.geometry().center())
+    if pri is None:
+        ppart = "primary=? "
+    else:
+        pg = pri.geometry()
+        ppart = (
+            f"primary={pri.name() or '(unnamed)'} "
+            f"geom={pg.x()},{pg.y()} {pg.width()}x{pg.height()} "
+        )
+    if scr is None:
+        spart = "screenAt=? "
+    else:
+        sg = scr.geometry()
+        spart = (
+            f"screenAt={scr.name() or '(unnamed)'} "
+            f"geom={sg.x()},{sg.y()} {sg.width()}x{sg.height()}"
+        )
+    return ppart + "| " + spart
+
+
 def _desired_display_affinity_for_window(w: QWidget) -> int:
-    """Return affinity for the window based on which display holds its center.
+    """Return affinity for ``SetWindowDisplayAffinity`` from the window's current geometry.
 
-    Default: full exclude-from-capture on the **primary** (main) display only. On any **other**
-    display (typical USB-HDMI / extended monitor), use ``WDA_NONE`` so DWM still paints the window
-    locally — many secondary paths fail to show ``WDA_EXCLUDEFROMCAPTURE`` windows at all. That
-    tradeoff means snipping or sharing **that** monitor can include the app.
+    Default is ``WDA_EXCLUDEFROMCAPTURE`` on every display so stealth matches common overlays: the
+    flag follows whichever monitor contains the window center (updated on move/resize/show), not
+    "non-primary == pretend we are being shared."
 
-    Set ``INTERVIEW_ASSISTANT_STRICT_CAPTURE_EXCLUDE_EVERYWHERE=1`` to always use exclude on every
-    display (stronger stealth; you may get a blank window again on HDMI).
+    If a secondary display fails to composite exclude-from-capture (rare USB-HDMI / hybrid cases),
+    set ``INTERVIEW_ASSISTANT_PRIMARY_ONLY_CAPTURE_EXCLUDE=1`` to use exclude only while the center
+    lies on the primary screen and ``WDA_NONE`` elsewhere (capture may include the window there).
     """
     if os.name != "nt":
         return _WDA_NONE
-    if _env_strict_capture_exclude_everywhere():
+    if not _env_primary_only_capture_exclude():
         return _WDA_EXCLUDEFROMCAPTURE
     scr = QGuiApplication.screenAt(w.geometry().center())
     pri = QGuiApplication.primaryScreen()
@@ -124,17 +188,21 @@ def _desired_display_affinity_for_window(w: QWidget) -> int:
     return _WDA_EXCLUDEFROMCAPTURE
 
 
-def _win32_set_window_display_affinity(hwnd: int, affinity: int) -> bool:
+def _win32_set_window_display_affinity(hwnd: int, affinity: int) -> int:
+    """Return Win32 BOOL as int: non-zero success, zero failure."""
     if os.name != "nt" or not hwnd:
-        return False
+        return 0
     import ctypes
 
     user32 = ctypes.windll.user32
     user32.SetWindowDisplayAffinity.argtypes = [ctypes.c_void_p, ctypes.c_uint32]
     user32.SetWindowDisplayAffinity.restype = ctypes.c_int
-    return bool(
+    return int(
         user32.SetWindowDisplayAffinity(ctypes.c_void_p(hwnd), ctypes.c_uint32(int(affinity)))
     )
+
+
+_AFFINITY_DBG_PREV_UNSET = object()
 
 
 RESUME_TEXT = "Paste your resume content here."
@@ -148,6 +216,36 @@ BUBBLE_WIDTH_PERCENT = 0.85
 TEXT_COLOR = "#111111"
 # QSS border-radius on the shell must match the top-level window mask (see _sync_round_window_mask).
 APP_SHELL_CORNER_RADIUS_PX = 0
+
+_TOAST_MARGIN_TOP = 12
+_TOAST_GAP_PX = 6
+_TOAST_MIN_OUTER = 88
+_TOAST_MAX_OUTER = 288
+_TOAST_LABEL_MAX_WIDTH = 248
+_TOAST_FONT_PX = 11
+_TOAST_SHOW_MS = 220
+_TOAST_HIDE_MS = 200
+_TOAST_SLIDE_PX = 12
+_TOAST_LINGER_SUCCESS_MS = 2600
+_TOAST_LINGER_WARNING_MS = 3600
+_TOAST_LINGER_ERROR_MS = 4800
+_TOAST_TEXT_MAX_CHARS = 200
+_TOPBAR_CYAN_BG = "#b2ebf2"
+_TOPBAR_CYAN_HOVER = "#80deea"
+_TOPBAR_CLOSE_HOVER_BG = "#ff8a80"
+
+# Top bar / settings header: light cyan pill buttons; shared hover (except close uses red hover).
+
+# Caption bubble row bottom border — reuse for settings horizontal splitter handle.
+CAPTION_ROW_BOTTOM_BORDER_COLOR = "rgba(17,17,17,80)"
+
+
+def _toast_trim_message(text: str) -> str:
+    t = (text or "").strip()
+    if len(t) <= _TOAST_TEXT_MAX_CHARS:
+        return t
+    return f"{t[: _TOAST_TEXT_MAX_CHARS - 1]}…"
+
 
 capture_lock = threading.Lock()
 # Rolling normalized caption from Live Captions (not trimmed while listening).
@@ -187,13 +285,265 @@ _keyboard_listener = None  # pynput.Listener — stopped on window close so the 
 
 ui_queue: queue.Queue = queue.Queue()
 app_running = True
+
+# Append-only session transcript: every interviewer capture (End, Delete skip, Home buffer, reject,
+# sent-to-GPT) plus GPT finals / honest placeholders. Cleared when the live interview starts.
+_interview_history_lock = threading.Lock()
+_interview_history_events: list[dict[str, str]] = []
+
 pending_request_id = ""
 last_answer_request_id = ""
-# Templates pinned at interview start (PageDown). Once set, every chunk uses these
-# even if the extension's stored value is later cleared or edited mid-interview.
-# None = not yet pinned (use the live extension value); "" = pinned to "no template".
+# Initial interview template snapshot pinned at prep handoff (see _session_initial_template).
+# Live chunk prompts use mode-specific templates via _active_chunk_template_override().
 _session_initial_template: str | None = None
-_session_chunk_template: str | None = None
+# Guidance mode toggled from the top-bar cycle button. "read" uses
+# READ_MODE_CHUNK_TEMPLATE; "type" overrides with TYPE_MODE_CHUNK_TEMPLATE
+# ([READ-n]/[TYPE-n]); "behavioral" overrides with BEHAVIORAL_MODE_CHUNK_TEMPLATE
+# for STAR-style guidance.
+_session_mode: str = "read"
+TYPE_MODE_CHUNK_TEMPLATE = """You are producing TYPE MODE live interview guidance.
+
+Use this only when the interviewer asks me to type, code, draw, use Notepad, or show something on screen.
+
+If there is no clear typing/coding/drawing task, output exactly:
+WAITING
+
+OUTPUT FORMAT:
+- Output everything inside one fenced code block.
+- Use the correct code fence language when known: ```python, ```sql, ```text, ```javascript.
+- Do not output anything outside the code block.
+- This prevents Markdown from treating # comments as headings.
+
+CONTENT TYPES:
+Use these markers:
+
+[SAY-n]
+Natural words I say out loud to the interviewer. This is not typed into the editor.
+
+[READ-n]
+Short words I say while typing the next line.
+
+[TYPE-n]
+Marker comment before the exact line I type next.
+
+COMMENT STYLE:
+Inside the code block, READ and TYPE must use the target language comment syntax.
+
+Python / shell / YAML / diagram / plain text:
+# [READ-n]
+# [TYPE-n]
+
+JavaScript / TypeScript / Java / C# / C++:
+// [READ-n]
+// [TYPE-n]
+
+SQL:
+-- [READ-n]
+-- [TYPE-n]
+
+HTML / XML:
+<!-- [READ-n] -->
+<!-- [TYPE-n] -->
+
+RULES:
+- [SAY-n] must sound natural in a real interview.
+- Do not say “the interviewer can see,” “for the interviewer,” or “I am going to impress the interviewer.”
+- Speak like a real engineer explaining work while coding.
+- [SAY-n] should be 1–3 short sentences.
+- [READ-n] should be one short sentence.
+- Every [TYPE-n] must be followed by exactly ONE typed line.
+- Preserve exact indentation for code.
+- Keep code valid if all [SAY-n] lines are removed.
+- Never output raw [READ-n] or [TYPE-n] outside comments.
+- No fake experience, fake metrics, or fake company details.
+- Use candidate briefing and job briefing already provided.
+
+FOR CODE:
+- Start with [SAY-1] for the approach.
+- Then use commented [READ-n] and [TYPE-n] before every typed code line.
+- After each logical block, add [SAY-n] for trade-off, edge case, or design reasoning.
+
+FOR DIAGRAM:
+- Use ```text.
+- Use # [READ-n] and # [TYPE-n].
+- Keep diagram spacing clean.
+- Add [SAY-n] before and after the diagram for natural explanation.
+
+GOOD SPOKEN STYLE:
+[SAY-1]
+I’ll keep the design small but realistic. I’ll separate ingestion, retrieval, and generation so each part can be replaced later without changing the whole API.
+
+BAD SPOKEN STYLE:
+[SAY-1]
+I’ll separate the RAG project into ingestion, retrieval, and generation so the interviewer can see the full flow clearly.
+
+Interviewer said:
+\"\"\"
+{cleaned_interviewer_intent}
+\"\"\"
+"""
+
+BEHAVIORAL_MODE_CHUNK_TEMPLATE = """Behavioral Mode prompt:
+Use this when the interviewer asks about teamwork, conflict, leadership, failure, ambiguity, ownership, communication, deadlines, prioritization, business partners, or past experience.
+
+You are producing behavioral interview speaking guidance.
+
+If there is no clear behavioral question, output exactly:
+WAITING
+
+Otherwise output exactly this structure:
+
+SHORT ANSWER:
+[1–2 natural sentences I can say immediately. Max 45 words.]
+
+STORY ANSWER:
+[A realistic first-person story using situation → action → result → reflection. 4–7 sentences. Max 160 words.]
+
+FOLLOW-UP DEPTH:
+[1–2 concise points I can add if the interviewer asks for more detail.]
+
+Rules:
+- First person only.
+- Natural spoken English.
+- No generic leadership slogans.
+- No fake experience, fake metrics, or fake company details.
+- Use candidate briefing and job briefing already provided.
+- Prefer practical engineering behavior: communication, trade-offs, ownership, alignment, risk handling.
+- Make it sound like a real engineer speaking under interview pressure.
+- Do not over-polish; keep it human and believable.
+
+Interviewer said:
+\"\"\"
+{cleaned_interviewer_intent}
+\"\"\"
+"""
+
+READ_MODE_CHUNK_TEMPLATE = """You are producing live interview speaking guidance.
+
+If there is no clear question, output exactly:
+WAITING
+
+Otherwise output exactly this structure:
+
+SHORT ANSWER:
+[1–2 natural sentences I can say immediately. Max 45 words.]
+
+DETAILED ANSWER:
+[3–5 additional sentences that extend the answer naturally. Max 120 words.]
+
+FOLLOW-UP DEPTH:
+[1–2 technical depth points, concise.]
+
+Rules:
+- First person only.
+- No analysis.
+- No generic textbook answer.
+- No fake experience, fake metrics, or fake company details.
+- Use the candidate briefing and job briefing already provided.
+- Make it sound like a real engineer speaking under interview pressure.
+- Prefer clear trade-offs and practical implementation details.
+
+Specific-info rule:
+- If the interviewer asks for a specific fact, version, tool, library, API, command, number, timeline, cloud service, framework, model, or name, answer directly in the first sentence.
+- Do not give a broad explanation before answering the specific point.
+- If the exact fact is known from the candidate briefing or job briefing, state it clearly.
+- If the exact fact is not known but can be reasonably inferred from my work period, tech stack, or project context, give it as an estimate, not as a confirmed fact.
+- Use wording like:
+  "I don't remember the exact version, but based on that project period, it was likely around [estimated range]. My work was mainly with [tool/API/service] for [specific purpose]."
+- If there is no safe estimate, say the closest truthful answer:
+  "I don't remember the exact version, but I used [tool/API/service] mainly for [specific purpose]."
+- Do not invent exact versions, dates, metrics, commands, or tools.
+- Keep the answer confident and practical, not apologetic.
+- After the direct answer, add one practical detail about how I used it.
+
+Interviewer said:
+\"\"\"
+{cleaned_interviewer_intent}
+\"\"\"
+"""
+
+
+def _http_post_json_local(url: str, payload: dict) -> tuple[dict, int]:
+    body = json.dumps(payload).encode("utf-8")
+    req = urllib.request.Request(
+        url,
+        data=body,
+        method="POST",
+        headers={"Content-Type": "application/json"},
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=45) as resp:
+            return json.loads(resp.read().decode("utf-8")), int(resp.status)
+    except urllib.error.HTTPError as exc:
+        raw = exc.read().decode("utf-8", errors="replace")
+        try:
+            return json.loads(raw), int(exc.code)
+        except json.JSONDecodeError:
+            return {"ok": False, "error": raw or str(exc)}, int(exc.code)
+    except OSError as exc:
+        return {"ok": False, "error": str(exc)}, 0
+
+
+def _load_mode_prompt_overrides_from_json() -> None:
+    """Merge ~/.interview_assistant/mode_prompts.json keys read/type/behavioral into live chunk templates."""
+    global READ_MODE_CHUNK_TEMPLATE, TYPE_MODE_CHUNK_TEMPLATE, BEHAVIORAL_MODE_CHUNK_TEMPLATE
+    path = Path.home() / ".interview_assistant" / "mode_prompts.json"
+    try:
+        raw = path.read_text(encoding="utf-8")
+        data = json.loads(raw)
+    except (OSError, json.JSONDecodeError):
+        return
+    if not isinstance(data, dict):
+        return
+    r = data.get("read")
+    if isinstance(r, str) and r.strip():
+        READ_MODE_CHUNK_TEMPLATE = r
+    t = data.get("type")
+    if isinstance(t, str) and t.strip():
+        TYPE_MODE_CHUNK_TEMPLATE = t
+    b = data.get("behavioral")
+    if isinstance(b, str) and b.strip():
+        BEHAVIORAL_MODE_CHUNK_TEMPLATE = b
+
+
+def _persist_mode_prompts_to_json() -> None:
+    global READ_MODE_CHUNK_TEMPLATE, TYPE_MODE_CHUNK_TEMPLATE, BEHAVIORAL_MODE_CHUNK_TEMPLATE
+    root = Path.home() / ".interview_assistant"
+    root.mkdir(parents=True, exist_ok=True)
+    path = root / "mode_prompts.json"
+    path.write_text(
+        json.dumps(
+            {
+                "read": READ_MODE_CHUNK_TEMPLATE,
+                "type": TYPE_MODE_CHUNK_TEMPLATE,
+                "behavioral": BEHAVIORAL_MODE_CHUNK_TEMPLATE,
+            },
+            ensure_ascii=False,
+            indent=2,
+        ),
+        encoding="utf-8",
+        newline="\n",
+    )
+
+
+_load_mode_prompt_overrides_from_json()
+
+
+def _active_chunk_template_override() -> str | None:
+    """Resolve which chunk-prompt template should be used for the next outgoing prompt.
+
+    Read mode uses READ_MODE_CHUNK_TEMPLATE. Type and behavioral modes use fixed
+    templates so the mode switch takes effect immediately mid-interview.
+    """
+    if _session_mode == "read":
+        return READ_MODE_CHUNK_TEMPLATE
+    if _session_mode == "type":
+        return TYPE_MODE_CHUNK_TEMPLATE
+    if _session_mode == "behavioral":
+        return BEHAVIORAL_MODE_CHUNK_TEMPLATE
+    return None
+
+
 # One-shot UI notice when HTTP fallback is used (avoid spamming every chunk).
 _http_fallback_notified = False
 # Dedupe live partial updates from /interview-live polling.
@@ -204,6 +554,8 @@ _last_manual_live_poll_for_rid: Tuple[str, str] = ("", "")
 _last_manual_final_seen: str = ""
 
 prompt_store = PromptStore()
+app_prompt_files.ensure_prompt_template_files()
+app_prompt_files.load_prompt_templates_into_store(prompt_store)
 bridge = PromptBridgeServer(prompt_store)
 
 
@@ -526,37 +878,134 @@ class InterviewWindow(QWidget):
         else:
             self.account_label.hide()
         topbar.addWidget(self.account_label)
-        self.top_drag_zone = QWidget()
-        self.top_drag_zone.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
-        self.top_drag_zone.setMinimumHeight(26)
-        self.top_drag_zone.setCursor(Qt.OpenHandCursor)
-        self.top_drag_zone.installEventFilter(self)
-        topbar.addWidget(self.top_drag_zone, stretch=1)
-        opacity_lbl = QLabel("Bg")
-        opacity_lbl.setStyleSheet("font-size: 11px; font-weight: 700; color: #222;")
+        self.top_center_drag_host = QWidget()
+        self.top_center_drag_host.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
+        self.top_center_drag_host.setMinimumHeight(26)
+        self.top_center_drag_host.setCursor(Qt.OpenHandCursor)
+        self.top_center_drag_host.installEventFilter(self)
+        cen = QHBoxLayout(self.top_center_drag_host)
+        cen.setContentsMargins(0, 0, 0, 0)
+        cen.setSpacing(8)
+        cen.addStretch(1)
+        self.opacity_lbl = QLabel("Bg")
+        self.opacity_lbl.setStyleSheet("font-size: 11px; font-weight: 700; color: #222;")
         self.opacity_slider = QSlider(Qt.Orientation.Horizontal)
         self.opacity_slider.setRange(0, 100)
         self.opacity_slider.setValue(80)
-        self.opacity_slider.setFixedWidth(110)
-        self.opacity_slider.setToolTip("Shell background opacity only (text stays solid)")
+        self.opacity_slider.setMinimumWidth(120)
+        self.opacity_slider.setMaximumWidth(220)
         self.opacity_slider.valueChanged.connect(self._on_opacity_slider_changed)
-        topbar.addWidget(opacity_lbl)
-        topbar.addWidget(self.opacity_slider)
+        cen.addWidget(self.opacity_lbl, 0, Qt.AlignmentFlag.AlignVCenter)
+        cen.addWidget(self.opacity_slider, 0, Qt.AlignmentFlag.AlignVCenter)
+        cen.addStretch(1)
+        topbar.addWidget(self.top_center_drag_host, stretch=1)
+        _mode_icon_render_px = 16
+        _mode_icon_display = QSize(28, 28)
+        _mode_btn_h = 28
+        _mode_icon_color = "#222222"
+        self.session_mode_btn = QToolButton()
+        self.session_mode_btn.setObjectName("ModeCycleBtn")
+        self.session_mode_btn.setCheckable(False)
+        self.session_mode_btn.setCursor(Qt.PointingHandCursor)
+        self.session_mode_btn.setMinimumHeight(_mode_btn_h)
+        self.session_mode_btn.setMinimumWidth(88)
+        self.session_mode_btn.setIconSize(_mode_icon_display)
+        self.session_mode_btn.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextBesideIcon)
+        # Qt6 / PySide6: only DelayedPopup, MenuButtonPopup, InstantPopup (no MenuButtonInstantPopup).
+        self.session_mode_btn.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup)
+        self.session_mode_btn.setStyleSheet(
+            f"""
+            QToolButton#ModeCycleBtn {{
+                border: none;
+                border-radius: 14px;
+                background: {_TOPBAR_CYAN_BG};
+                padding-left: 8px;
+                padding-right: 2px;
+                font-size: 11px;
+                font-weight: 700;
+                color: #222;
+            }}
+            QToolButton#ModeCycleBtn:hover {{
+                background: {_TOPBAR_CYAN_HOVER};
+            }}
+            QToolButton#ModeCycleBtn::menu-indicator {{
+                subcontrol-origin: padding;
+                subcontrol-position: center right;
+                width: 10px;
+                height: 10px;
+                right: 5px;
+                left: unset;
+                top: 0px;
+            }}
+            """
+        )
+        mode_menu = QMenu(self.session_mode_btn)
+        for mid, title in (("read", "Read"), ("type", "Type"), ("behavioral", "Behavioral")):
+            act = QAction(title, self)
+            act.triggered.connect(lambda checked=False, m=mid: self._set_session_mode_from_menu(m))
+            mode_menu.addAction(act)
+        self.session_mode_btn.setMenu(mode_menu)
+        self._session_mode_icon_render_px = _mode_icon_render_px
+        self._session_mode_icon_color = _mode_icon_color
+        self._update_session_mode_button()
+        topbar.addWidget(self.session_mode_btn)
+        self.save_transcript_btn = QPushButton()
+        self.save_transcript_btn.setObjectName("SaveTranscriptTopBtn")
+        self.save_transcript_btn.setFixedSize(28, 28)
+        self.save_transcript_btn.setCursor(Qt.PointingHandCursor)
+        self.save_transcript_btn.setIcon(self._build_save_transcript_svg_icon(16, "#111111"))
+        self.save_transcript_btn.setIconSize(self.save_transcript_btn.size())
+        self.save_transcript_btn.setAccessibleName("Save interview transcript")
+        self.save_transcript_btn.setStyleSheet(
+            f"""
+            QPushButton#SaveTranscriptTopBtn {{
+                border: none;
+                border-radius: 14px;
+                background: {_TOPBAR_CYAN_BG};
+            }}
+            QPushButton#SaveTranscriptTopBtn:hover {{
+                background: {_TOPBAR_CYAN_HOVER};
+            }}
+            """
+        )
+        self.save_transcript_btn.clicked.connect(self._on_save_transcript_clicked)
+        topbar.addWidget(self.save_transcript_btn)
+        self.settings_btn = QPushButton()
+        self.settings_btn.setObjectName("SettingsOverflowBtn")
+        self.settings_btn.setFixedSize(28, 28)
+        self.settings_btn.setCursor(Qt.PointingHandCursor)
+        self.settings_btn.setIcon(self._build_overflow_kebab_svg_icon(16, "#111111"))
+        self.settings_btn.setIconSize(self.settings_btn.size())
+        self.settings_btn.setAccessibleName("Settings")
+        self.settings_btn.setStyleSheet(
+            f"""
+            QPushButton#SettingsOverflowBtn {{
+                border: none;
+                border-radius: 14px;
+                background: {_TOPBAR_CYAN_BG};
+            }}
+            QPushButton#SettingsOverflowBtn:hover {{
+                background: {_TOPBAR_CYAN_HOVER};
+            }}
+            """
+        )
+        self.settings_btn.clicked.connect(self._on_settings_nav_clicked)
+        topbar.addWidget(self.settings_btn)
         self.close_btn = QPushButton()
         self.close_btn.setFixedSize(28, 28)
         self.close_btn.setCursor(Qt.PointingHandCursor)
         self.close_btn.setIcon(self._build_close_svg_icon(16, "#111111"))
         self.close_btn.setIconSize(self.close_btn.size())
         self.close_btn.setStyleSheet(
-            """
-            QPushButton {
+            f"""
+            QPushButton {{
                 border: none;
                 border-radius: 14px;
-                background: rgba(255,255,255,170);
-            }
-            QPushButton:hover {
-                background: rgba(255,80,80,220);
-            }
+                background: {_TOPBAR_CYAN_BG};
+            }}
+            QPushButton:hover {{
+                background: {_TOPBAR_CLOSE_HOVER_BG};
+            }}
             """
         )
         self.close_btn.clicked.connect(self.close)
@@ -623,7 +1072,6 @@ class InterviewWindow(QWidget):
         self.gpt_copy_btn.setIcon(self._build_copy_glyph_svg_icon(14, "#455a64"))
         self.gpt_copy_btn.setIconSize(QSize(14, 14))
         self.gpt_copy_btn.setCursor(Qt.PointingHandCursor)
-        self.gpt_copy_btn.setToolTip("Copy result")
         self.gpt_copy_btn.setFixedSize(24, 24)
         self.gpt_copy_btn.setStyleSheet(
             "QToolButton { border: none; border-radius: 12px; background: transparent; font-weight: 700; }"
@@ -648,19 +1096,29 @@ class InterviewWindow(QWidget):
         interview_layout.addWidget(self.interview_splitter)
         self.scroll = self.caption_scroll
 
+        self._settings_active_kind: str | None = None
+        self._settings_snap_text = ""
+        self._settings_editor_dirty = False
+        self.session_stack = QStackedWidget()
+        self.session_stack.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+        self.settings_page = self._build_settings_page()
+        self.session_stack.addWidget(self.interview_page)
+        self.session_stack.addWidget(self.settings_page)
+
         self.main_stack = QStackedWidget()
         self.main_stack.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
         if self._start_with_prep:
             self.prep_widget = PrepWizardWidget(self._bridge_base, parent=self.main_stack)
             self.main_stack.addWidget(self.prep_widget)
-            self.main_stack.addWidget(self.interview_page)
+            self.main_stack.addWidget(self.session_stack)
             self.prep_widget.finished.connect(self._on_prep_finished)
             self.main_stack.currentChanged.connect(self._sync_shell_for_main_stack)
             self._sync_shell_for_main_stack(self.main_stack.currentIndex())
         else:
-            self.main_stack.addWidget(self.interview_page)
+            self.main_stack.addWidget(self.session_stack)
             self._shell_phase_prep = False
             self._apply_shell_visual()
+            interview_history_reset()
         shell_layout.addWidget(self.main_stack, stretch=1)
 
         self.queue_timer = QTimer(self)
@@ -684,12 +1142,314 @@ class InterviewWindow(QWidget):
         self._exclude_capture_geom_timer.setInterval(80)
         self._exclude_capture_geom_timer.timeout.connect(self._sync_exclude_capture_after_geometry)
 
+        self._toast_host = QWidget(self)
+        self._toast_host.setObjectName("ToastHost")
+        self._toast_host.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
+        self._toast_host.setStyleSheet("#ToastHost { background: transparent; border: none; }")
+        self._toast_frames: list[QFrame] = []
+        self._sync_toast_host_geometry()
+        self._toast_host.raise_()
+
         # Hover cursor updates should work before clicking.
         self._enable_hover_tracking(self)
+
+    def _build_settings_page(self) -> QWidget:
+        page = QWidget()
+        page.setObjectName("SettingsPage")
+        outer = QVBoxLayout(page)
+        outer.setContentsMargins(8, 8, 8, 8)
+        outer.setSpacing(8)
+        header = QHBoxLayout()
+        self.settings_back_btn = QToolButton()
+        self.settings_back_btn.setObjectName("SettingsBackBtn")
+        self.settings_back_btn.setText("Back")
+        self.settings_back_btn.setIcon(self._build_chevron_left_svg_icon(14, "#212121"))
+        self.settings_back_btn.setIconSize(QSize(16, 16))
+        self.settings_back_btn.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextBesideIcon)
+        self.settings_back_btn.setCursor(Qt.PointingHandCursor)
+        self.settings_back_btn.setAutoRaise(False)
+        self.settings_back_btn.setStyleSheet(
+            f"""
+            QToolButton#SettingsBackBtn {{
+                border: none;
+                border-radius: 14px;
+                background: {_TOPBAR_CYAN_BG};
+                padding: 6px 14px 6px 10px;
+                font-size: 12px;
+                font-weight: 700;
+                color: #212121;
+            }}
+            QToolButton#SettingsBackBtn:hover {{
+                background: {_TOPBAR_CYAN_HOVER};
+            }}
+            """
+        )
+        self.settings_back_btn.clicked.connect(self._on_settings_back_clicked)
+        header.addWidget(self.settings_back_btn)
+        header.addStretch(1)
+        outer.addLayout(header)
+
+        splitter = QSplitter(Qt.Orientation.Horizontal)
+        splitter.setChildrenCollapsible(False)
+        splitter.setStretchFactor(0, 3)
+        splitter.setStretchFactor(1, 7)
+        splitter.setHandleWidth(1)
+        splitter.setStyleSheet(
+            f"QSplitter::handle:horizontal {{ background-color: {CAPTION_ROW_BOTTOM_BORDER_COLOR}; "
+            "width: 1px; border: none; }}"
+        )
+        left = QWidget()
+        left.setMinimumWidth(140)
+        lv = QVBoxLayout(left)
+        lv.setContentsMargins(4, 4, 4, 4)
+        lv.setSpacing(10)
+        btn_style = (
+            "QPushButton { padding: 8px 12px; border-radius: 8px; background: #f5f5f5; color: #263238; "
+            "font-weight: 700; font-size: 12px; border: 1px solid #cfd8dc; text-align: left; }"
+            "QPushButton:hover { background: #e8eaf6; }"
+        )
+        self._settings_tpl_buttons: dict[str, QPushButton] = {}
+        for kind, label in (
+            ("resume_summary", "Resume summary template"),
+            ("jd_summary", "JD summary template"),
+            ("initial_interview", "Initial interview template"),
+            ("chunk_interview", "Per-caption interview template"),
+            ("read_mode", "Read mode prompt"),
+            ("type_mode", "Type mode prompt"),
+            ("behavioral_mode", "Behavioral mode prompt"),
+        ):
+            b = QPushButton(label)
+            b.setStyleSheet(btn_style)
+            b.setCursor(Qt.PointingHandCursor)
+            b.clicked.connect(lambda checked=False, k=kind: self._on_settings_pick_prompt_kind(k))
+            lv.addWidget(b)
+            self._settings_tpl_buttons[kind] = b
+        lv.addStretch(1)
+        splitter.addWidget(left)
+
+        right = QWidget()
+        right.setMinimumWidth(200)
+        rv = QVBoxLayout(right)
+        rv.setContentsMargins(4, 4, 4, 4)
+        rv.setSpacing(8)
+        self._settings_right_hint = QLabel("Select a prompt on the left to view or edit.")
+        self._settings_right_hint.setWordWrap(True)
+        self._settings_right_hint.setStyleSheet("font-size: 13px; font-weight: 700; color: #546e7a; padding: 8px;")
+        rv.addWidget(self._settings_right_hint)
+        self._settings_editor = QPlainTextEdit()
+        self._settings_editor.setPlaceholderText("")
+        self._settings_editor.setStyleSheet(
+            "QPlainTextEdit { font-size: 13px; font-weight: 600; color: #212121; background: rgba(255,255,255,0.92); "
+            "border: 1px solid rgba(17,17,17,90); border-radius: 8px; padding: 8px; }"
+        )
+        self._settings_editor.hide()
+        self._settings_editor.textChanged.connect(self._on_settings_editor_text_changed)
+        rv.addWidget(self._settings_editor, stretch=1)
+        btn_row = QHBoxLayout()
+        btn_row.addStretch(1)
+        self._settings_prompt_save_btn = QPushButton("Save")
+        self._settings_prompt_save_btn.setMinimumHeight(36)
+        self._settings_prompt_save_btn.setCursor(Qt.PointingHandCursor)
+        self._settings_prompt_save_btn.setStyleSheet(
+            "QPushButton { padding: 8px 22px; border-radius: 10px; background: #3949ab; color: white; "
+            "font-weight: 700; font-size: 13px; border: none; }"
+            "QPushButton:hover { background: #5c6bc0; }"
+        )
+        self._settings_prompt_save_btn.clicked.connect(self._on_settings_prompt_save_clicked)
+        self._settings_prompt_cancel_btn = QPushButton("Cancel")
+        self._settings_prompt_cancel_btn.setMinimumHeight(36)
+        self._settings_prompt_cancel_btn.setCursor(Qt.PointingHandCursor)
+        self._settings_prompt_cancel_btn.setStyleSheet(
+            "QPushButton { padding: 8px 22px; border-radius: 10px; background: #eceff1; color: #263238; "
+            "font-weight: 700; font-size: 13px; border: none; }"
+            "QPushButton:hover { background: #cfd8dc; }"
+        )
+        self._settings_prompt_cancel_btn.clicked.connect(self._on_settings_prompt_cancel_clicked)
+        self._settings_prompt_save_btn.hide()
+        self._settings_prompt_cancel_btn.hide()
+        btn_row.addWidget(self._settings_prompt_save_btn)
+        btn_row.addWidget(self._settings_prompt_cancel_btn)
+        rv.addLayout(btn_row)
+        splitter.addWidget(right)
+        splitter.setSizes([260, 540])
+        outer.addWidget(splitter, stretch=1)
+        return page
+
+    def _settings_effective_client_id(self) -> str:
+        global _active_interview_client_id
+        return (str(_active_interview_client_id or "").strip() or str(get_selected_client_id() or "").strip())
+
+    def _on_settings_nav_clicked(self) -> None:
+        if self.session_stack is None:
+            return
+        self.session_stack.setCurrentIndex(1)
+
+    def _on_settings_back_clicked(self) -> None:
+        if self._settings_editor_dirty:
+            r = QMessageBox.question(
+                self,
+                "Unsaved edits",
+                "Discard unsaved prompt edits and return to the interview?",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No,
+            )
+            if r != QMessageBox.StandardButton.Yes:
+                return
+        self._reset_settings_editor_state()
+        if self.session_stack is not None:
+            self.session_stack.setCurrentIndex(0)
+
+    def _reset_settings_editor_state(self) -> None:
+        self._settings_active_kind = None
+        self._settings_snap_text = ""
+        self._settings_editor_dirty = False
+        self._settings_editor.blockSignals(True)
+        self._settings_editor.clear()
+        self._settings_editor.blockSignals(False)
+        self._settings_editor.hide()
+        self._settings_right_hint.show()
+        self._settings_prompt_save_btn.hide()
+        self._settings_prompt_cancel_btn.hide()
+
+    def _on_settings_pick_prompt_kind(self, kind: str) -> None:
+        if kind == "read_mode":
+            text = READ_MODE_CHUNK_TEMPLATE
+        elif kind == "type_mode":
+            text = TYPE_MODE_CHUNK_TEMPLATE
+        elif kind == "behavioral_mode":
+            text = BEHAVIORAL_MODE_CHUNK_TEMPLATE
+        elif kind in ("resume_summary", "jd_summary", "initial_interview", "chunk_interview"):
+            text = prompt_store.get_template(kind)
+        else:
+            return
+        self._settings_active_kind = kind
+        self._settings_editor.blockSignals(True)
+        self._settings_editor.setPlainText(text or "")
+        self._settings_editor.blockSignals(False)
+        self._settings_snap_text = self._settings_editor.toPlainText()
+        self._settings_editor_dirty = False
+        self._settings_editor.show()
+        self._settings_right_hint.hide()
+        self._settings_prompt_save_btn.show()
+        self._settings_prompt_cancel_btn.show()
+
+    def _on_settings_editor_text_changed(self) -> None:
+        self._settings_editor_dirty = self._settings_editor.toPlainText() != self._settings_snap_text
+
+    def _on_settings_prompt_cancel_clicked(self) -> None:
+        if self._settings_active_kind is None:
+            self._reset_settings_editor_state()
+            return
+        self._settings_editor.blockSignals(True)
+        self._settings_editor.setPlainText(self._settings_snap_text)
+        self._settings_editor.blockSignals(False)
+        self._settings_editor_dirty = False
+
+    def _on_settings_prompt_save_clicked(self) -> None:
+        global READ_MODE_CHUNK_TEMPLATE, TYPE_MODE_CHUNK_TEMPLATE, BEHAVIORAL_MODE_CHUNK_TEMPLATE
+        kind = self._settings_active_kind
+        if not kind:
+            return
+        body = self._settings_editor.toPlainText()
+        if kind == "read_mode":
+            READ_MODE_CHUNK_TEMPLATE = body
+            _persist_mode_prompts_to_json()
+            self.show_toast("Read mode prompt saved.", level="success")
+        elif kind == "type_mode":
+            TYPE_MODE_CHUNK_TEMPLATE = body
+            _persist_mode_prompts_to_json()
+            self.show_toast("Type mode prompt saved.", level="success")
+        elif kind == "behavioral_mode":
+            BEHAVIORAL_MODE_CHUNK_TEMPLATE = body
+            _persist_mode_prompts_to_json()
+            self.show_toast("Behavioral mode prompt saved.", level="success")
+        elif kind in ("resume_summary", "jd_summary", "initial_interview", "chunk_interview"):
+            cid = self._settings_effective_client_id()
+            url = f"{self._bridge_base}/context/template/{kind}"
+            post_body: dict = {"text": body}
+            if cid:
+                post_body["client_id"] = cid
+            payload, status = _http_post_json_local(url, post_body)
+            if status >= 400 or str(payload.get("error", "")).strip():
+                self.show_toast(
+                    f"Could not save template: {payload.get('error', payload)!s}",
+                    level="error",
+                )
+                return
+            if str(payload.get("status", "")).lower() != "ok" and payload.get("ok") is not True:
+                self.show_toast("Could not save template: unexpected bridge response.", level="error")
+                return
+            prompt_store.set_template(kind, body)
+            if kind == "resume_summary":
+                self.show_toast("Resume summary template saved.", level="success")
+            elif kind == "jd_summary":
+                self.show_toast("Job description template saved.", level="success")
+            elif kind == "initial_interview":
+                self.show_toast("Initial interview template saved.", level="success")
+            else:
+                self.show_toast("Per-caption interview template saved.", level="success")
+        self._settings_snap_text = body
+        self._settings_editor_dirty = False
+
+    def _topbar_blocks_window_drag(self, pt_window) -> bool:
+        for w in (
+            self.close_btn,
+            self.settings_btn,
+            self.save_transcript_btn,
+            self.session_mode_btn,
+            self.opacity_slider,
+            self.opacity_lbl,
+            self.account_label,
+            self.settings_back_btn,
+        ):
+            if w.isVisible() and w.rect().contains(w.mapFrom(self, pt_window)):
+                return True
+        return False
 
     def _on_opacity_slider_changed(self, value: int) -> None:
         self._shell_bg_opacity = max(0.0, min(1.0, value / 100.0))
         self._apply_shell_visual()
+
+    def _set_session_mode_from_menu(self, mode: str) -> None:
+        """Set chunk-guidance mode from the top-bar menu (read / type / behavioral)."""
+        global _session_mode
+        old = _session_mode
+        m = (mode or "read").strip().lower()
+        if m not in ("read", "type", "behavioral"):
+            m = "read"
+        _session_mode = m
+        self._update_session_mode_button()
+        if old == m:
+            return
+        if m == "type":
+            self.show_toast("Switched to Type mode.", level="success")
+        elif m == "behavioral":
+            self.show_toast("Switched to Behavioral mode.", level="success")
+        else:
+            self.show_toast("Switched to Read mode.", level="success")
+
+    def _update_session_mode_button(self) -> None:
+        global _session_mode
+        px = self._session_mode_icon_render_px
+        col = self._session_mode_icon_color
+        if _session_mode == "type":
+            self.session_mode_btn.setIcon(
+                self._build_type_mode_svg_icon(px, col)
+            )
+            self.session_mode_btn.setText("Type")
+            self.session_mode_btn.setAccessibleName("Type mode")
+        elif _session_mode == "behavioral":
+            self.session_mode_btn.setIcon(
+                self._build_behavioral_mode_svg_icon(px, col)
+            )
+            self.session_mode_btn.setText("Behavioral")
+            self.session_mode_btn.setAccessibleName("Behavioral mode")
+        else:
+            self.session_mode_btn.setIcon(
+                self._build_read_mode_svg_icon(px, col)
+            )
+            self.session_mode_btn.setText("Read")
+            self.session_mode_btn.setAccessibleName("Read mode")
 
     def _apply_shell_visual(self) -> None:
         """Only the shell panel background fades; labels/buttons stay opaque."""
@@ -719,17 +1479,25 @@ class InterviewWindow(QWidget):
             QFrame#InterviewShell QPushButton {{
                 font-weight: 700;
             }}
+            QFrame#InterviewShell QToolButton {{
+                font-weight: 700;
+            }}
             """
         )
 
     def _sync_shell_for_main_stack(self, index: int) -> None:
         if self._start_with_prep and self.main_stack is not None:
             self._shell_phase_prep = index == 0
+        in_prep = bool(self._start_with_prep and self.main_stack is not None and index == 0)
+        self.session_mode_btn.setVisible(not in_prep)
+        self.save_transcript_btn.setVisible(not in_prep)
+        self.settings_btn.setVisible(not in_prep)
         self._apply_shell_visual()
 
     def _on_prep_finished(self, display_email: str, client_id: str) -> None:
         global _interview_ws, _main_interview_window, _active_interview_client_id
-        global _session_initial_template, _session_chunk_template
+        global _session_initial_template
+        interview_history_reset()
         chosen = str(client_id or "").strip()
         if chosen:
             set_selected_client_id(chosen)
@@ -740,7 +1508,6 @@ class InterviewWindow(QWidget):
         # Pin the templates that step 4 just shipped to ChatGPT — every caption from now
         # on uses these snapshots, so editing the extension mid-interview cannot change behavior.
         _session_initial_template = (prompt_store.get_template("initial_interview") or "").strip()
-        _session_chunk_template = (prompt_store.get_template("chunk_interview") or "").strip()
         _interview_ws = InterviewWSServer(ui_queue)
         _interview_ws.start()
         threading.Thread(target=start_listener, daemon=True).start()
@@ -755,6 +1522,9 @@ class InterviewWindow(QWidget):
 
         if self.prep_widget is not None:
             self.prep_widget.shutdown_for_handoff()
+        if self.session_stack is not None:
+            self.session_stack.setCurrentIndex(0)
+        self._reset_settings_editor_state()
         if self.main_stack is not None:
             self.main_stack.setCurrentIndex(1)
             QTimer.singleShot(0, self._apply_initial_splitter_sizes)
@@ -785,9 +1555,252 @@ class InterviewWindow(QWidget):
             child.setMouseTracking(True)
             child.installEventFilter(self)
 
+    def _sync_toast_host_geometry(self) -> None:
+        host = getattr(self, "_toast_host", None)
+        if host is None:
+            return
+        host.setGeometry(0, 0, max(1, self.width()), max(1, self.height()))
+
+    def _toast_layout_positions(self) -> list[tuple[int, int, int]]:
+        """Return (x, y, row_height) per toast, horizontally centered (variable width per toast)."""
+        W = max(1, self.width())
+        y = _TOAST_MARGIN_TOP
+        out: list[tuple[int, int, int]] = []
+        for frame in self._toast_frames:
+            fw = max(1, frame.width())
+            x = max(0, (W - fw) // 2)
+            h = max(24, frame.sizeHint().height(), frame.height())
+            out.append((x, y, h))
+            y += h + _TOAST_GAP_PX
+        return out
+
+    def _relayout_toast_frames(self, *, animate_last_entrance: bool = False) -> None:
+        self._sync_toast_host_geometry()
+        self._toast_host.raise_()
+        positions = self._toast_layout_positions()
+        if not positions or not self._toast_frames:
+            return
+        last_i = len(self._toast_frames) - 1
+        for i, frame in enumerate(self._toast_frames):
+            x, y, _h = positions[i]
+            end = QPoint(x, y)
+            if animate_last_entrance and i == last_i:
+                eff = frame.graphicsEffect()
+                if isinstance(eff, QGraphicsOpacityEffect):
+                    eff.setOpacity(0.0)
+                frame.move(QPoint(x, y - _TOAST_SLIDE_PX))
+                frame.show()
+                grp = QParallelAnimationGroup(self)
+                opa = QPropertyAnimation(eff, b"opacity", self)
+                opa.setDuration(_TOAST_SHOW_MS)
+                opa.setStartValue(0.0)
+                opa.setEndValue(1.0)
+                opa.setEasingCurve(QEasingCurve.Type.OutCubic)
+                posa = QPropertyAnimation(frame, b"pos", self)
+                posa.setDuration(_TOAST_SHOW_MS)
+                posa.setStartValue(QPoint(x, y - _TOAST_SLIDE_PX))
+                posa.setEndValue(end)
+                posa.setEasingCurve(QEasingCurve.Type.OutCubic)
+                grp.addAnimation(opa)
+                grp.addAnimation(posa)
+                grp.start(QAbstractAnimation.DeleteWhenStopped)
+            else:
+                frame.move(end)
+                eff = frame.graphicsEffect()
+                if isinstance(eff, QGraphicsOpacityEffect):
+                    eff.setOpacity(1.0)
+                frame.show()
+
+    def _relayout_toast_frames_slide_to_target(self, duration_ms: int = 200) -> None:
+        self._sync_toast_host_geometry()
+        self._toast_host.raise_()
+        positions = self._toast_layout_positions()
+        for i, frame in enumerate(self._toast_frames):
+            if i >= len(positions):
+                break
+            x, y, _h = positions[i]
+            end = QPoint(x, y)
+            if frame.pos() == end:
+                continue
+            posa = QPropertyAnimation(frame, b"pos", self)
+            posa.setDuration(duration_ms)
+            posa.setStartValue(frame.pos())
+            posa.setEndValue(end)
+            posa.setEasingCurve(QEasingCurve.Type.OutCubic)
+            posa.start(QAbstractAnimation.DeleteWhenStopped)
+
+    def _dismiss_toast_frame(self, frame: QFrame) -> None:
+        if frame not in self._toast_frames:
+            return
+        eff = frame.graphicsEffect()
+        if not isinstance(eff, QGraphicsOpacityEffect):
+            try:
+                self._toast_frames.remove(frame)
+            except ValueError:
+                pass
+            frame.deleteLater()
+            self._relayout_toast_frames_slide_to_target(200)
+            return
+        anim = QPropertyAnimation(eff, b"opacity", self)
+        anim.setDuration(_TOAST_HIDE_MS)
+        anim.setStartValue(float(eff.opacity()))
+        anim.setEndValue(0.0)
+        anim.setEasingCurve(QEasingCurve.Type.InCubic)
+
+        def _after() -> None:
+            try:
+                self._toast_frames.remove(frame)
+            except ValueError:
+                pass
+            frame.deleteLater()
+            self._relayout_toast_frames_slide_to_target(220)
+
+        anim.finished.connect(_after)
+        anim.start(QAbstractAnimation.DeleteWhenStopped)
+
+    def show_toast(
+        self,
+        message: str,
+        *,
+        level: str = "success",
+        duration_ms: int | None = None,
+    ) -> None:
+        lvl = (level or "success").strip().lower()
+        if lvl not in ("success", "warning", "error"):
+            lvl = "success"
+        host = getattr(self, "_toast_host", None)
+        if host is None:
+            return
+        if lvl == "error":
+            default_msg = "Something went wrong."
+        elif lvl == "warning":
+            default_msg = "Notice."
+        else:
+            default_msg = "Done."
+        text = _toast_trim_message((message or "").strip() or default_msg)
+        self._sync_toast_host_geometry()
+        host.raise_()
+        frame = QFrame(host)
+        frame.setObjectName({"success": "ToastSuccess", "warning": "ToastWarning", "error": "ToastError"}[lvl])
+        frame.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
+        fs = _TOAST_FONT_PX
+        styles = {
+            "success": f"""
+                QFrame#ToastSuccess {{
+                    background-color: rgba(46, 125, 50, 0.94);
+                    border-radius: 8px;
+                    border: 1px solid rgba(165, 214, 167, 0.55);
+                }}
+                QFrame#ToastSuccess QLabel {{
+                    color: #e8f5e9;
+                    font-size: {fs}px;
+                    font-weight: 600;
+                    padding: 5px 10px;
+                    background: transparent;
+                }}
+            """,
+            "warning": f"""
+                QFrame#ToastWarning {{
+                    background-color: rgba(230, 81, 0, 0.94);
+                    border-radius: 8px;
+                    border: 1px solid rgba(255, 224, 178, 0.55);
+                }}
+                QFrame#ToastWarning QLabel {{
+                    color: #fff8e1;
+                    font-size: {fs}px;
+                    font-weight: 600;
+                    padding: 5px 10px;
+                    background: transparent;
+                }}
+            """,
+            "error": f"""
+                QFrame#ToastError {{
+                    background-color: rgba(183, 28, 28, 0.94);
+                    border-radius: 8px;
+                    border: 1px solid rgba(255, 205, 210, 0.45);
+                }}
+                QFrame#ToastError QLabel {{
+                    color: #ffebee;
+                    font-size: {fs}px;
+                    font-weight: 600;
+                    padding: 5px 10px;
+                    background: transparent;
+                }}
+            """,
+        }
+        frame.setStyleSheet(styles[lvl])
+        lay = QHBoxLayout(frame)
+        lay.setContentsMargins(0, 0, 0, 0)
+        lbl = QLabel(text)
+        lbl.setWordWrap(True)
+        lbl.setMaximumWidth(_TOAST_LABEL_MAX_WIDTH)
+        lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        lbl.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
+        lay.addWidget(lbl)
+        eff = QGraphicsOpacityEffect(frame)
+        eff.setOpacity(0.0)
+        frame.setGraphicsEffect(eff)
+        frame.adjustSize()
+        max_outer = min(_TOAST_MAX_OUTER, max(_TOAST_MIN_OUTER, self.width() - 16))
+        fw = min(max_outer, max(_TOAST_MIN_OUTER, int(frame.sizeHint().width())))
+        frame.setFixedWidth(fw)
+        frame.adjustSize()
+        self._toast_frames.append(frame)
+        self._relayout_toast_frames(animate_last_entrance=True)
+        if duration_ms is None:
+            if lvl == "error":
+                linger = _TOAST_LINGER_ERROR_MS
+            elif lvl == "warning":
+                linger = _TOAST_LINGER_WARNING_MS
+            else:
+                linger = _TOAST_LINGER_SUCCESS_MS
+        else:
+            linger = int(duration_ms)
+        linger = max(700, linger)
+        QTimer.singleShot(linger, lambda f=frame: self._dismiss_toast_frame(f))
+
     def _build_close_svg_icon(self, size: int, color: str) -> QIcon:
         svg = f"""<svg xmlns="http://www.w3.org/2000/svg" width="{size}" height="{size}" viewBox="0 0 16 16">
 <path fill="{color}" d="M3.72 3.72a.75.75 0 0 1 1.06 0L8 6.94l3.22-3.22a.75.75 0 1 1 1.06 1.06L9.06 8l3.22 3.22a.75.75 0 1 1-1.06 1.06L8 9.06l-3.22 3.22a.75.75 0 0 1-1.06-1.06L6.94 8L3.72 4.78a.75.75 0 0 1 0-1.06z"/>
+</svg>"""
+        renderer = QSvgRenderer(svg.encode("utf-8"))
+        pixmap = QPixmap(size, size)
+        pixmap.fill(Qt.GlobalColor.transparent)
+        painter = QPainter(pixmap)
+        renderer.render(painter)
+        painter.end()
+        return QIcon(pixmap)
+
+    def _build_save_transcript_svg_icon(self, size: int, color: str) -> QIcon:
+        # Tray + arrow (save / export), 16×16 viewBox — same render pipeline as close button.
+        svg = f"""<svg xmlns="http://www.w3.org/2000/svg" width="{size}" height="{size}" viewBox="0 0 16 16">
+<path fill="{color}" d="M8 1 4 6h2.5v5h3V6H12L8 1zM2 12.5h12V15H2v-2.5z"/>
+</svg>"""
+        renderer = QSvgRenderer(svg.encode("utf-8"))
+        pixmap = QPixmap(size, size)
+        pixmap.fill(Qt.GlobalColor.transparent)
+        painter = QPainter(pixmap)
+        renderer.render(painter)
+        painter.end()
+        return QIcon(pixmap)
+
+    def _build_overflow_kebab_svg_icon(self, size: int, color: str) -> QIcon:
+        svg = f"""<svg xmlns="http://www.w3.org/2000/svg" width="{size}" height="{size}" viewBox="0 0 16 16">
+<circle cx="8" cy="3" r="1.35" fill="{color}"/>
+<circle cx="8" cy="8" r="1.35" fill="{color}"/>
+<circle cx="8" cy="13" r="1.35" fill="{color}"/>
+</svg>"""
+        renderer = QSvgRenderer(svg.encode("utf-8"))
+        pixmap = QPixmap(size, size)
+        pixmap.fill(Qt.GlobalColor.transparent)
+        painter = QPainter(pixmap)
+        renderer.render(painter)
+        painter.end()
+        return QIcon(pixmap)
+
+    def _build_chevron_left_svg_icon(self, size: int, color: str) -> QIcon:
+        svg = f"""<svg xmlns="http://www.w3.org/2000/svg" width="{size}" height="{size}" viewBox="0 0 16 16">
+<path fill="{color}" d="M10.5 3.5 6 8l4.5 4.5-1.06 1.06L3.88 8l5.56-5.56L10.5 3.5z"/>
 </svg>"""
         renderer = QSvgRenderer(svg.encode("utf-8"))
         pixmap = QPixmap(size, size)
@@ -848,6 +1861,50 @@ class InterviewWindow(QWidget):
         painter.end()
         return QIcon(pixmap)
 
+    @staticmethod
+    def _build_read_mode_svg_icon(size: int, color: str) -> QIcon:
+        svg = f"""<svg xmlns="http://www.w3.org/2000/svg" width="{size}" height="{size}" viewBox="0 0 24 24">
+<path fill="{color}" d="M8 2.5h10.5c.83 0 1.5.67 1.5 1.5v16c0 .83-.67 1.5-1.5 1.5H8A2.5 2.5 0 0 1 5.5 19V5A2.5 2.5 0 0 1 8 2.5zm1.5 5.25h7v1.5h-7zm0 3.5h7v1.5h-7zm0 3.5h4.5v1.5H9.5z"/>
+<circle cx="6" cy="6.25" r="1" fill="{color}"/>
+<circle cx="6" cy="10.25" r="1" fill="{color}"/>
+<circle cx="6" cy="14.25" r="1" fill="{color}"/>
+<circle cx="6" cy="18.25" r="1" fill="{color}"/>
+</svg>"""
+        renderer = QSvgRenderer(svg.encode("utf-8"))
+        pixmap = QPixmap(size, size)
+        pixmap.fill(Qt.GlobalColor.transparent)
+        painter = QPainter(pixmap)
+        renderer.render(painter)
+        painter.end()
+        return QIcon(pixmap)
+
+    @staticmethod
+    def _build_type_mode_svg_icon(size: int, color: str) -> QIcon:
+        svg = f"""<svg xmlns="http://www.w3.org/2000/svg" width="{size}" height="{size}" viewBox="0 0 24 24">
+<path fill="{color}" d="M3 17.46V20.5c0 .28.22.5.5.5h3.04c.13 0 .26-.05.35-.15L17.81 9.94l-3.59-3.59L3.35 17.11c-.09.09-.15.22-.15.35zM20.71 7.04a1.003 1.003 0 0 0 0-1.41l-2.34-2.34a1.003 1.003 0 0 0-1.41 0l-1.83 1.83 3.59 3.59 1.99-1.67z"/>
+</svg>"""
+        renderer = QSvgRenderer(svg.encode("utf-8"))
+        pixmap = QPixmap(size, size)
+        pixmap.fill(Qt.GlobalColor.transparent)
+        painter = QPainter(pixmap)
+        renderer.render(painter)
+        painter.end()
+        return QIcon(pixmap)
+
+    @staticmethod
+    def _build_behavioral_mode_svg_icon(size: int, color: str) -> QIcon:
+        svg = f"""<svg xmlns="http://www.w3.org/2000/svg" width="{size}" height="{size}" viewBox="0 0 24 24">
+<path fill="{color}" d="M5 4.5h8.5A2.25 2.25 0 0 1 15.75 6.75v3.5A2.25 2.25 0 0 1 13.5 12.5h-1.9L9.25 15.5V12.5H5A2.25 2.25 0 0 1 2.75 10.25v-3.5A2.25 2.25 0 0 1 5 4.5z"/>
+<path fill="{color}" d="M10.25 9.75h7A1.85 1.85 0 0 1 19.1 11.6v2.65a1.85 1.85 0 0 1-1.85 1.85h-1.35l-1.6 2.55v-2.55h-1.05A1.85 1.85 0 0 1 12.4 14.25v-2.65a1.85 1.85 0 0 1 1.85-1.85z"/>
+</svg>"""
+        renderer = QSvgRenderer(svg.encode("utf-8"))
+        pixmap = QPixmap(size, size)
+        pixmap.fill(Qt.GlobalColor.transparent)
+        painter = QPainter(pixmap)
+        renderer.render(painter)
+        painter.end()
+        return QIcon(pixmap)
+
     def _hit_test_edges(self, local_pos):
         rect = self.rect()
         x, y = local_pos.x(), local_pos.y()
@@ -872,9 +1929,8 @@ class InterviewWindow(QWidget):
             self.setCursor(Qt.OpenHandCursor)
 
     def mousePressEvent(self, event: QMouseEvent):
-        if event.button() == Qt.LeftButton and not self.close_btn.geometry().contains(
-            event.position().toPoint()
-        ):
+        pt = event.position().toPoint()
+        if event.button() == Qt.LeftButton and not self._topbar_blocks_window_drag(pt):
             left, right, top, bottom = self._hit_test_edges(event.position().toPoint())
             if left or right or top or bottom:
                 self.resize_edges = (left, right, top, bottom)
@@ -922,7 +1978,7 @@ class InterviewWindow(QWidget):
         super().mouseMoveEvent(event)
 
     def eventFilter(self, watched, event):
-        drag_zone = getattr(self, "top_drag_zone", None)
+        drag_zone = getattr(self, "top_center_drag_host", None)
         if drag_zone is not None and watched is drag_zone and event.type() == QEvent.Type.MouseButtonPress:
             me = event
             if me.button() == Qt.LeftButton:
@@ -967,10 +2023,47 @@ class InterviewWindow(QWidget):
         self._schedule_sync_exclude_capture_after_geometry()
 
     def moveEvent(self, event):
-        super().moveEvent(event)
         self._schedule_sync_exclude_capture_after_geometry()
+        super().moveEvent(event)
 
-    def closeEvent(self, event):
+    def _default_transcript_save_path(self) -> Path:
+        return _documents_dir_fallback() / f"Interview_{datetime.now().strftime('%Y-%m-%d_%H%M%S')}.txt"
+
+    def _write_transcript_file(self, path: Path) -> None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(interview_history_format_txt(), encoding="utf-8", newline="\n")
+
+    def _prompt_save_transcript_interactive(self) -> bool:
+        """True if a file was written; False if cancelled or write failed."""
+        path_str, _sel = QFileDialog.getSaveFileName(
+            self,
+            "Save interview transcript",
+            str(self._default_transcript_save_path()),
+            "Text Files (*.txt)",
+        )
+        if not path_str:
+            return False
+        out = Path(path_str)
+        if out.suffix.lower() != ".txt":
+            out = out.with_suffix(".txt")
+        try:
+            self._write_transcript_file(out)
+        except OSError as exc:
+            self.show_toast(f"Could not save transcript file: {exc}", level="error")
+            return False
+        self.show_toast(f"Saved: {out.name}", level="success")
+        return True
+
+    def _on_save_transcript_clicked(self) -> None:
+        if not interview_history_has_interviewer_lines():
+            self.show_toast(
+                "No interviewer captions in this session yet — nothing to save.",
+                level="warning",
+            )
+            return
+        self._prompt_save_transcript_interactive()
+
+    def _shutdown_services(self) -> None:
         global app_running, _keyboard_listener, _interview_ws
         app_running = False
         try:
@@ -987,6 +2080,26 @@ class InterviewWindow(QWidget):
                 _keyboard_listener.stop()
         except Exception:
             pass
+
+    def closeEvent(self, event):
+        # Stop prep timers / register thread before bridge.stop() so /prep/clear and polls
+        # do not hit a torn-down server (ConnectionAbortedError / QThread warnings).
+        if self.prep_widget is not None:
+            self.prep_widget.shutdown_for_handoff()
+        # Autosave transcript when any interviewer text was captured (same scope as the old
+        # save prompt). No dialog on success; time-based path under Documents (see _default_transcript_save_path).
+        if interview_history_has_interviewer_lines():
+            path = self._default_transcript_save_path()
+            try:
+                self._write_transcript_file(path)
+            except OSError as exc:
+                self.show_toast(
+                    f"Could not autosave transcript to {path.name}: {exc}",
+                    level="error",
+                )
+                event.ignore()
+                return
+        self._shutdown_services()
         super().closeEvent(event)
         app_inst = QApplication.instance()
         if app_inst is not None:
@@ -1004,6 +2117,8 @@ class InterviewWindow(QWidget):
     def showEvent(self, event):
         super().showEvent(event)
         self._sync_round_window_mask()
+        self._sync_toast_host_geometry()
+        self._relayout_toast_frames(animate_last_entrance=False)
         self._apply_initial_splitter_sizes()
         if self._exclude_from_capture:
             QTimer.singleShot(0, self._apply_exclude_from_capture_if_enabled)
@@ -1021,12 +2136,54 @@ class InterviewWindow(QWidget):
         self._apply_exclude_from_capture_if_enabled()
 
     def _apply_display_affinity_only(self) -> None:
+        self._apply_display_affinity_only_impl(is_api_retry=False)
+
+    def _apply_display_affinity_retry_once(self) -> None:
+        self._display_affinity_retry_pending = False
+        if not self._exclude_from_capture or not self.isVisible():
+            return
+        self._apply_display_affinity_only_impl(is_api_retry=True)
+
+    def _apply_display_affinity_only_impl(self, *, is_api_retry: bool) -> None:
         if not self._exclude_from_capture or not self.isVisible():
             return
         hwnd = int(self.winId())
-        if hwnd:
-            aff = _desired_display_affinity_for_window(self)
-            _win32_set_window_display_affinity(hwnd, aff)
+        if not hwnd:
+            return
+        aff = _desired_display_affinity_for_window(self)
+        sk = _screen_key_at_window_center(self)
+        rc = _win32_set_window_display_affinity(hwnd, aff)
+        ok = bool(rc)
+
+        if _env_debug_affinity():
+            prev_aff = getattr(self, "_affinity_dbg_prev_logged_aff", _AFFINITY_DBG_PREV_UNSET)
+            prev_sk = getattr(self, "_affinity_dbg_prev_logged_sk", _AFFINITY_DBG_PREV_UNSET)
+            now = time.time()
+            if ok:
+                if prev_aff is _AFFINITY_DBG_PREV_UNSET or aff != prev_aff or sk != prev_sk:
+                    line = (
+                        f"[affinity] hwnd=0x{hwnd:x} {_affinity_constant_name(aff)} "
+                        f"SetWindowDisplayAffinity=ok rc={rc} | {_primary_vs_screen_at_debug_suffix(self)}"
+                    )
+                    print(line, file=sys.stderr, flush=True)
+                    self._affinity_dbg_prev_logged_aff = aff
+                    self._affinity_dbg_prev_logged_sk = sk
+            else:
+                sig = (hwnd, aff, sk, rc)
+                last_sig = getattr(self, "_affinity_dbg_last_fail_sig", None)
+                last_ts = float(getattr(self, "_affinity_dbg_last_fail_ts", 0.0))
+                if sig != last_sig or (now - last_ts) >= 0.5:
+                    line = (
+                        f"[affinity] hwnd=0x{hwnd:x} {_affinity_constant_name(aff)} "
+                        f"SetWindowDisplayAffinity=fail rc={rc} | {_primary_vs_screen_at_debug_suffix(self)}"
+                    )
+                    print(line, file=sys.stderr, flush=True)
+                    self._affinity_dbg_last_fail_sig = sig
+                    self._affinity_dbg_last_fail_ts = now
+
+        if not ok and not is_api_retry and not getattr(self, "_display_affinity_retry_pending", False):
+            self._display_affinity_retry_pending = True
+            QTimer.singleShot(200, self._apply_display_affinity_retry_once)
 
     def _apply_exclude_from_capture_if_enabled(self) -> None:
         if not self._exclude_from_capture or not self.isVisible():
@@ -1036,6 +2193,7 @@ class InterviewWindow(QWidget):
             return
         scr = QGuiApplication.screenAt(self.geometry().center())
         prev = getattr(self, "_affinity_bump_screen", None)
+        # Center can move to another virtual monitor during drag; staggered re-apply helps DWM.
         if scr is not prev:
             self._affinity_bump_screen = scr
             for ms in (100, 400, 850):
@@ -1044,6 +2202,8 @@ class InterviewWindow(QWidget):
 
     def resizeEvent(self, event):
         self._sync_round_window_mask()
+        self._sync_toast_host_geometry()
+        self._relayout_toast_frames(animate_last_entrance=False)
         self.resize_timer.start(20)
         if not self._splitter_initialized:
             QTimer.singleShot(0, self._apply_initial_splitter_sizes)
@@ -1133,7 +2293,7 @@ class InterviewWindow(QWidget):
         QTimer.singleShot(1500, restore)
 
     def create_row(
-        self, side: str, with_copy_button: bool = False, copy_tooltip: str = "Copy"
+        self, side: str, with_copy_button: bool = False
     ) -> tuple[QWidget, QFrame, QLabel]:
         row = QWidget()
         h = QHBoxLayout(row)
@@ -1144,7 +2304,7 @@ class InterviewWindow(QWidget):
         panel.setMinimumHeight(44)
         panel.setMaximumHeight(2000)
         panel.setStyleSheet(
-            "QFrame { background: transparent; border: none; border-bottom: 1px solid rgba(17,17,17,80); }"
+            f"QFrame {{ background: transparent; border: none; border-bottom: 1px solid {CAPTION_ROW_BOTTOM_BORDER_COLOR}; }}"
         )
         panel_layout = QVBoxLayout(panel)
         panel_layout.setContentsMargins(0, 0, 0, 0)
@@ -1168,7 +2328,6 @@ class InterviewWindow(QWidget):
             copy_btn.setIcon(InterviewWindow._build_copy_glyph_svg_icon(_isz, "#455a64"))
             copy_btn.setIconSize(QSize(_isz, _isz))
             copy_btn.setCursor(Qt.PointingHandCursor)
-            copy_btn.setToolTip(copy_tooltip)
             copy_btn.setFixedSize(20, 20)
             copy_btn.setStyleSheet(
                 "QToolButton { border: none; border-radius: 10px; background: transparent; }"
@@ -1199,12 +2358,11 @@ class InterviewWindow(QWidget):
             self.content_layout.insertWidget(stretch_index, row)
 
     def add_text_row(self, text: str, side: str, clipboard_prompt: str | None = None):
-        tip = "Copy GPT prompt" if side == "right" else "Copy"
-        row, panel, label = self.create_row(side, with_copy_button=True, copy_tooltip=tip)
+        row, panel, label = self.create_row(side, with_copy_button=True)
         label.setText(text or " ")
         if side == "right":
             _, default_p = build_chunk_prompts(
-                text or "", prompt_store, template_override=_session_chunk_template
+                text or "", prompt_store, template_override=_active_chunk_template_override()
             )
             label.setProperty("copy_text", clipboard_prompt if clipboard_prompt is not None else default_p)
         self.insert_before_draft(row)
@@ -1218,7 +2376,7 @@ class InterviewWindow(QWidget):
             return
         if self.active_draft_label is None:
             row, panel, label = self.create_row(
-                "right", with_copy_button=True, copy_tooltip="Copy GPT prompt"
+                "right", with_copy_button=True
             )
             label.setText(text or " ")
             stretch_index = self.content_layout.count() - 1
@@ -1230,7 +2388,7 @@ class InterviewWindow(QWidget):
         else:
             self.active_draft_label.setText(text or " ")
         _, prompt = build_chunk_prompts(
-            text or "", prompt_store, template_override=_session_chunk_template
+            text or "", prompt_store, template_override=_active_chunk_template_override()
         )
         if self.active_draft_label is not None:
             self.active_draft_label.setProperty("copy_text", prompt)
@@ -1243,7 +2401,7 @@ class InterviewWindow(QWidget):
         if self.active_draft_label is not None:
             self.active_draft_label.setText(text or " ")
             _, default_p = build_chunk_prompts(
-                text or "", prompt_store, template_override=_session_chunk_template
+                text or "", prompt_store, template_override=_active_chunk_template_override()
             )
             self.active_draft_label.setProperty(
                 "copy_text", clipboard_prompt if clipboard_prompt is not None else default_p
@@ -1274,6 +2432,7 @@ class InterviewWindow(QWidget):
         text = consumed_text or label_text
         if not text:
             return
+        interview_history_append_interviewer(text, "home_capture")
         self._home_edit_active = True
         self._caption_edit_cap_id = str(uuid.uuid4())
         self._caption_edit_sent_once = False
@@ -1311,8 +2470,6 @@ class InterviewWindow(QWidget):
         send_btn = QToolButton(panel)
         reject_btn.setIcon(self._build_x_cancel_svg_icon(18, "#c62828"))
         send_btn.setIcon(self._build_send_plane_svg_icon(18, "#1565c0"))
-        reject_btn.setToolTip("Reject")
-        send_btn.setToolTip("Send")
         reject_btn.setCursor(Qt.PointingHandCursor)
         send_btn.setCursor(Qt.PointingHandCursor)
         reject_btn.setIconSize(QSize(14, 14))
@@ -1365,7 +2522,7 @@ class InterviewWindow(QWidget):
             f"QLabel {{ color: {TEXT_COLOR}; background: transparent; border: none; font-size: 16px; font-weight: 700; }}"
         )
         label.setText(text or " ")
-        _, default_p = build_chunk_prompts(text or "", prompt_store, template_override=_session_chunk_template)
+        _, default_p = build_chunk_prompts(text or "", prompt_store, template_override=_active_chunk_template_override())
         label.setProperty("copy_text", clipboard_prompt if clipboard_prompt is not None else default_p)
         lay.addWidget(label)
         actions = QHBoxLayout()
@@ -1376,7 +2533,6 @@ class InterviewWindow(QWidget):
         copy_btn.setIcon(self._build_copy_glyph_svg_icon(14, "#455a64"))
         copy_btn.setIconSize(QSize(14, 14))
         copy_btn.setCursor(Qt.PointingHandCursor)
-        copy_btn.setToolTip("Copy GPT prompt")
         copy_btn.setFixedSize(20, 20)
         copy_btn.setStyleSheet(
             "QToolButton { border: none; border-radius: 10px; background: transparent; }"
@@ -1405,10 +2561,11 @@ class InterviewWindow(QWidget):
             return
         edited = te.toPlainText().strip()
         if reject:
+            interview_history_append_interviewer(edited, "rejected")
             self._restore_active_draft_panel_as_final(edited, None)
         else:
             _, clip_prompt = build_chunk_prompts(
-                edited, prompt_store, template_override=_session_chunk_template
+                edited, prompt_store, template_override=_active_chunk_template_override()
             )
             self._restore_active_draft_panel_as_final(edited, clip_prompt)
             if edited:
@@ -1498,6 +2655,7 @@ class InterviewWindow(QWidget):
         shown = ans or (self.gpt_result_body.toPlainText() or "").strip()
         self._set_gpt_result_text(shown)
         if shown:
+            interview_history_append_gpt(shown)
             if push_history:
                 self._push_gpt_result_history(shown)
             else:
@@ -1608,13 +2766,13 @@ class InterviewWindow(QWidget):
             elif t == "caption_edit_spawn_new_draft":
                 self._spawn_new_draft_while_editing()
             elif t == "message":
-                self.add_text_row(event.get("text", ""), event.get("side", "left"))
+                self.show_toast(str(event.get("text", "") or "").strip() or "Notice.", level="warning")
             elif t == "f9_paste":
                 text = str(event.get("text", "") or "")
                 replace_all = bool(event.get("replace_all", False))
                 app_inst = QApplication.instance()
                 if app_inst is None:
-                    self.add_text_row("Could not set clipboard.", "left")
+                    self.show_toast("Could not set clipboard.", level="error")
                     continue
                 try:
                     app_inst.clipboard().setText(text)
@@ -1623,16 +2781,98 @@ class InterviewWindow(QWidget):
                         try:
                             _win32_set_clipboard_unicode(text)
                         except OSError:
-                            self.add_text_row("Could not set clipboard.", "left")
+                            self.show_toast("Could not set clipboard.", level="error")
                             continue
                     else:
-                        self.add_text_row("Could not set clipboard.", "left")
+                        self.show_toast("Could not set clipboard.", level="error")
                         continue
                 threading.Thread(
                     target=_do_keyboard_paste_only, args=(replace_all,), daemon=True
                 ).start()
             elif t == "ws_ext":
                 handle_ws_extension_payload(event.get("payload") or {})
+
+
+def _interview_history_now_tag() -> str:
+    return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+
+def interview_history_reset() -> None:
+    with _interview_history_lock:
+        _interview_history_events.clear()
+
+
+def interview_history_has_interviewer_lines() -> bool:
+    with _interview_history_lock:
+        return any((e.get("role") or "") == "interviewer" for e in _interview_history_events)
+
+
+def interview_history_append_interviewer(body: str, source: str) -> None:
+    raw = body if isinstance(body, str) else ""
+    stripped = raw.strip()
+    if not stripped:
+        if source != "rejected":
+            return
+        stripped = "(empty)"
+        raw = stripped
+    with _interview_history_lock:
+        _interview_history_events.append(
+            {"time": _interview_history_now_tag(), "role": "interviewer", "source": str(source or ""), "body": raw.strip()}
+        )
+
+
+def interview_history_append_gpt(body: str) -> None:
+    display = (body or "").strip() or "(no text)"
+    with _interview_history_lock:
+        _interview_history_events.append(
+            {"time": _interview_history_now_tag(), "role": "gpt", "source": "final", "body": display}
+        )
+
+
+def interview_history_append_gpt_placeholder(reason: str) -> None:
+    msg = (reason or "").strip() or "GPT: (no final output for the previous request)"
+    with _interview_history_lock:
+        _interview_history_events.append(
+            {"time": _interview_history_now_tag(), "role": "gpt", "source": "placeholder", "body": msg}
+        )
+
+
+def interview_history_format_txt() -> str:
+    with _interview_history_lock:
+        events = list(_interview_history_events)
+    lines: list[str] = [
+        "Interview Assistant — transcript",
+        f"Saved (local): {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
+        "",
+    ]
+    for e in events:
+        role = e.get("role", "")
+        ts = e.get("time", "")
+        tag = e.get("source", "")
+        body = e.get("body", "")
+        lines.append("=" * 60)
+        if role == "interviewer":
+            lines.append(f'Interviewer ({tag}) [{ts}]::')
+            lines.append("-" * 60)
+            lines.append(body)
+        elif role == "gpt":
+            if tag == "placeholder":
+                lines.append(f"GPT [{ts}]:: (no final output)")
+            else:
+                lines.append(f"GPT [{ts}]::")
+            lines.append("-" * 60)
+            lines.append(body)
+        lines.append("")
+    lines.append("=" * 60)
+    lines.append("End of transcript")
+    return "\n".join(lines)
+
+
+def _documents_dir_fallback() -> Path:
+    docs = Path.home() / "Documents"
+    if docs.is_dir():
+        return docs
+    return Path.cwd()
 
 
 def queue_ui_message(text, side):
@@ -1803,18 +3043,32 @@ def skip_pending_captions_without_gpt() -> None:
     """Advance slice cursor to end of current caption; drop pending text (no GPT)."""
     global refined_full_caption, next_chunk_start_index, _caption_chunk_anchor_prefix
     global _boundary_shift_candidate_idx, _boundary_shift_candidate_hits
+    skipped = ""
     with capture_lock:
+        full = refined_full_caption
+        start = min(next_chunk_start_index, len(full))
+        skipped = full[start:].strip()
         next_chunk_start_index = len(refined_full_caption)
         _caption_chunk_anchor_prefix = refined_full_caption
         _boundary_shift_candidate_idx = -1
         _boundary_shift_candidate_hits = 0
+    if skipped:
+        interview_history_append_interviewer(skipped, "delete_skip")
 
 
 def process_chunk(raw_chunk):
     global pending_request_id, _interview_ws, _http_fallback_notified, _last_live_poll_for_rid
     prev_rid = (pending_request_id or "").strip()
+    chunk = (raw_chunk or "").strip()
+    if not chunk:
+        return
+    if prev_rid:
+        interview_history_append_gpt_placeholder(
+            "Previous GPT request had no recorded final output (superseded by a new interviewer chunk)."
+        )
+    interview_history_append_interviewer(chunk, "sent_gpt")
     _cleaned, final_prompt = build_chunk_prompts(
-        raw_chunk, prompt_store, template_override=_session_chunk_template
+        raw_chunk, prompt_store, template_override=_active_chunk_template_override()
     )
     request_id = str(uuid.uuid4())
     if prev_rid:
@@ -1840,7 +3094,7 @@ def process_chunk(raw_chunk):
         raw_chunk=raw_chunk,
         prompt_store=prompt_store,
         log_fn=lambda _t, _m: None,
-        template_override=_session_chunk_template,
+        template_override=_active_chunk_template_override(),
     )
     pending_request_id = result.get("request_id", "").strip()
 
@@ -1888,7 +3142,7 @@ def on_press(key):
             text = snapshot_chunk_since_last_end()
             if text:
                 _, clip_prompt = build_chunk_prompts(
-                    text, prompt_store, template_override=_session_chunk_template
+                    text, prompt_store, template_override=_active_chunk_template_override()
                 )
                 queue_finalize_input(text, clip_prompt)
                 queue_new_empty_draft()
