@@ -781,6 +781,31 @@ def handle_ws_extension_payload(payload: dict) -> None:
             queue_ui_message(f"Extension: {msg}", "left")
 
 
+class _StealthQMenu(QMenu):
+    """QMenu uses its own HWND; mirror the interview window's exclude-from-capture on that popup."""
+
+    def __init__(self, parent: QWidget | None = None, *, affinity_source: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self._affinity_source = affinity_source
+
+    def showEvent(self, event) -> None:  # noqa: N802
+        super().showEvent(event)
+        src = self._affinity_source
+        if src is None or os.name != "nt" or not getattr(src, "_exclude_from_capture", False):
+            return
+        QTimer.singleShot(0, self._apply_exclude_from_capture_to_menu_hwnd)
+
+    def _apply_exclude_from_capture_to_menu_hwnd(self) -> None:
+        src = self._affinity_source
+        if not isinstance(src, QWidget) or not src.isVisible():
+            return
+        hwnd = int(self.winId())
+        if not hwnd:
+            return
+        aff = _desired_display_affinity_for_window(src)
+        _win32_set_window_display_affinity(hwnd, aff)
+
+
 class StatusRow:
     def __init__(self, label: QLabel, base: str, row: QWidget | None = None, panel: QFrame | None = None):
         self.label = label
@@ -939,7 +964,7 @@ class InterviewWindow(QWidget):
             }}
             """
         )
-        mode_menu = QMenu(self.session_mode_btn)
+        mode_menu = _StealthQMenu(self.session_mode_btn, affinity_source=self)
         for mid, title in (("read", "Read"), ("type", "Type"), ("behavioral", "Behavioral")):
             act = QAction(title, self)
             act.triggered.connect(lambda checked=False, m=mid: self._set_session_mode_from_menu(m))
