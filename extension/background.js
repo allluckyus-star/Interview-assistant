@@ -380,7 +380,8 @@ async function handlePrepJob() {
   }
   if (!res.ok) return;
   const job = await res.json();
-  if (!job || job.status !== "pending" || !job.job_id || !job.prompt) return;
+  if (!job || job.status !== "pending" || !job.job_id) return;
+  if (job.phase !== "open_chatgpt" && !job.prompt) return;
   if (job.job_id === lastHandledPrepJobId) return;
 
   lastHandledPrepJobId = job.job_id;
@@ -459,6 +460,17 @@ async function handlePrepJob() {
       const okF = await waitUntilTabComplete(tabId, 20000);
       await postPrepExtensionStatus({ event: "prep_focus_ready", job_id: job.job_id, tab_id: tabId, tab_complete: okF });
       await sleep(400);
+    }
+
+    if (job.phase === "open_chatgpt") {
+      await postPrepExtensionStatus({
+        event: "prep_open_chatgpt_only_done",
+        job_id: job.job_id,
+        tab_id: tabId,
+        detail: "ChatGPT tab ready (open_chatgpt job)",
+      });
+      await postPrepComplete(job.job_id, "", "");
+      return;
     }
 
     const resp = await sendRunPrepJobWithRetry(tabId, job);

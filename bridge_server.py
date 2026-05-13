@@ -994,10 +994,14 @@ class PromptBridgeServer:
                         return
                     pl = payload if isinstance(payload, dict) else {}
                     phase = str(pl.get("phase", "")).strip()
-                    prompt = str(pl.get("prompt", "")).strip()
-                    if phase not in ("resume_summary", "jd_summary", "interview_gpt_setup") or not prompt:
-                        self._send_json({"error": "phase and prompt required"}, 400)
-                        return
+                    if phase == "open_chatgpt":
+                        # Tab-only prep: extension opens/focuses ChatGPT; prompt is unused (non-empty for JSON).
+                        prompt = " "
+                    else:
+                        prompt = str(pl.get("prompt", "")).strip()
+                        if phase not in ("resume_summary", "jd_summary", "interview_gpt_setup") or not prompt:
+                            self._send_json({"error": "phase and prompt required"}, 400)
+                            return
                     open_new = bool(pl.get("open_new_tab", True))
                     job_client = str(pl.get("client_id", "")).strip() or str(get_selected_client_id() or "").strip()
                     if not job_client:

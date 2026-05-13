@@ -124,6 +124,7 @@ class PrepWizardWidget(QWidget):
 
         self._register_seq_baseline = 0
         self._step1_advancing = False
+        self._waiting_for_step1_chatgpt_tab = False
         self._reg_thread: _WaitRegisterThread | None = None
         self._abandon_register_wait = False
         self._resume_listen_timer = QTimer(self)
@@ -239,7 +240,8 @@ class PrepWizardWidget(QWidget):
         v.addStretch(1)
         self.step1_instructions = QLabel(
             "1. Open the Chrome window where you want to use ChatGPT.\n"
-            "2. In the Interview Assistant extension popup, click Register."
+            "2. In the Interview Assistant extension popup, click Register.\n"
+            "3. After Register, a ChatGPT tab opens here automatically before step 2."
         )
         self.step1_instructions.setAlignment(Qt.AlignHCenter)
         self.step1_instructions.setWordWrap(True)
@@ -529,6 +531,8 @@ class PrepWizardWidget(QWidget):
         self._jd_listen_timer.stop()
         self._step4_listen_timer.stop()
         self._prep_poll_timer.stop()
+        self._waiting_job_id = ""
+        self._waiting_for_step1_chatgpt_tab = False
         anim = self._fade_anim
         if anim is not None:
             try:
@@ -616,8 +620,41 @@ class PrepWizardWidget(QWidget):
         self.step1_error.hide()
         self.step1_success.setText(message)
         self.step1_success.show()
+        try:
+            _http_post_json(self.bridge_base, "/prep/clear", {})
+        except OSError:
+            pass
         _http_post_json(self.bridge_base, "/sync-store-to-selected-client", {})
-        QTimer.singleShot(900, lambda: self._animate_to_step(1))
+        if not self._queue_open_chatgpt_tab_job():
+            self.step1_success.hide()
+            self.step1_error.setText(
+                "Registered, but the bridge could not queue opening ChatGPT. "
+                "Ensure live.py is running, then use Wait again."
+            )
+            self.step1_error.show()
+            self.step1_retry.show()
+            self._step1_advancing = False
+            return
+
+    def _queue_open_chatgpt_tab_job(self) -> bool:
+        """Queue extension job that only opens/focuses ChatGPT (no prompt). Returns False on bridge error."""
+        cid = (self.selected_client_id or "").strip()
+        if not cid:
+            return False
+        body, status = _http_post_json(
+            self.bridge_base,
+            "/prep/start",
+            {"phase": "open_chatgpt", "prompt": " ", "open_new_tab": True, "client_id": cid},
+        )
+        if status >= 400 or not body.get("ok"):
+            return False
+        job_id = str(body.get("job_id", "")).strip()
+        if not job_id:
+            return False
+        self._waiting_for_step1_chatgpt_tab = True
+        self._waiting_job_id = job_id
+        self._prep_poll_timer.start()
+        return True
 
     def _animate_to_step(self, index: int) -> None:
         """Cross-fade to stacked page index."""
@@ -676,6 +713,7 @@ class PrepWizardWidget(QWidget):
             self._reset_step1_baseline_from_bridge()
             self._start_register_wait_thread()
         elif index == 1:
+            self._step1_advancing = False
             self._jd_listen_timer.stop()
             self._step4_listen_timer.stop()
             self.title_label.setText("Resume summary")
@@ -874,7 +912,7 @@ class PrepWizardWidget(QWidget):
         body, status = _http_post_json(
             self.bridge_base,
             "/prep/start",
-            {"phase": "resume_summary", "prompt": prompt, "open_new_tab": True, "client_id": cid},
+            {"phase": "resume_summary", "prompt": prompt, "open_new_tab": False, "client_id": cid},
         )
         if status >= 400 or not body.get("ok"):
             self.step2_error.setText("Could not start summary job. Is the extension installed?")
@@ -982,6 +1020,7 @@ class PrepWizardWidget(QWidget):
             return
         self._prep_poll_timer.stop()
         self._waiting_job_id = ""
+        self._waiting_for_step1_chatgpt_tab = False
         try:
             _http_post_json(self.bridge_base, "/prep/clear", {})
         except OSError:
@@ -1013,6 +1052,24 @@ class PrepWizardWidget(QWidget):
         self._prep_poll_timer.stop()
         self._waiting_job_id = ""
         idx = self.stack.currentIndex()
+
+        if self._waiting_for_step1_chatgpt_tab:
+            self._waiting_for_step1_chatgpt_tab = False
+            try:
+                _http_post_json(self.bridge_base, "/prep/clear", {})
+            except OSError:
+                pass
+            if st == "done":
+                QTimer.singleShot(300, lambda: self._animate_to_step(1))
+            else:
+                err = str(job.get("error", "") or "Unknown error")
+                self.step1_success.hide()
+                self.step1_error.setText(f"Could not open ChatGPT tab: {err}")
+                self.step1_error.show()
+                self.step1_retry.show()
+                self._step1_advancing = False
+            return
+
         if st == "done":
             if idx == 1:
                 self.step2_success.setText("Resume summary saved. Continuing…")
