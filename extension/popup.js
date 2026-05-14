@@ -15,7 +15,7 @@ const bridgeErr = document.getElementById("bridgeErr");
 const registerStatus = document.getElementById("registerStatus");
 
 /** Template keys still migrated between profile stems in chrome.storage (not edited or synced from popup). */
-const TEMPLATE_KEYS = ["resume_summary", "jd_summary", "initial_interview", "chunk_interview"];
+const TEMPLATE_KEYS = ["resume_summary", "jd_summary", "initial_interview"];
 
 const W_MENU = 248;
 const W_PANEL = 280;

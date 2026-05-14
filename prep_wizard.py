@@ -55,7 +55,7 @@ def _http_post_json(base: str, path: str, payload: dict[str, Any]) -> tuple[dict
         return {"ok": False, "error": str(exc)}, 0
 
 
-_TEMPLATE_KEYS = ("resume_summary", "jd_summary", "initial_interview", "chunk_interview")
+_TEMPLATE_KEYS = ("resume_summary", "jd_summary", "initial_interview")
 
 
 def _apply_resume_summary_template(template: str, resume: str) -> str:
@@ -847,17 +847,12 @@ class PrepWizardWidget(QWidget):
         self.btn_interview_setup.setText("Prepare interview")
         jd = self._jd_text_for_selected()
         initial_tpl = self._template_for_selected("initial_interview")
-        chunk_tpl = self._template_for_selected("chunk_interview")
         missing: list[str] = []
         if not jd:
             missing.append("job description in the extension")
         if not initial_tpl:
             missing.append(
                 "initial interview prompt (Settings → Prompts, or prompt_initial_interview.txt beside the app)"
-            )
-        if not chunk_tpl:
-            missing.append(
-                "per-caption interview prompt (Settings → Prompts, or prompt_chunk_interview.txt beside the app)"
             )
         if missing:
             self.step4_waiting.setText("Waiting for: " + ", ".join(missing) + "…")
@@ -969,8 +964,7 @@ class PrepWizardWidget(QWidget):
     def _on_interview_setup_clicked(self) -> None:
         jd = self._jd_text_for_selected()
         initial_tpl = self._template_for_selected("initial_interview")
-        chunk_tpl = self._template_for_selected("chunk_interview")
-        if not jd or not initial_tpl or not chunk_tpl:
+        if not jd or not initial_tpl:
             return
         cid = (self.selected_client_id or "").strip()
         if not cid:

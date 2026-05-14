@@ -12,23 +12,17 @@ def build_chunk_prompts(
     prompt_store: Optional[PromptStore] = None,
     template_override: Optional[str] = None,
 ) -> tuple[str, str]:
-    """Build (cleaned_intent, final_prompt) from the extension-supplied chunk template only.
+    """Build (cleaned_intent, final_prompt) for a caption or manual chunk.
 
-    Resolution order for the template body:
-      1. ``template_override`` (used to pin the prompt at interview-start — pass an empty string
-         to explicitly mean "no template, send the cleaned caption verbatim").
-      2. ``prompt_store.get_template("chunk_interview")`` (live extension value).
+    If ``template_override`` is not None, its stripped text is the template (use ``""`` to send
+    ``cleaned_intent`` verbatim). If ``template_override`` is None, no template is applied and
+    ``final_prompt`` equals the cleaned chunk text.
     """
     cleaned_intent = (raw_chunk.strip() or raw_chunk).strip()
     if template_override is not None:
         template = template_override.strip()
     else:
         template = ""
-        if prompt_store is not None:
-            try:
-                template = (prompt_store.get_template("chunk_interview") or "").strip()
-            except Exception:
-                template = ""
     if template:
         final_prompt = template.replace("{cleaned_interviewer_intent}", cleaned_intent)
     else:

@@ -104,6 +104,157 @@
     return true;
   }
 
+  function base64ToUint8Array(b64) {
+    const bin = atob(String(b64 || ""));
+    const len = bin.length;
+    const out = new Uint8Array(len);
+    for (let i = 0; i < len; i += 1) out[i] = bin.charCodeAt(i);
+    return out;
+  }
+
+  /**
+   * ChatGPT dims the UI on synthetic dragenter/dragover. Without dragleave/dragend (like dragging away
+   * from the composer), the overlay can stay. Clear it after our programmatic drop.
+   */
+  function dismissComposerDragDropOverlay(primary, partner) {
+    const emptyDt = new DataTransfer();
+    const leaveOpts = { bubbles: true, composed: true, cancelable: false, dataTransfer: emptyDt };
+    const nodes = [];
+    if (primary instanceof HTMLElement) nodes.push(primary);
+    if (partner instanceof HTMLElement && partner !== primary) nodes.push(partner);
+    const surf = getComposerSurface();
+    if (surf instanceof HTMLElement && !nodes.includes(surf)) nodes.push(surf);
+    const ta = document.querySelector('div#prompt-textarea[contenteditable="true"]');
+    if (ta instanceof HTMLElement && !nodes.includes(ta)) nodes.push(ta);
+    for (let i = 0; i < nodes.length; i += 1) {
+      try {
+        nodes[i].dispatchEvent(new DragEvent("dragleave", leaveOpts));
+      } catch (_e) {}
+      try {
+        nodes[i].dispatchEvent(new DragEvent("dragexit", leaveOpts));
+      } catch (_e) {}
+    }
+    try {
+      document.documentElement.dispatchEvent(new DragEvent("dragleave", leaveOpts));
+    } catch (_e) {}
+    try {
+      if (document.body) document.body.dispatchEvent(new DragEvent("dragleave", leaveOpts));
+    } catch (_e) {}
+    try {
+      window.dispatchEvent(new DragEvent("dragleave", leaveOpts));
+    } catch (_e) {}
+    try {
+      window.dispatchEvent(new DragEvent("dragend", leaveOpts));
+    } catch (_e) {}
+  }
+
+  function tryAttachPngDataToElement(el, base64Png, partnerForCleanup) {
+    if (!(el instanceof HTMLElement) || !base64Png) return false;
+    const trimmed = String(base64Png).trim();
+    if (!trimmed) return false;
+    let bytes;
+    try {
+      bytes = base64ToUint8Array(trimmed);
+    } catch (_e) {
+      return false;
+    }
+    const name = `ia-snip-${Date.now()}.png`;
+    const file = new File([bytes], name, { type: "image/png" });
+    const dt = new DataTransfer();
+    try {
+      dt.items.add(file);
+    } catch (_e) {
+      return false;
+    }
+    const opts = { bubbles: true, composed: true, cancelable: true, dataTransfer: dt };
+    let ok = false;
+    try {
+      try {
+        el.focus({ preventScroll: true });
+      } catch (_e) {
+        try {
+          el.focus();
+        } catch (_e2) {}
+      }
+      el.dispatchEvent(new DragEvent("dragenter", opts));
+      el.dispatchEvent(new DragEvent("dragover", opts));
+      el.dispatchEvent(new DragEvent("drop", opts));
+      ok = true;
+    } catch (_e) {
+      ok = false;
+    } finally {
+      dismissComposerDragDropOverlay(el, partnerForCleanup);
+    }
+    return ok;
+  }
+
+  /** Drop on outer composer surface (preferred for file chips). */
+  function tryAttachPngToComposer(composer, base64Png) {
+    if (!composer || !base64Png) return false;
+    const surf = getComposerSurface();
+    const el = surf instanceof HTMLElement ? surf : composer;
+    const partner = el === composer ? null : composer;
+    return tryAttachPngDataToElement(el, base64Png, partner);
+  }
+
+  /** Fallback: some builds accept drops only on the inner editor. */
+  function tryAttachPngToInnerComposer(composer, base64Png) {
+    if (!(composer instanceof HTMLElement) || !base64Png) return false;
+    const surf = getComposerSurface();
+    const partner = surf instanceof HTMLElement && !surf.isSameNode(composer) ? surf : null;
+    return tryAttachPngDataToElement(composer, base64Png, partner);
+  }
+
+  /** Heuristic: ChatGPT staged a file/image on the composer (not just empty "drop here" copy). */
+  function composerHasVisibleAttachment(root) {
+    if (!(root instanceof HTMLElement)) return false;
+    const hints = [
+      '[data-testid*="attachment"]',
+      'button[aria-label*="Remove"]',
+      'button[aria-label*="remove"]',
+    ];
+    for (let i = 0; i < hints.length; i += 1) {
+      try {
+        if (root.querySelector(hints[i])) return true;
+      } catch (_e) {}
+    }
+    const imgs = root.querySelectorAll("img");
+    for (let i = 0; i < imgs.length; i += 1) {
+      const img = imgs[i];
+      const src = (img.getAttribute("src") || "").trim();
+      if (src.startsWith("blob:") || src.startsWith("data:image")) return true;
+    }
+    return false;
+  }
+
+  async function waitForComposerAttachment(root, maxMs) {
+    const limit = Date.now() + (maxMs || 12000);
+    while (Date.now() < limit) {
+      if (composerHasVisibleAttachment(root)) return true;
+      await wait(90);
+    }
+    return false;
+  }
+
+  /** Prefer Send only after attachment UI appears; last ~3.5s allow Send anyway (invisible attach edge case). */
+  async function trySubmitWithRetryAfterAttachment(maxMs, attachRoot, needsAttachment, composerEl) {
+    const deadline = Date.now() + (maxMs || 22000);
+    const graceAt = deadline - 3500;
+    while (Date.now() < deadline) {
+      const attached = !needsAttachment || composerHasVisibleAttachment(attachRoot);
+      const button = findSendButton();
+      const force = !!(needsAttachment && !attached && Date.now() >= graceAt);
+      if (button && !button.disabled && (attached || force)) {
+        if (force) iaLog("[ws] send without detected attachment chip (grace)");
+        button.click();
+        dismissComposerDragDropOverlay(attachRoot, composerEl || attachRoot);
+        return true;
+      }
+      await wait(110);
+    }
+    return false;
+  }
+
   function setInputValue(el, text) {
     if (!el) return false;
 
@@ -747,6 +898,23 @@
     return new Promise((resolve) => setTimeout(resolve, ms));
   }
 
+  /** Yield a few display frames so ChatGPT can paint attachment UI after synthetic drop. */
+  function waitAnimationFrames(count) {
+    const n = Math.max(1, Math.floor(Number(count) || 2));
+    return new Promise((resolve) => {
+      let i = 0;
+      const step = () => {
+        i += 1;
+        if (i >= n) {
+          resolve();
+          return;
+        }
+        requestAnimationFrame(step);
+      };
+      requestAnimationFrame(step);
+    });
+  }
+
   /** Loopback HTTP from https://chatgpt.com is blocked (Chrome local network access); service worker proxies. */
   function iaBridgeFetch(url, options, timeoutMs) {
     return new Promise((resolve) => {
@@ -980,11 +1148,12 @@
     let prompt = (msg.prompt || "").trim();
     const requestId = (msg.request_id || "").trim();
     const mtype = msg.type || "";
+    const imgB64 = String(msg.image_png_base64 || "").trim();
     if (!requestId) return;
     if (mtype === "INITIAL_PROMPT" && !prompt) {
       prompt = await resolveInitialPromptFromStorage();
     }
-    if (!prompt) {
+    if (!prompt && !imgB64) {
       wsSend({ type: "STATUS", level: "error", message: "No prompt (paste resume/JD in extension or use Python-built prompt)." });
       return;
     }
@@ -993,20 +1162,64 @@
       wsSend({ type: "STATUS", level: "error", message: "composer_not_found" });
       return;
     }
-    if (!setInputValue(composer, prompt)) {
-      wsSend({ type: "STATUS", level: "error", message: "could_not_insert" });
-      return;
+    if (prompt) {
+      if (!setInputValue(composer, prompt)) {
+        wsSend({ type: "STATUS", level: "error", message: "could_not_insert" });
+        return;
+      }
+    } else if (imgB64) {
+      if (!setInputValue(composer, " ")) {
+        wsSend({ type: "STATUS", level: "error", message: "could_not_insert" });
+        return;
+      }
+    }
+    const surf = getComposerSurface();
+    const attachRoot = surf instanceof HTMLElement ? surf : composer;
+
+    if (imgB64) {
+      await wait(220);
+      await waitAnimationFrames(3);
+      tryAttachPngToComposer(composer, imgB64);
+      await waitAnimationFrames(3);
+      let chip = await waitForComposerAttachment(attachRoot, 8000);
+      if (!chip) {
+        iaLog("[ws] attachment chip not seen; retry surface drop");
+        await wait(350);
+        tryAttachPngToComposer(composer, imgB64);
+        await waitAnimationFrames(3);
+        chip = await waitForComposerAttachment(attachRoot, 6000);
+      }
+      if (
+        !chip &&
+        surf instanceof HTMLElement &&
+        composer instanceof HTMLElement &&
+        !surf.isSameNode(composer)
+      ) {
+        iaLog("[ws] try inner composer drop once");
+        tryAttachPngToInnerComposer(composer, imgB64);
+        await waitAnimationFrames(3);
+        await waitForComposerAttachment(attachRoot, 6000);
+      }
+      await wait(180);
+      dismissComposerDragDropOverlay(attachRoot, composer);
+      await waitAnimationFrames(2);
     }
     const baselineAi = getAssistantMessageList().length;
-    await wait(200);
-    await trySubmitWithRetry(15000);
+    await waitAnimationFrames(2);
+    await wait(imgB64 ? 120 : 200);
+    if (imgB64) {
+      await trySubmitWithRetryAfterAttachment(22000, attachRoot, true, composer);
+    } else {
+      await trySubmitWithRetry(15000);
+    }
     await wait(350);
+    const rejectEcho = prompt || "(screenshot)";
     await reportGptStatus(
       "ws_sent",
-      { phase: "ws_interview", request_id: requestId, rejectEcho: prompt },
+      { phase: "ws_interview", request_id: requestId, rejectEcho },
       true
     );
-    startWsResponseWatch(requestId, baselineAi, prompt);
+    startWsResponseWatch(requestId, baselineAi, rejectEcho);
   }
 
   async function runPrepJob(message) {

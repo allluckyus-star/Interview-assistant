@@ -1,4 +1,4 @@
-"""Root-directory .txt files for the four prep/interview prompt templates.
+"""Root-directory .txt files for prep prompt templates (resume, JD, initial interview).
 
 Templates are owned by the desktop app (not the browser extension). Missing files
 are created with built-in defaults on first ensure; edits persist to disk.
@@ -21,7 +21,6 @@ _TEMPLATE_FILES: Dict[str, str] = {
     "resume_summary": "prompt_resume_summary.txt",
     "jd_summary": "prompt_jd_summary.txt",
     "initial_interview": "prompt_initial_interview.txt",
-    "chunk_interview": "prompt_chunk_interview.txt",
 }
 
 _DEFAULT_RESUME_SUMMARY = """You are an expert technical interviewer assistant.
@@ -145,27 +144,10 @@ Static resume and job context were already provided in earlier messages in this 
 
 Reply with one short sentence confirming you are ready, then stop."""
 
-_DEFAULT_CHUNK_INTERVIEW = """You are generating what the candidate should say in an interview.
-
-Hard rules (non-negotiable):
-- Output only the final answer text the candidate should speak.
-- No explanation, no analysis, no headings, no labels, no bullet list unless interviewer explicitly asked for a list.
-- Use first person.
-- Keep concise and natural, interview-ready tone.
-- If multiple questions are present, answer them in asked order in compact paragraph form.
-- If there is no clear question, output one short clarification question only.
-
-Interviewer intent (cleaned):
-\"\"\"
-{cleaned_interviewer_intent}
-\"\"\"
-"""
-
 _DEFAULTS: Dict[str, str] = {
     "resume_summary": _DEFAULT_RESUME_SUMMARY,
     "jd_summary": _DEFAULT_JD_SUMMARY,
     "initial_interview": _DEFAULT_INITIAL_INTERVIEW,
-    "chunk_interview": _DEFAULT_CHUNK_INTERVIEW,
 }
 
 
@@ -208,6 +190,6 @@ def save_template_text(key: str, text: str) -> None:
 
 
 def load_prompt_templates_into_store(store: Any) -> None:
-    """Reload all four templates from disk into the given PromptStore."""
+    """Reload all prep templates from disk into the given PromptStore."""
     for key in _TEMPLATE_FILES:
         store.set_template(key, read_template_text(key))

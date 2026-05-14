@@ -118,7 +118,7 @@ def _print_prep_ext_line(pl: Dict[str, Any]) -> None:
     # print("[prep:ext] " + " ".join(parts), flush=True)
 
 
-TEMPLATE_KEYS = ("resume_summary", "jd_summary", "initial_interview", "chunk_interview")
+TEMPLATE_KEYS = ("resume_summary", "jd_summary", "initial_interview")
 
 from app_prompt_files import load_prompt_templates_into_store, save_template_text
 

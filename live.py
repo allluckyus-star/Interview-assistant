@@ -1,3 +1,4 @@
+import base64
 import json
 import os
 import queue
@@ -11,7 +12,7 @@ from datetime import datetime
 import urllib.error
 import urllib.request
 from pathlib import Path
-from typing import Tuple
+from typing import Callable, Tuple
 from urllib.parse import urlencode
 
 from pynput import keyboard
@@ -19,16 +20,32 @@ import uiautomation as auto
 
 from PySide6.QtCore import (
     QAbstractAnimation,
+    QByteArray,
+    QBuffer,
     QEasingCurve,
     QEvent,
+    QIODevice,
     QParallelAnimationGroup,
     QPoint,
     QPropertyAnimation,
+    QRect,
     QSize,
     Qt,
     QTimer,
 )
-from PySide6.QtGui import QAction, QGuiApplication, QIcon, QMouseEvent, QPainter, QPainterPath, QPixmap, QRegion
+from PySide6.QtGui import (
+    QAction,
+    QColor,
+    QGuiApplication,
+    QIcon,
+    QImage,
+    QKeyEvent,
+    QMouseEvent,
+    QPainter,
+    QPainterPath,
+    QPixmap,
+    QRegion,
+)
 from PySide6.QtSvg import QSvgRenderer
 from PySide6.QtWidgets import (
     QApplication,
@@ -41,7 +58,9 @@ from PySide6.QtWidgets import (
     QMessageBox,
     QPlainTextEdit,
     QPushButton,
+    QRubberBand,
     QSplitter,
+    QSplitterHandle,
     QScrollArea,
     QSizePolicy,
     QSlider,
@@ -238,6 +257,220 @@ _TOPBAR_CLOSE_HOVER_BG = "#ff8a80"
 
 # Caption bubble row bottom border — reuse for settings horizontal splitter handle.
 CAPTION_ROW_BOTTOM_BORDER_COLOR = "rgba(17,17,17,80)"
+# Same ink as CAPTION_ROW_BOTTOM_BORDER_COLOR for owner-drawn splitter handles.
+_SPLITTER_HANDLE_LINE_QCOLOR = QColor(17, 17, 17, 80)
+
+
+class _InterviewVerticalSplitter(QSplitter):
+    """Vertical stack splitter: 2 px-thick handles; line is center 50% width (divider color)."""
+
+    def __init__(self, parent=None):
+        super().__init__(Qt.Orientation.Vertical, parent)
+        self.setHandleWidth(2)
+
+    def createHandle(self):
+        return _InterviewVerticalSplitterHandle(self.orientation(), self)
+
+
+class _InterviewVerticalSplitterHandle(QSplitterHandle):
+    def paintEvent(self, event):
+        w, h = self.width(), self.height()
+        if w <= 0 or h <= 0:
+            return
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing, False)
+        line_w = max(1, int(round(w * 0.5)))
+        x0 = (w - line_w) // 2
+        p.fillRect(x0, 0, line_w, h, _SPLITTER_HANDLE_LINE_QCOLOR)
+
+
+class _SettingsHorizontalSplitter(QSplitter):
+    """Settings left/right: 2 px-wide handles; line is center 50% height (divider color)."""
+
+    def __init__(self, parent=None):
+        super().__init__(Qt.Orientation.Horizontal, parent)
+        self.setHandleWidth(2)
+
+    def createHandle(self):
+        return _SettingsHorizontalSplitterHandle(self.orientation(), self)
+
+
+class _SettingsHorizontalSplitterHandle(QSplitterHandle):
+    def paintEvent(self, event):
+        w, h = self.width(), self.height()
+        if w <= 0 or h <= 0:
+            return
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing, False)
+        line_h = max(1, int(round(h * 0.5)))
+        y0 = (h - line_h) // 2
+        p.fillRect(0, y0, w, line_h, _SPLITTER_HANDLE_LINE_QCOLOR)
+
+
+def _virtual_desktop_geometry() -> QRect:
+    geo = QRect()
+    for s in QGuiApplication.screens():
+        geo = geo.united(s.geometry())
+    return geo
+
+
+def _grab_virtual_screen_pixmap() -> tuple[QPixmap, QRect]:
+    geo = _virtual_desktop_geometry()
+    pm = QPixmap(geo.size())
+    pm.fill(QColor(32, 32, 36))
+    painter = QPainter(pm)
+    for s in QGuiApplication.screens():
+        g = s.geometry()
+        frag = s.grabWindow(0)
+        painter.drawPixmap(g.x() - geo.x(), g.y() - geo.y(), frag)
+    painter.end()
+    return pm, geo
+
+
+def _image_to_png_base64(img: QImage, max_side: int = 2048) -> str:
+    if img.isNull():
+        return ""
+    w, h = img.width(), img.height()
+    if max(w, h) > max_side:
+        img = img.scaled(
+            max_side,
+            max_side,
+            Qt.AspectRatioMode.KeepAspectRatio,
+            Qt.TransformationMode.SmoothTransformation,
+        )
+    img = img.convertToFormat(QImage.Format.Format_ARGB32)
+    ba = QByteArray()
+    buf = QBuffer(ba)
+    buf.open(QIODevice.OpenModeFlag.WriteOnly)
+    img.save(buf, "PNG")
+    return base64.b64encode(bytes(ba)).decode("ascii")
+
+
+class SnipOverlay(QWidget):
+    """Fullscreen frozen screenshot; drag rectangle to crop. Esc cancels."""
+
+    def __init__(self, frozen: QPixmap, desktop_geo: QRect, on_done: Callable[[QImage | None], None], parent=None):
+        super().__init__(parent)
+        self._frozen = frozen
+        self._on_done = on_done
+        self._finished = False
+        self._dragging = False
+        self._origin = QPoint()
+        self._rubber = QRubberBand(QRubberBand.Shape.Rectangle, self)
+        fl = (
+            Qt.WindowType.Window
+            | Qt.WindowType.FramelessWindowHint
+            | Qt.WindowType.WindowStaysOnTopHint
+            | Qt.WindowType.Tool
+        )
+        self.setWindowFlags(fl)
+        self.setAttribute(Qt.WidgetAttribute.WA_ShowWithoutActivating, False)
+        self.setGeometry(desktop_geo)
+        self.setMouseTracking(True)
+        self.setCursor(Qt.CursorShape.CrossCursor)
+        self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
+
+    def showEvent(self, e):
+        super().showEvent(e)
+        self.activateWindow()
+        self.raise_()
+        self.setFocus(Qt.FocusReason.PopupFocusReason)
+
+    def keyPressEvent(self, e):
+        if e.key() == Qt.Key.Key_Escape:
+            self._finish(None)
+        else:
+            super().keyPressEvent(e)
+
+    def paintEvent(self, _e):
+        p = QPainter(self)
+        p.drawPixmap(0, 0, self._frozen)
+
+    def mousePressEvent(self, e: QMouseEvent):
+        if e.button() == Qt.MouseButton.LeftButton:
+            self._dragging = True
+            self._origin = e.position().toPoint()
+            self._rubber.setGeometry(QRect(self._origin, QSize()))
+            self._rubber.show()
+
+    def mouseMoveEvent(self, e: QMouseEvent):
+        if self._dragging:
+            r = QRect(self._origin, e.position().toPoint()).normalized()
+            self._rubber.setGeometry(r)
+
+    def mouseReleaseEvent(self, e: QMouseEvent):
+        if e.button() != Qt.MouseButton.LeftButton or not self._dragging:
+            return
+        self._dragging = False
+        self._rubber.hide()
+        rect = QRect(self._origin, e.position().toPoint()).normalized()
+        if rect.width() < 4 or rect.height() < 4:
+            self._finish(None)
+            return
+        img = self._frozen.toImage().copy(rect)
+        self._finish(img if not img.isNull() else None)
+
+    def _finish(self, img: QImage | None) -> None:
+        if self._finished:
+            return
+        self._finished = True
+        cb = self._on_done
+        self.hide()
+        self.deleteLater()
+        cb(img)
+
+
+class _FreePromptEditHost(QWidget):
+    """QTextEdit fills the host; send bottom-right; optional tiny tools top-right."""
+
+    def __init__(self, edit: QTextEdit, send_btn: QPushButton, top_tool_buttons: list[QToolButton] | None = None):
+        super().__init__()
+        self._edit = edit
+        self._btn = send_btn
+        self._top_tools = list(top_tool_buttons or [])
+        edit.setParent(self)
+        send_btn.setParent(self)
+        send_btn.raise_()
+        for b in self._top_tools:
+            b.setParent(self)
+            b.raise_()
+
+    def resizeEvent(self, event):
+        w, h = self.width(), self.height()
+        self._edit.setGeometry(0, 0, max(1, w), max(1, h))
+        m = 6
+        bsz = 28
+        self._btn.setGeometry(max(0, w - bsz - m), max(0, h - bsz - m), bsz, bsz)
+        tiny = 22
+        gap = 4
+        top_y = 5
+        n = len(self._top_tools)
+        if n:
+            row_w = n * tiny + (n - 1) * gap
+            x0 = max(m, w - m - row_w)
+            for i, b in enumerate(self._top_tools):
+                b.setGeometry(x0 + i * (tiny + gap), top_y, tiny, tiny)
+        super().resizeEvent(event)
+
+
+class _GptResultEditHost(QWidget):
+    """QTextEdit fills the host; copy button is overlaid at bottom-left inside bounds."""
+
+    def __init__(self, edit: QTextEdit, copy_btn: QToolButton):
+        super().__init__()
+        self._edit = edit
+        self._btn = copy_btn
+        edit.setParent(self)
+        copy_btn.setParent(self)
+        copy_btn.raise_()
+
+    def resizeEvent(self, event):
+        w, h = self.width(), self.height()
+        self._edit.setGeometry(0, 0, max(1, w), max(1, h))
+        m = 6
+        bsz = 28
+        self._btn.setGeometry(m, max(0, h - bsz - m), bsz, bsz)
+        super().resizeEvent(event)
 
 
 def _toast_trim_message(text: str) -> str:
@@ -296,10 +529,9 @@ last_answer_request_id = ""
 # Initial interview template snapshot pinned at prep handoff (see _session_initial_template).
 # Live chunk prompts use mode-specific templates via _active_chunk_template_override().
 _session_initial_template: str | None = None
-# Guidance mode toggled from the top-bar cycle button. "read" uses
-# READ_MODE_CHUNK_TEMPLATE; "type" overrides with TYPE_MODE_CHUNK_TEMPLATE
-# ([READ-n]/[TYPE-n]); "behavioral" overrides with BEHAVIORAL_MODE_CHUNK_TEMPLATE
-# for STAR-style guidance.
+# Guidance mode toggled from the top-bar menu. "read" / "type" / "behavioral" use
+# their chunk templates; "free" uses FREE_MODE_CHUNK_TEMPLATE and sends only from
+# the in-window prompt box (End does not send live captions).
 _session_mode: str = "read"
 TYPE_MODE_CHUNK_TEMPLATE = """You are producing TYPE MODE live interview guidance.
 
@@ -418,6 +650,12 @@ Interviewer said:
 \"\"\"
 """
 
+FREE_MODE_CHUNK_TEMPLATE = """
+\"\"\"
+{cleaned_interviewer_intent}
+\"\"\"
+"""
+
 READ_MODE_CHUNK_TEMPLATE = """You are producing live interview speaking guidance.
 
 If there is no clear question, output exactly:
@@ -485,8 +723,8 @@ def _http_post_json_local(url: str, payload: dict) -> tuple[dict, int]:
 
 
 def _load_mode_prompt_overrides_from_json() -> None:
-    """Merge ~/.interview_assistant/mode_prompts.json keys read/type/behavioral into live chunk templates."""
-    global READ_MODE_CHUNK_TEMPLATE, TYPE_MODE_CHUNK_TEMPLATE, BEHAVIORAL_MODE_CHUNK_TEMPLATE
+    """Merge ~/.interview_assistant/mode_prompts.json keys read/type/behavioral/free into live chunk templates."""
+    global READ_MODE_CHUNK_TEMPLATE, TYPE_MODE_CHUNK_TEMPLATE, BEHAVIORAL_MODE_CHUNK_TEMPLATE, FREE_MODE_CHUNK_TEMPLATE
     path = Path.home() / ".interview_assistant" / "mode_prompts.json"
     try:
         raw = path.read_text(encoding="utf-8")
@@ -504,10 +742,13 @@ def _load_mode_prompt_overrides_from_json() -> None:
     b = data.get("behavioral")
     if isinstance(b, str) and b.strip():
         BEHAVIORAL_MODE_CHUNK_TEMPLATE = b
+    f = data.get("free")
+    if isinstance(f, str) and f.strip():
+        FREE_MODE_CHUNK_TEMPLATE = f
 
 
 def _persist_mode_prompts_to_json() -> None:
-    global READ_MODE_CHUNK_TEMPLATE, TYPE_MODE_CHUNK_TEMPLATE, BEHAVIORAL_MODE_CHUNK_TEMPLATE
+    global READ_MODE_CHUNK_TEMPLATE, TYPE_MODE_CHUNK_TEMPLATE, BEHAVIORAL_MODE_CHUNK_TEMPLATE, FREE_MODE_CHUNK_TEMPLATE
     root = Path.home() / ".interview_assistant"
     root.mkdir(parents=True, exist_ok=True)
     path = root / "mode_prompts.json"
@@ -517,6 +758,7 @@ def _persist_mode_prompts_to_json() -> None:
                 "read": READ_MODE_CHUNK_TEMPLATE,
                 "type": TYPE_MODE_CHUNK_TEMPLATE,
                 "behavioral": BEHAVIORAL_MODE_CHUNK_TEMPLATE,
+                "free": FREE_MODE_CHUNK_TEMPLATE,
             },
             ensure_ascii=False,
             indent=2,
@@ -532,8 +774,8 @@ _load_mode_prompt_overrides_from_json()
 def _active_chunk_template_override() -> str | None:
     """Resolve which chunk-prompt template should be used for the next outgoing prompt.
 
-    Read mode uses READ_MODE_CHUNK_TEMPLATE. Type and behavioral modes use fixed
-    templates so the mode switch takes effect immediately mid-interview.
+    Read / type / behavioral / free use fixed in-process templates so the mode switch
+    takes effect immediately mid-interview.
     """
     if _session_mode == "read":
         return READ_MODE_CHUNK_TEMPLATE
@@ -541,6 +783,8 @@ def _active_chunk_template_override() -> str | None:
         return TYPE_MODE_CHUNK_TEMPLATE
     if _session_mode == "behavioral":
         return BEHAVIORAL_MODE_CHUNK_TEMPLATE
+    if _session_mode == "free":
+        return FREE_MODE_CHUNK_TEMPLATE
     return None
 
 
@@ -636,6 +880,33 @@ def _do_keyboard_paste_only(replace_all: bool) -> None:
             kb.release("v")
     except Exception:
         pass
+
+
+def _win_send_snip_hotkey_worker() -> None:
+    """Open Windows Snip & Sketch (Win+Shift+S), same as Snipping Tool bar. Runs off the Qt GUI thread."""
+    time.sleep(0.35)
+    kb = keyboard.Controller()
+    try:
+        with kb.pressed(keyboard.Key.cmd, keyboard.Key.shift):
+            kb.press("s")
+            kb.release("s")
+        return
+    except Exception:
+        pass
+    if os.name == "nt":
+        try:
+            os.startfile("ms-screenclip:")  # type: ignore[attr-defined]
+            return
+        except OSError:
+            try:
+                subprocess.Popen(
+                    ["cmd", "/c", "start", "", "ms-screenclip:"],
+                    creationflags=subprocess.CREATE_NO_WINDOW,
+                )
+                return
+            except OSError:
+                pass
+    ui_queue.put({"type": "free_snip_abort", "message": "Could not start Windows screen snip."})
 
 
 def _inject_last_gpt_paste(replace_all: bool) -> None:
@@ -860,6 +1131,13 @@ class InterviewWindow(QWidget):
         self.gpt_fallback_notice_label: QLabel | None = None
         self.status_rows: dict[str, list[StatusRow]] = {"llama": [], "gpt": []}
         self.message_panels: list[QWidget] = []
+        self._free_attach_png_b64: str | None = None
+        self._free_snip_session_active = False
+        self._snip_poll_timer = QTimer(self)
+        self._snip_poll_timer.setInterval(200)
+        self._snip_poll_timer.timeout.connect(self._poll_os_snip_clipboard)
+        self._snip_clipboard_image_before = QImage()
+        self._snip_poll_count = 0
 
         # Tool window: no taskbar button on Windows; we do not use the system tray.
         self.setWindowFlags(
@@ -965,7 +1243,12 @@ class InterviewWindow(QWidget):
             """
         )
         mode_menu = _StealthQMenu(self.session_mode_btn, affinity_source=self)
-        for mid, title in (("read", "Read"), ("type", "Type"), ("behavioral", "Behavioral")):
+        for mid, title in (
+            ("read", "Read"),
+            ("type", "Type"),
+            ("behavioral", "Behavioral"),
+            ("free", "Free"),
+        ):
             act = QAction(title, self)
             act.triggered.connect(lambda checked=False, m=mid: self._set_session_mode_from_menu(m))
             mode_menu.addAction(act)
@@ -1075,51 +1358,159 @@ class InterviewWindow(QWidget):
         self.gpt_result_panel = QFrame()
         self.gpt_result_panel.setObjectName("GptResultPanel")
         self.gpt_result_panel.setStyleSheet(
-            "QFrame#GptResultPanel { background: rgba(255,255,255,0.55); border: 1px solid rgba(17,17,17,70); }"
+            "QFrame#GptResultPanel { background: transparent; border: none; }"
         )
         gpt_layout = QVBoxLayout(self.gpt_result_panel)
-        gpt_layout.setContentsMargins(10, 10, 10, 10)
-        gpt_layout.setSpacing(6)
-        self.gpt_result_title = QLabel("ChatGPT RESULT")
-        self.gpt_result_title.setStyleSheet("font-size: 12px; font-weight: 700; color: #333;")
+        gpt_layout.setContentsMargins(0, 0, 0, 0)
+        gpt_layout.setSpacing(0)
         self.gpt_result_body = QTextEdit()
         self.gpt_result_body.setReadOnly(True)
         self.gpt_result_body.setAcceptRichText(False)
+        self.gpt_result_body.setPlaceholderText("ChatGPT result")
         self.gpt_result_body.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
         self.gpt_result_body.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.gpt_result_body.setViewportMargins(44, 4, 4, 44)
         self.gpt_result_body.setStyleSheet(
-            f"QTextEdit {{ color: {TEXT_COLOR}; background: transparent; border: none; font-size: 16px; font-weight: 700; }}"
+            f"QTextEdit {{ color: {TEXT_COLOR}; background: transparent; "
+            f"border: 1px solid {CAPTION_ROW_BOTTOM_BORDER_COLOR}; font-size: 16px; font-weight: 700; }}"
         )
-        controls_row = QHBoxLayout()
-        controls_row.setContentsMargins(0, 0, 0, 0)
-        controls_row.setSpacing(6)
         self.gpt_copy_btn = QToolButton()
-        self.gpt_copy_btn.setIcon(self._build_copy_glyph_svg_icon(14, "#455a64"))
-        self.gpt_copy_btn.setIconSize(QSize(14, 14))
+        self.gpt_copy_btn.setObjectName("GptResultCopyTopBtn")
+        self.gpt_copy_btn.setFixedSize(28, 28)
         self.gpt_copy_btn.setCursor(Qt.PointingHandCursor)
-        self.gpt_copy_btn.setFixedSize(24, 24)
+        self.gpt_copy_btn.setIcon(self._build_copy_glyph_svg_icon(16, "#111111"))
+        self.gpt_copy_btn.setIconSize(self.gpt_copy_btn.size())
+        self.gpt_copy_btn.setAccessibleName("Copy ChatGPT result")
         self.gpt_copy_btn.setStyleSheet(
-            "QToolButton { border: none; border-radius: 12px; background: transparent; font-weight: 700; }"
-            "QToolButton:hover { background: rgba(0, 0, 0, 0.10); }"
+            f"""
+            QToolButton#GptResultCopyTopBtn {{
+                border: none;
+                border-radius: 14px;
+                background: {_TOPBAR_CYAN_BG};
+            }}
+            QToolButton#GptResultCopyTopBtn:hover {{
+                background: {_TOPBAR_CYAN_HOVER};
+            }}
+            """
         )
         self.gpt_copy_btn.clicked.connect(self._copy_current_gpt_result)
-        controls_row.addWidget(self.gpt_copy_btn)
-        controls_row.addStretch(1)
-        gpt_layout.addWidget(self.gpt_result_title)
-        gpt_layout.addWidget(self.gpt_result_body, 1)
-        gpt_layout.addLayout(controls_row)
+        self._gpt_result_edit_host = _GptResultEditHost(self.gpt_result_body, self.gpt_copy_btn)
+        gpt_layout.addWidget(self._gpt_result_edit_host, 1)
 
-        self.interview_splitter = QSplitter(Qt.Orientation.Vertical)
-        self.interview_splitter.addWidget(self.caption_scroll)
-        self.interview_splitter.addWidget(self.gpt_result_panel)
+        self._free_prompt_panel = QFrame()
+        self._free_prompt_panel.setObjectName("FreePromptPanel")
+        self._free_prompt_panel.setMinimumHeight(0)
+        self._free_prompt_panel.setStyleSheet(
+            "QFrame#FreePromptPanel { background: transparent; border: none; }"
+        )
+        free_outer = QVBoxLayout(self._free_prompt_panel)
+        free_outer.setContentsMargins(0, 0, 0, 0)
+        free_outer.setSpacing(0)
+        self._free_prompt_edit = QTextEdit()
+        self._free_prompt_edit.setAcceptRichText(False)
+        self._free_prompt_edit.setPlaceholderText("Type a prompt…  (Ctrl+Enter)")
+        self._free_prompt_edit.setMinimumHeight(72)
+        self._free_prompt_edit.setMaximumHeight(160)
+        self._free_prompt_edit.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        self._free_prompt_edit.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self._free_prompt_edit.setViewportMargins(4, 30, 40, 40)
+        self._free_prompt_edit.setStyleSheet(
+            f"QTextEdit {{ color: {TEXT_COLOR}; background: transparent; "
+            f"border: 1px solid {CAPTION_ROW_BOTTOM_BORDER_COLOR}; "
+            "font-size: 14px; font-weight: 600; padding: 0px; }}"
+        )
+        self._free_prompt_edit.installEventFilter(self)
+        self._free_prompt_send_btn = QPushButton()
+        self._free_prompt_send_btn.setObjectName("FreePromptSendTopBtn")
+        self._free_prompt_send_btn.setFixedSize(28, 28)
+        self._free_prompt_send_btn.setCursor(Qt.PointingHandCursor)
+        self._free_prompt_send_btn.setIcon(self._build_send_plane_svg_icon(16, "#111111"))
+        self._free_prompt_send_btn.setIconSize(self._free_prompt_send_btn.size())
+        self._free_prompt_send_btn.setAccessibleName("Send prompt to ChatGPT")
+        self._free_prompt_send_btn.setStyleSheet(
+            f"""
+            QPushButton#FreePromptSendTopBtn {{
+                border: none;
+                border-radius: 14px;
+                background: {_TOPBAR_CYAN_BG};
+            }}
+            QPushButton#FreePromptSendTopBtn:hover {{
+                background: {_TOPBAR_CYAN_HOVER};
+            }}
+            """
+        )
+        self._free_prompt_send_btn.clicked.connect(self._on_free_prompt_send_clicked)
+        tiny_tool_ss = f"""
+            QToolButton#FreePromptTinyTool {{
+                border: none;
+                border-radius: 11px;
+                background: {_TOPBAR_CYAN_BG};
+            }}
+            QToolButton#FreePromptTinyTool:hover {{
+                background: {_TOPBAR_CYAN_HOVER};
+            }}
+        """
+        self._free_snip_btn = QToolButton()
+        self._free_snip_btn.setObjectName("FreePromptTinyTool")
+        self._free_snip_btn.setFixedSize(22, 22)
+        self._free_snip_btn.setCursor(Qt.PointingHandCursor)
+        self._free_snip_btn.setIcon(self._build_snip_region_svg_icon(14, "#111111"))
+        self._free_snip_btn.setIconSize(QSize(14, 14))
+        self._free_snip_btn.setAccessibleName("Snip screen region")
+        self._free_snip_btn.setStyleSheet(tiny_tool_ss)
+        self._free_snip_btn.setToolTip("Snip screen (sends with Send)")
+        self._free_snip_btn.clicked.connect(self._on_free_snip_clicked)
+        self._free_stub2_btn = QToolButton()
+        self._free_stub2_btn.setObjectName("FreePromptTinyTool")
+        self._free_stub2_btn.setFixedSize(22, 22)
+        self._free_stub2_btn.setCursor(Qt.PointingHandCursor)
+        self._free_stub2_btn.setIcon(self._build_tool_stub_svg_icon(14, "#888888"))
+        self._free_stub2_btn.setIconSize(QSize(14, 14))
+        self._free_stub2_btn.setAccessibleName("Reserved tool 2")
+        self._free_stub2_btn.setStyleSheet(tiny_tool_ss)
+        self._free_stub2_btn.setToolTip("Reserved")
+        self._free_stub2_btn.clicked.connect(self._on_free_stub_tool_clicked)
+        self._free_stub3_btn = QToolButton()
+        self._free_stub3_btn.setObjectName("FreePromptTinyTool")
+        self._free_stub3_btn.setFixedSize(22, 22)
+        self._free_stub3_btn.setCursor(Qt.PointingHandCursor)
+        self._free_stub3_btn.setIcon(self._build_tool_stub_svg_icon(14, "#888888"))
+        self._free_stub3_btn.setIconSize(QSize(14, 14))
+        self._free_stub3_btn.setAccessibleName("Reserved tool 3")
+        self._free_stub3_btn.setStyleSheet(tiny_tool_ss)
+        self._free_stub3_btn.setToolTip("Reserved")
+        self._free_stub3_btn.clicked.connect(self._on_free_stub_tool_clicked)
+        self._free_prompt_edit_host = _FreePromptEditHost(
+            self._free_prompt_edit,
+            self._free_prompt_send_btn,
+            [self._free_snip_btn, self._free_stub2_btn, self._free_stub3_btn],
+        )
+        free_outer.addWidget(self._free_prompt_edit_host, 1)
+
+        self.interview_splitter = _InterviewVerticalSplitter()
+
+        def _splitter_pane_wrap(inner: QWidget) -> QWidget:
+            wrap = QWidget()
+            lay = QVBoxLayout(wrap)
+            lay.setContentsMargins(2, 2, 2, 2)
+            lay.setSpacing(0)
+            lay.addWidget(inner)
+            return wrap
+
+        self._caption_split_wrap = _splitter_pane_wrap(self.caption_scroll)
+        self._free_split_wrap = _splitter_pane_wrap(self._free_prompt_panel)
+        self._gpt_split_wrap = _splitter_pane_wrap(self.gpt_result_panel)
+        self.interview_splitter.addWidget(self._caption_split_wrap)
+        self.interview_splitter.addWidget(self._gpt_split_wrap)
         self.interview_splitter.setChildrenCollapsible(False)
-
+        self._free_prompt_panel.hide()
         self.interview_page = QWidget()
         interview_layout = QVBoxLayout(self.interview_page)
-        interview_layout.setContentsMargins(0, 0, 0, 0)
+        interview_layout.setContentsMargins(4, 4, 4, 4)
         interview_layout.setSpacing(0)
         interview_layout.addWidget(self.interview_splitter)
         self.scroll = self.caption_scroll
+        self._sync_free_mode_panel_visibility()
 
         self._settings_active_kind: str | None = None
         self._settings_snap_text = ""
@@ -1214,15 +1605,10 @@ class InterviewWindow(QWidget):
         header.addStretch(1)
         outer.addLayout(header)
 
-        splitter = QSplitter(Qt.Orientation.Horizontal)
+        splitter = _SettingsHorizontalSplitter()
         splitter.setChildrenCollapsible(False)
         splitter.setStretchFactor(0, 3)
         splitter.setStretchFactor(1, 7)
-        splitter.setHandleWidth(1)
-        splitter.setStyleSheet(
-            f"QSplitter::handle:horizontal {{ background-color: {CAPTION_ROW_BOTTOM_BORDER_COLOR}; "
-            "width: 1px; border: none; }}"
-        )
         left = QWidget()
         left.setMinimumWidth(140)
         lv = QVBoxLayout(left)
@@ -1238,10 +1624,10 @@ class InterviewWindow(QWidget):
             ("resume_summary", "Resume summary template"),
             ("jd_summary", "JD summary template"),
             ("initial_interview", "Initial interview template"),
-            ("chunk_interview", "Per-caption interview template"),
             ("read_mode", "Read mode prompt"),
             ("type_mode", "Type mode prompt"),
             ("behavioral_mode", "Behavioral mode prompt"),
+            ("free_mode", "Free mode prompt"),
         ):
             b = QPushButton(label)
             b.setStyleSheet(btn_style)
@@ -1281,19 +1667,8 @@ class InterviewWindow(QWidget):
             "QPushButton:hover { background: #5c6bc0; }"
         )
         self._settings_prompt_save_btn.clicked.connect(self._on_settings_prompt_save_clicked)
-        self._settings_prompt_cancel_btn = QPushButton("Cancel")
-        self._settings_prompt_cancel_btn.setMinimumHeight(36)
-        self._settings_prompt_cancel_btn.setCursor(Qt.PointingHandCursor)
-        self._settings_prompt_cancel_btn.setStyleSheet(
-            "QPushButton { padding: 8px 22px; border-radius: 10px; background: #eceff1; color: #263238; "
-            "font-weight: 700; font-size: 13px; border: none; }"
-            "QPushButton:hover { background: #cfd8dc; }"
-        )
-        self._settings_prompt_cancel_btn.clicked.connect(self._on_settings_prompt_cancel_clicked)
-        self._settings_prompt_save_btn.hide()
-        self._settings_prompt_cancel_btn.hide()
         btn_row.addWidget(self._settings_prompt_save_btn)
-        btn_row.addWidget(self._settings_prompt_cancel_btn)
+        self._settings_prompt_save_btn.hide()
         rv.addLayout(btn_row)
         splitter.addWidget(right)
         splitter.setSizes([260, 540])
@@ -1334,7 +1709,6 @@ class InterviewWindow(QWidget):
         self._settings_editor.hide()
         self._settings_right_hint.show()
         self._settings_prompt_save_btn.hide()
-        self._settings_prompt_cancel_btn.hide()
 
     def _on_settings_pick_prompt_kind(self, kind: str) -> None:
         if kind == "read_mode":
@@ -1343,7 +1717,9 @@ class InterviewWindow(QWidget):
             text = TYPE_MODE_CHUNK_TEMPLATE
         elif kind == "behavioral_mode":
             text = BEHAVIORAL_MODE_CHUNK_TEMPLATE
-        elif kind in ("resume_summary", "jd_summary", "initial_interview", "chunk_interview"):
+        elif kind == "free_mode":
+            text = FREE_MODE_CHUNK_TEMPLATE
+        elif kind in ("resume_summary", "jd_summary", "initial_interview"):
             text = prompt_store.get_template(kind)
         else:
             return
@@ -1356,22 +1732,12 @@ class InterviewWindow(QWidget):
         self._settings_editor.show()
         self._settings_right_hint.hide()
         self._settings_prompt_save_btn.show()
-        self._settings_prompt_cancel_btn.show()
 
     def _on_settings_editor_text_changed(self) -> None:
         self._settings_editor_dirty = self._settings_editor.toPlainText() != self._settings_snap_text
 
-    def _on_settings_prompt_cancel_clicked(self) -> None:
-        if self._settings_active_kind is None:
-            self._reset_settings_editor_state()
-            return
-        self._settings_editor.blockSignals(True)
-        self._settings_editor.setPlainText(self._settings_snap_text)
-        self._settings_editor.blockSignals(False)
-        self._settings_editor_dirty = False
-
     def _on_settings_prompt_save_clicked(self) -> None:
-        global READ_MODE_CHUNK_TEMPLATE, TYPE_MODE_CHUNK_TEMPLATE, BEHAVIORAL_MODE_CHUNK_TEMPLATE
+        global READ_MODE_CHUNK_TEMPLATE, TYPE_MODE_CHUNK_TEMPLATE, BEHAVIORAL_MODE_CHUNK_TEMPLATE, FREE_MODE_CHUNK_TEMPLATE
         kind = self._settings_active_kind
         if not kind:
             return
@@ -1388,7 +1754,11 @@ class InterviewWindow(QWidget):
             BEHAVIORAL_MODE_CHUNK_TEMPLATE = body
             _persist_mode_prompts_to_json()
             self.show_toast("Behavioral mode prompt saved.", level="success")
-        elif kind in ("resume_summary", "jd_summary", "initial_interview", "chunk_interview"):
+        elif kind == "free_mode":
+            FREE_MODE_CHUNK_TEMPLATE = body
+            _persist_mode_prompts_to_json()
+            self.show_toast("Free mode prompt saved.", level="success")
+        elif kind in ("resume_summary", "jd_summary", "initial_interview"):
             cid = self._settings_effective_client_id()
             url = f"{self._bridge_base}/context/template/{kind}"
             post_body: dict = {"text": body}
@@ -1411,8 +1781,6 @@ class InterviewWindow(QWidget):
                 self.show_toast("Job description template saved.", level="success")
             elif kind == "initial_interview":
                 self.show_toast("Initial interview template saved.", level="success")
-            else:
-                self.show_toast("Per-caption interview template saved.", level="success")
         self._settings_snap_text = body
         self._settings_editor_dirty = False
 
@@ -1436,20 +1804,23 @@ class InterviewWindow(QWidget):
         self._apply_shell_visual()
 
     def _set_session_mode_from_menu(self, mode: str) -> None:
-        """Set chunk-guidance mode from the top-bar menu (read / type / behavioral)."""
+        """Set chunk-guidance mode from the top-bar menu (read / type / behavioral / free)."""
         global _session_mode
         old = _session_mode
         m = (mode or "read").strip().lower()
-        if m not in ("read", "type", "behavioral"):
+        if m not in ("read", "type", "behavioral", "free"):
             m = "read"
         _session_mode = m
         self._update_session_mode_button()
+        self._sync_free_mode_panel_visibility()
         if old == m:
             return
         if m == "type":
             self.show_toast("Switched to Type mode.", level="success")
         elif m == "behavioral":
             self.show_toast("Switched to Behavioral mode.", level="success")
+        elif m == "free":
+            self.show_toast("Free mode: use the prompt box and send (End does not send captions).", level="success")
         else:
             self.show_toast("Switched to Read mode.", level="success")
 
@@ -1469,12 +1840,214 @@ class InterviewWindow(QWidget):
             )
             self.session_mode_btn.setText("Behavioral")
             self.session_mode_btn.setAccessibleName("Behavioral mode")
+        elif _session_mode == "free":
+            self.session_mode_btn.setIcon(self._build_free_mode_svg_icon(px, col))
+            self.session_mode_btn.setText("Free")
+            self.session_mode_btn.setAccessibleName("Free mode")
         else:
             self.session_mode_btn.setIcon(
                 self._build_read_mode_svg_icon(px, col)
             )
             self.session_mode_btn.setText("Read")
             self.session_mode_btn.setAccessibleName("Read mode")
+
+    def _sync_free_mode_panel_visibility(self) -> None:
+        global _session_mode
+        sp = getattr(self, "interview_splitter", None)
+        panel = getattr(self, "_free_prompt_panel", None)
+        free_wrap = getattr(self, "_free_split_wrap", None)
+        if panel is None or sp is None or free_wrap is None:
+            return
+        is_free = _session_mode == "free"
+        idx = sp.indexOf(free_wrap)
+        if is_free:
+            if idx < 0:
+                sp.insertWidget(1, free_wrap)
+            panel.setVisible(True)
+            panel.setMinimumHeight(100)
+        else:
+            panel.setVisible(False)
+            panel.setMinimumHeight(0)
+            if idx >= 0:
+                free_wrap.setParent(None)
+        QTimer.singleShot(0, self._adjust_interview_splitter_for_free_mode)
+
+    def _adjust_interview_splitter_for_free_mode(self) -> None:
+        sp = getattr(self, "interview_splitter", None)
+        if sp is None:
+            return
+        global _session_mode
+        h = max(1, sp.height())
+        if _session_mode == "free" and sp.count() >= 3:
+            cap = max(96, int(h * 0.26))
+            mid = max(108, int(h * 0.20))
+            bot = max(160, h - cap - mid)
+            sp.setSizes([cap, mid, bot])
+        elif sp.count() >= 2:
+            top = max(120, int(h * 0.32))
+            bot = max(180, h - top)
+            sp.setSizes([top, bot])
+
+    def _on_free_prompt_send_clicked(self) -> None:
+        global _session_mode
+        if _session_mode != "free":
+            return
+        te = getattr(self, "_free_prompt_edit", None)
+        if te is None:
+            return
+        raw = (te.toPlainText() or "").strip()
+        img = (getattr(self, "_free_attach_png_b64", None) or "").strip() or None
+        if not raw and not img:
+            self.show_toast("Type a prompt or attach a screenshot.", level="warning")
+            return
+        img_copy = img
+        self._clear_free_snip_attachment()
+        te.clear()
+        threading.Thread(
+            target=process_chunk,
+            args=(raw, "free_manual"),
+            kwargs={"image_png_base64": img_copy},
+            daemon=True,
+        ).start()
+
+    def _clear_free_snip_attachment(self) -> None:
+        self._free_attach_png_b64 = None
+        btn = getattr(self, "_free_snip_btn", None)
+        if btn is not None:
+            btn.setToolTip("Snip screen (sends with Send)")
+
+    def _finish_free_snip(self, img: QImage | None) -> None:
+        self._free_snip_session_active = False
+        if img is None or img.isNull():
+            return
+        b64 = _image_to_png_base64(img)
+        if not b64:
+            self.show_toast("Could not encode screenshot.", level="error")
+            return
+        self._free_attach_png_b64 = b64
+        btn = getattr(self, "_free_snip_btn", None)
+        if btn is not None:
+            btn.setToolTip("Screenshot ready — sends with Send (click snip to replace)")
+        self.show_toast("Screenshot attached. Add text if you want, then Send.", level="info")
+
+    def _set_interview_topmost(self, on: bool) -> None:
+        """Temporarily drop always-on-top so Windows snip (or our overlay) can sit above this window."""
+        flags = (
+            Qt.WindowType.Tool
+            | Qt.FramelessWindowHint
+            | Qt.WindowType.NoDropShadowWindowHint
+        )
+        if on:
+            flags |= Qt.WindowStaysOnTopHint
+        self.setWindowFlags(flags)
+        self.setAttribute(Qt.WA_TranslucentBackground, True)
+        self.show()
+
+    def _stop_os_snip_poll(self) -> None:
+        t = getattr(self, "_snip_poll_timer", None)
+        if t is not None and t.isActive():
+            t.stop()
+
+    def _abort_free_os_snip(self, message: str = "") -> None:
+        if not getattr(self, "_free_snip_session_active", False):
+            return
+        self._free_snip_session_active = False
+        self._stop_os_snip_poll()
+        self._set_interview_topmost(True)
+        if (message or "").strip():
+            self.show_toast(message.strip(), level="warning")
+
+    def _poll_os_snip_clipboard(self) -> None:
+        if not getattr(self, "_free_snip_session_active", False):
+            self._stop_os_snip_poll()
+            return
+        self._snip_poll_count += 1
+        if self._snip_poll_count > 600:
+            self._end_os_snip_session(None, cancelled=True)
+            return
+        app = QApplication.instance()
+        if app is None:
+            return
+        cb = app.clipboard()
+        mime = cb.mimeData()
+        if not mime.hasImage():
+            return
+        im = cb.image()
+        if im.isNull():
+            return
+        before = getattr(self, "_snip_clipboard_image_before", QImage())
+        if not before.isNull() and im == before:
+            return
+        self._end_os_snip_session(im, cancelled=False)
+
+    def _end_os_snip_session(self, im: QImage | None, *, cancelled: bool) -> None:
+        if not getattr(self, "_free_snip_session_active", False):
+            return
+        self._free_snip_session_active = False
+        self._stop_os_snip_poll()
+        self._set_interview_topmost(True)
+        if cancelled or im is None or im.isNull():
+            if cancelled:
+                self.show_toast("Snip cancelled or timed out.", level="warning")
+            return
+        self._finish_free_snip(im)
+
+    def _begin_os_snip_session(self) -> None:
+        """Same snip experience as Win+Shift+S: OS bar, selection, image on clipboard."""
+        app = QApplication.instance()
+        if app is None:
+            self._free_snip_session_active = False
+            return
+        cb = app.clipboard()
+        mime = cb.mimeData()
+        self._snip_clipboard_image_before = cb.image() if mime.hasImage() else QImage()
+        self._snip_poll_count = 0
+        self._free_snip_session_active = True
+        self._stop_os_snip_poll()
+        self._set_interview_topmost(False)
+        self.show_toast(
+            "Windows snip (Win+Shift+S): drag a region, release — image attaches to Send.",
+            level="info",
+        )
+        self._snip_poll_timer.start()
+        threading.Thread(target=_win_send_snip_hotkey_worker, daemon=True).start()
+
+    def _begin_custom_snip_overlay_fallback(self) -> None:
+        """Non-Windows: in-app snip; drop always-on-top so the overlay is visible above this window."""
+        self._free_snip_session_active = True
+        self._set_interview_topmost(False)
+        try:
+            pm, geo = _grab_virtual_screen_pixmap()
+        except Exception:
+            self._free_snip_session_active = False
+            self._set_interview_topmost(True)
+            self.show_toast("Could not capture screen.", level="error")
+            return
+
+        def _done(im: QImage | None) -> None:
+            self._set_interview_topmost(True)
+            self._free_snip_session_active = False
+            self._finish_free_snip(im)
+
+        ov = SnipOverlay(pm, geo, _done, parent=None)
+        ov.setWindowModality(Qt.WindowModality.NonModal)
+        ov.show()
+        ov.raise_()
+        ov.activateWindow()
+
+    def _on_free_snip_clicked(self) -> None:
+        global _session_mode
+        if _session_mode != "free":
+            return
+        if getattr(self, "_free_snip_session_active", False):
+            return
+        if os.name == "nt":
+            self._begin_os_snip_session()
+        else:
+            self._begin_custom_snip_overlay_fallback()
+
+    def _on_free_stub_tool_clicked(self) -> None:
+        self.show_toast("Reserved for a future tool.", level="info")
 
     def _apply_shell_visual(self) -> None:
         """Only the shell panel background fades; labels/buttons stay opaque."""
@@ -1530,8 +2103,7 @@ class InterviewWindow(QWidget):
         else:
             _active_interview_client_id = str(get_selected_client_id() or "").strip()
         apply_selected_client_context_to_prompt_store(prompt_store)
-        # Pin the templates that step 4 just shipped to ChatGPT — every caption from now
-        # on uses these snapshots, so editing the extension mid-interview cannot change behavior.
+        # Pin initial interview template snapshot at prep handoff (used where initial context matters).
         _session_initial_template = (prompt_store.get_template("initial_interview") or "").strip()
         _interview_ws = InterviewWSServer(ui_queue)
         _interview_ws.start()
@@ -1930,6 +2502,44 @@ class InterviewWindow(QWidget):
         painter.end()
         return QIcon(pixmap)
 
+    @staticmethod
+    def _build_free_mode_svg_icon(size: int, color: str) -> QIcon:
+        svg = f"""<svg xmlns="http://www.w3.org/2000/svg" width="{size}" height="{size}" viewBox="0 0 24 24">
+<path fill="{color}" d="M20 5H4c-1.1 0-2 .9-2 2v10c0 1.1.9 2 2 2h16c1.1 0 2-.9 2-2V7c0-1.1-.9-2-2-2zm0 12H4V7h16v10zM6 10h2v2H6v-2zm3 0h8v2H9v-2zm-3 4h2v2H6v-2zm3 0h5v2H9v-2z"/>
+</svg>"""
+        renderer = QSvgRenderer(svg.encode("utf-8"))
+        pixmap = QPixmap(size, size)
+        pixmap.fill(Qt.GlobalColor.transparent)
+        painter = QPainter(pixmap)
+        renderer.render(painter)
+        painter.end()
+        return QIcon(pixmap)
+
+    @staticmethod
+    def _build_snip_region_svg_icon(size: int, color: str) -> QIcon:
+        svg = f"""<svg xmlns="http://www.w3.org/2000/svg" width="{size}" height="{size}" viewBox="0 0 24 24" fill="none" stroke="{color}" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+<rect x="3" y="3" width="18" height="18" rx="2" ry="2"/>
+<path d="M9 3v18M15 3v18M3 9h18M3 15h18"/></svg>"""
+        renderer = QSvgRenderer(svg.encode("utf-8"))
+        pixmap = QPixmap(size, size)
+        pixmap.fill(Qt.GlobalColor.transparent)
+        painter = QPainter(pixmap)
+        renderer.render(painter)
+        painter.end()
+        return QIcon(pixmap)
+
+    @staticmethod
+    def _build_tool_stub_svg_icon(size: int, color: str) -> QIcon:
+        svg = f"""<svg xmlns="http://www.w3.org/2000/svg" width="{size}" height="{size}" viewBox="0 0 24 24" fill="{color}">
+<circle cx="8" cy="12" r="1.8"/><circle cx="12" cy="12" r="1.8"/><circle cx="16" cy="12" r="1.8"/></svg>"""
+        renderer = QSvgRenderer(svg.encode("utf-8"))
+        pixmap = QPixmap(size, size)
+        pixmap.fill(Qt.GlobalColor.transparent)
+        painter = QPainter(pixmap)
+        renderer.render(painter)
+        painter.end()
+        return QIcon(pixmap)
+
     def _hit_test_edges(self, local_pos):
         rect = self.rect()
         x, y = local_pos.x(), local_pos.y()
@@ -2012,6 +2622,14 @@ class InterviewWindow(QWidget):
                 self.grabMouse()
                 self.setCursor(Qt.ClosedHandCursor)
                 return True
+        fp = getattr(self, "_free_prompt_edit", None)
+        if fp is not None and watched is fp and event.type() == QEvent.Type.KeyPress:
+            if isinstance(event, QKeyEvent):
+                if event.key() in (Qt.Key.Key_Return, Qt.Key.Key_Enter) and (
+                    event.modifiers() & Qt.KeyboardModifier.ControlModifier
+                ):
+                    self._on_free_prompt_send_clicked()
+                    return True
         et = event.type()
         scroll = getattr(self, "scroll", None)
         if isinstance(scroll, QWidget):
@@ -2239,9 +2857,16 @@ class InterviewWindow(QWidget):
         if not hasattr(self, "interview_splitter") or self.interview_splitter is None:
             return
         total = max(1, self.interview_splitter.height())
-        top = max(120, int(total * 0.30))
-        bottom = max(180, total - top)
-        self.interview_splitter.setSizes([top, bottom])
+        global _session_mode
+        if _session_mode == "free" and self.interview_splitter.count() >= 3:
+            cap = max(96, int(total * 0.26))
+            mid = max(108, int(total * 0.20))
+            bot = max(160, total - cap - mid)
+            self.interview_splitter.setSizes([cap, mid, bot])
+        elif self.interview_splitter.count() >= 2:
+            top = max(120, int(total * 0.30))
+            bottom = max(180, total - top)
+            self.interview_splitter.setSizes([top, bottom])
         self._splitter_initialized = True
 
     def _tick_caption_autoscroll(self) -> None:
@@ -2263,7 +2888,11 @@ class InterviewWindow(QWidget):
             self._suppress_user_scroll_signal = False
 
     def _set_gpt_result_text(self, text: str) -> None:
-        self.gpt_result_body.setPlainText((text or "").strip() or " ")
+        t = (text or "").strip()
+        if not t:
+            self.gpt_result_body.clear()
+        else:
+            self.gpt_result_body.setPlainText(t)
 
     def _refresh_gpt_history_nav(self) -> None:
         """History nav UI removed; title stays fixed as ChatGPT RESULT."""
@@ -2284,11 +2913,11 @@ class InterviewWindow(QWidget):
     def _copy_current_gpt_result(self) -> None:
         txt = (self.gpt_result_body.toPlainText() or "").strip()
         QApplication.clipboard().setText(txt)
-        self.gpt_copy_btn.setIcon(self._build_tick_svg_icon(14, "#2e7d32"))
+        self.gpt_copy_btn.setIcon(self._build_tick_svg_icon(16, "#2e7d32"))
 
         def _restore_copy_icon() -> None:
             try:
-                self.gpt_copy_btn.setIcon(self._build_copy_glyph_svg_icon(14, "#455a64"))
+                self.gpt_copy_btn.setIcon(self._build_copy_glyph_svg_icon(16, "#111111"))
             except Exception:
                 pass
 
@@ -2759,6 +3388,11 @@ class InterviewWindow(QWidget):
                 break
 
             t = event.get("type")
+            if t == "free_snip_abort":
+                mw = _main_interview_window
+                if mw is not None:
+                    mw._abort_free_os_snip(str(event.get("message", "") or ""))
+                continue
             if t == "draft":
                 self.show_or_update_draft(event.get("text", ""))
             elif t == "finalize":
@@ -2877,7 +3511,10 @@ def interview_history_format_txt() -> str:
         body = e.get("body", "")
         lines.append("=" * 60)
         if role == "interviewer":
-            lines.append(f'Interviewer ({tag}) [{ts}]::')
+            if tag == "free_manual":
+                lines.append(f"Manual prompt [{ts}]::")
+            else:
+                lines.append(f'Interviewer ({tag}) [{ts}]::')
             lines.append("-" * 60)
             lines.append(body)
         elif role == "gpt":
@@ -3081,32 +3718,50 @@ def skip_pending_captions_without_gpt() -> None:
         interview_history_append_interviewer(skipped, "delete_skip")
 
 
-def process_chunk(raw_chunk):
+def process_chunk(raw_chunk, history_source="sent_gpt", image_png_base64=None):
     global pending_request_id, _interview_ws, _http_fallback_notified, _last_live_poll_for_rid
     prev_rid = (pending_request_id or "").strip()
-    chunk = (raw_chunk or "").strip()
-    if not chunk:
+    user_text = (raw_chunk or "").strip()
+    img = (image_png_base64 or "").strip() if image_png_base64 else ""
+    img = img or None
+    if not user_text and not img:
+        return
+    if history_source == "free_manual" and _session_mode != "free":
+        return
+    if _session_mode == "free" and history_source == "sent_gpt":
         return
     if prev_rid:
         interview_history_append_gpt_placeholder(
             "Previous GPT request had no recorded final output (superseded by a new interviewer chunk)."
         )
-    interview_history_append_interviewer(chunk, "sent_gpt")
+    hist = user_text
+    if img:
+        hist = f"{user_text}\n[Screenshot attached]".strip() if user_text else "[Screenshot attached]"
+    interview_history_append_interviewer(hist, history_source)
+    prompt_source = user_text if user_text else "[Refer to the attached screenshot.]"
     _cleaned, final_prompt = build_chunk_prompts(
-        raw_chunk, prompt_store, template_override=_active_chunk_template_override()
+        prompt_source, prompt_store, template_override=_active_chunk_template_override()
     )
     request_id = str(uuid.uuid4())
     if prev_rid:
         _clear_interview_live_text(prev_rid)
         _last_live_poll_for_rid = ("", "")
     client_id = _target_client_id()
-    if _try_ws_send_action(
-        {"type": "INTERVIEWER_CHUNK", "prompt": final_prompt, "request_id": request_id},
-    ):
+    ws_payload: dict = {"type": "INTERVIEWER_CHUNK", "prompt": final_prompt, "request_id": request_id}
+    if img:
+        ws_payload["image_png_base64"] = img
+    if _try_ws_send_action(ws_payload):
         _http_fallback_notified = False
         pending_request_id = request_id
         queue_gpt_session_start("", "Gpt processing (WebSocket)")
         return
+    if img:
+        queue_ui_message(
+            "Extension not connected: screenshots cannot be sent over HTTP. Reconnect the bridge tab or send text only.",
+            "left",
+        )
+        if not user_text:
+            return
     http_notice = ""
     if client_id and not _http_fallback_notified:
         _http_fallback_notified = True
@@ -3116,7 +3771,7 @@ def process_chunk(raw_chunk):
         )
     queue_gpt_session_start(http_notice, "Gpt processing")
     result = process_caption_chunk(
-        raw_chunk=raw_chunk,
+        raw_chunk=prompt_source,
         prompt_store=prompt_store,
         log_fn=lambda _t, _m: None,
         template_override=_active_chunk_template_override(),
@@ -3163,6 +3818,12 @@ def on_press(key):
                 getattr(_main_interview_window, "_home_edit_active", False)
             ):
                 queue_caption_edit_spawn_new_draft()
+                return
+            if _session_mode == "free":
+                queue_ui_message(
+                    "Free mode: use the prompt box and send (End does not send live captions).",
+                    "left",
+                )
                 return
             text = snapshot_chunk_since_last_end()
             if text:
