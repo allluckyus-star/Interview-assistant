@@ -13,6 +13,10 @@ let lastHandledPrepJobId = "";
 let prepTabId = null;
 
 const BRIDGED_PREP_TAB_KEY = "bridgedPrepTabId";
+/** Session hint: active tab was ChatGPT when user clicked Register with bridge (short TTL). */
+const PREP_BRIDGE_TAB_HINT_ID = "prepBridgeTabHintTabId";
+const PREP_BRIDGE_TAB_HINT_TS = "prepBridgeTabHintTs";
+const PREP_BRIDGE_TAB_HINT_MAX_AGE_MS = 120000;
 
 function isChatGptPageUrl(url) {
   if (!url) return false;
@@ -24,6 +28,48 @@ function rememberPrepTabId(tabId) {
   prepTabId = tabId;
   if (tabId != null) {
     chrome.storage.local.set({ [BRIDGED_PREP_TAB_KEY]: tabId });
+  }
+}
+
+/** Active tab in last-focused or current window, if that tab is already ChatGPT. */
+async function tryGetActiveChatGptTabId() {
+  for (const q of [{ active: true, lastFocusedWindow: true }, { active: true, currentWindow: true }]) {
+    const tabs = await chrome.tabs.query(q);
+    const t = tabs[0];
+    if (t && t.id != null && isChatGptPageUrl(t.url || "")) return t.id;
+  }
+  return null;
+}
+
+async function readAndClearBridgeTabHint() {
+  try {
+    const data = await chrome.storage.session.get([PREP_BRIDGE_TAB_HINT_ID, PREP_BRIDGE_TAB_HINT_TS]);
+    await chrome.storage.session.remove([PREP_BRIDGE_TAB_HINT_ID, PREP_BRIDGE_TAB_HINT_TS]);
+    const id = data[PREP_BRIDGE_TAB_HINT_ID];
+    const ts = Number(data[PREP_BRIDGE_TAB_HINT_TS] || 0);
+    if (id == null || !Number.isFinite(ts)) return null;
+    if (Date.now() - ts > PREP_BRIDGE_TAB_HINT_MAX_AGE_MS) return null;
+    const tab = await chrome.tabs.get(id).catch(() => null);
+    if (tab && tab.id != null && isChatGptPageUrl(tab.url || "")) return tab.id;
+  } catch (_e) {
+    /* chrome.storage.session missing in very old Chrome */
+  }
+  return null;
+}
+
+async function storeBridgeTabHintIfActiveIsGpt() {
+  try {
+    const id = await tryGetActiveChatGptTabId();
+    if (id != null) {
+      await chrome.storage.session.set({
+        [PREP_BRIDGE_TAB_HINT_ID]: id,
+        [PREP_BRIDGE_TAB_HINT_TS]: Date.now(),
+      });
+    } else {
+      await chrome.storage.session.remove([PREP_BRIDGE_TAB_HINT_ID, PREP_BRIDGE_TAB_HINT_TS]);
+    }
+  } catch (_e) {
+    /* ignore */
   }
 }
 
@@ -397,28 +443,58 @@ async function handlePrepJob() {
   try {
     let tabId = prepTabId;
     if (openNewTab) {
-      await postPrepExtensionStatus({
-        event: "prep_opening_tab",
-        job_id: job.job_id,
-        detail: "Creating https://chatgpt.com/ tab",
-      });
-      const created = await chrome.tabs.create({ url: "https://chatgpt.com/", active: true });
-      tabId = created.id;
-      rememberPrepTabId(tabId);
-      await postPrepExtensionStatus({
-        event: "prep_tab_loading",
-        job_id: job.job_id,
-        tab_id: tabId,
-        detail: "Waiting for tab status=complete (content script injects at document_idle)",
-      });
-      const okComplete = await waitUntilTabComplete(tabId, 90000);
-      await postPrepExtensionStatus({
-        event: "prep_tab_loaded",
-        job_id: job.job_id,
-        tab_id: tabId,
-        tab_complete: okComplete,
-      });
-      await sleep(500);
+      let tabIdReuse = await readAndClearBridgeTabHint();
+      if (tabIdReuse == null) {
+        tabIdReuse = await tryGetActiveChatGptTabId();
+      }
+      if (tabIdReuse != null) {
+        await postPrepExtensionStatus({
+          event: "prep_reusing_existing_chatgpt",
+          job_id: job.job_id,
+          tab_id: tabIdReuse,
+          detail: "Active window tab is already ChatGPT — reusing (no new tab)",
+        });
+        tabId = tabIdReuse;
+        rememberPrepTabId(tabId);
+        await chrome.tabs.update(tabId, { active: true });
+        await postPrepExtensionStatus({
+          event: "prep_tab_loading",
+          job_id: job.job_id,
+          tab_id: tabId,
+          detail: "Focusing existing ChatGPT tab; waiting for status=complete",
+        });
+        const okReuse = await waitUntilTabComplete(tabId, 90000);
+        await postPrepExtensionStatus({
+          event: "prep_tab_loaded",
+          job_id: job.job_id,
+          tab_id: tabId,
+          tab_complete: okReuse,
+        });
+        await sleep(500);
+      } else {
+        await postPrepExtensionStatus({
+          event: "prep_opening_tab",
+          job_id: job.job_id,
+          detail: "Creating https://chatgpt.com/ tab",
+        });
+        const created = await chrome.tabs.create({ url: "https://chatgpt.com/", active: true });
+        tabId = created.id;
+        rememberPrepTabId(tabId);
+        await postPrepExtensionStatus({
+          event: "prep_tab_loading",
+          job_id: job.job_id,
+          tab_id: tabId,
+          detail: "Waiting for tab status=complete (content script injects at document_idle)",
+        });
+        const okComplete = await waitUntilTabComplete(tabId, 90000);
+        await postPrepExtensionStatus({
+          event: "prep_tab_loaded",
+          job_id: job.job_id,
+          tab_id: tabId,
+          tab_complete: okComplete,
+        });
+        await sleep(500);
+      }
     } else {
       const existing = await chrome.tabs.query({
         url: ["https://chat.openai.com/*", "https://chatgpt.com/*", "https://www.chatgpt.com/*"]
@@ -521,6 +597,12 @@ function scheduleBridgeTick() {
 }
 
 chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
+  if (message?.type === "IA_PREP_NOTE_ACTIVE_TAB_FOR_BRIDGE") {
+    storeBridgeTabHintIfActiveIsGpt()
+      .then(() => sendResponse({ ok: true }))
+      .catch(() => sendResponse({ ok: false }));
+    return true;
+  }
   if (message?.type === "IA_BRIDGE_FETCH") {
     (async () => {
       if (!isAllowedBridgeHttpUrl(message.url)) {

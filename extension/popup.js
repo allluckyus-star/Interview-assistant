@@ -332,6 +332,11 @@ async function refreshRegistryStatus() {
 
 async function registerClient() {
   registerStatus.textContent = "Status: Registering…";
+  try {
+    await chrome.runtime.sendMessage({ type: "IA_PREP_NOTE_ACTIVE_TAB_FOR_BRIDGE" });
+  } catch (_e) {
+    /* popup may lack receiver if background not ready */
+  }
   const clientId = await getOrCreateClientId();
   const { email, profile_id } = await getChromeProfileInfo();
   const label = email || `Chrome client ${clientId.slice(0, 6)}`;
