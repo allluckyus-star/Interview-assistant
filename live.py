@@ -36,6 +36,8 @@ from PySide6.QtCore import (
 from PySide6.QtGui import (
     QAction,
     QColor,
+    QFont,
+    QFontMetrics,
     QGuiApplication,
     QIcon,
     QImage,
@@ -236,19 +238,20 @@ TEXT_COLOR = "#111111"
 # QSS border-radius on the shell must match the top-level window mask (see _sync_round_window_mask).
 APP_SHELL_CORNER_RADIUS_PX = 0
 
-_TOAST_MARGIN_TOP = 12
-_TOAST_GAP_PX = 6
-_TOAST_MIN_OUTER = 88
-_TOAST_MAX_OUTER = 288
-_TOAST_LABEL_MAX_WIDTH = 248
-_TOAST_FONT_PX = 11
-_TOAST_SHOW_MS = 220
-_TOAST_HIDE_MS = 200
-_TOAST_SLIDE_PX = 12
-_TOAST_LINGER_SUCCESS_MS = 2600
-_TOAST_LINGER_WARNING_MS = 3600
-_TOAST_LINGER_ERROR_MS = 4800
-_TOAST_TEXT_MAX_CHARS = 200
+_TOAST_MARGIN_TOP = 14
+_TOAST_GAP_PX = 8
+_TOAST_MIN_OUTER = 100
+_TOAST_MAX_OUTER = 380
+_TOAST_LABEL_MAX_WIDTH = 340
+_TOAST_FONT_PX = 15
+_TOAST_SHOW_MS = 200
+_TOAST_HIDE_MS = 180
+_TOAST_SLIDE_PX = 10
+_TOAST_LINGER_SUCCESS_MS = 2200
+_TOAST_LINGER_WARNING_MS = 3000
+_TOAST_LINGER_ERROR_MS = 4200
+_TOAST_LINGER_INFO_MS = 2400
+_TOAST_TEXT_MAX_CHARS = 96
 _TOPBAR_CYAN_BG = "#b2ebf2"
 _TOPBAR_CYAN_HOVER = "#80deea"
 _TOPBAR_CLOSE_HOVER_BG = "#ff8a80"
@@ -529,7 +532,7 @@ last_answer_request_id = ""
 # Initial interview template snapshot pinned at prep handoff (see _session_initial_template).
 # Live chunk prompts use mode-specific templates via _active_chunk_template_override().
 _session_initial_template: str | None = None
-# Guidance mode toggled from the top-bar menu. "read" / "type" / "behavioral" use
+# Guidance mode toggled from the top-bar menu. "read" / "type" / "behavioral" / "info" use
 # their chunk templates; "free" uses FREE_MODE_CHUNK_TEMPLATE and sends only from
 # the in-window prompt box (End does not send live captions).
 _session_mode: str = "read"
@@ -656,6 +659,32 @@ FREE_MODE_CHUNK_TEMPLATE = """
 \"\"\"
 """
 
+INFO_MODE_CHUNK_TEMPLATE = """You must guess and invent the specific information the interviewer is asking for.
+
+Rules:
+- Do NOT say I don't know, I don't remember, I'm not sure, or anything similar.
+- First person only. Sound like a real engineer in a live interview.
+
+If there is no specific factual question in what the interviewer said, output exactly:
+WAITING
+
+Otherwise output exactly this structure:
+
+SHORT ANSWER:
+[1–2 confident sentences with plausible invented specifics. Max 45 words. No memory hedges.]
+
+DETAILED ANSWER:
+[3–5 sentences extending the answer; details must be concrete and invented when needed but consistent with candidate and job briefing. Max 120 words.]
+
+FOLLOW-UP DEPTH:
+[1–2 concise depth points, still stated confidently as known fact.]
+
+Interviewer said:
+\"\"\"
+{cleaned_interviewer_intent}
+\"\"\"
+"""
+
 READ_MODE_CHUNK_TEMPLATE = """You are producing live interview speaking guidance.
 
 If there is no clear question, output exactly:
@@ -723,8 +752,8 @@ def _http_post_json_local(url: str, payload: dict) -> tuple[dict, int]:
 
 
 def _load_mode_prompt_overrides_from_json() -> None:
-    """Merge ~/.interview_assistant/mode_prompts.json keys read/type/behavioral/free into live chunk templates."""
-    global READ_MODE_CHUNK_TEMPLATE, TYPE_MODE_CHUNK_TEMPLATE, BEHAVIORAL_MODE_CHUNK_TEMPLATE, FREE_MODE_CHUNK_TEMPLATE
+    """Merge ~/.interview_assistant/mode_prompts.json keys read/type/behavioral/info/free into live chunk templates."""
+    global READ_MODE_CHUNK_TEMPLATE, TYPE_MODE_CHUNK_TEMPLATE, BEHAVIORAL_MODE_CHUNK_TEMPLATE, INFO_MODE_CHUNK_TEMPLATE, FREE_MODE_CHUNK_TEMPLATE
     path = Path.home() / ".interview_assistant" / "mode_prompts.json"
     try:
         raw = path.read_text(encoding="utf-8")
@@ -742,13 +771,16 @@ def _load_mode_prompt_overrides_from_json() -> None:
     b = data.get("behavioral")
     if isinstance(b, str) and b.strip():
         BEHAVIORAL_MODE_CHUNK_TEMPLATE = b
+    inf = data.get("info")
+    if isinstance(inf, str) and inf.strip():
+        INFO_MODE_CHUNK_TEMPLATE = inf
     f = data.get("free")
     if isinstance(f, str) and f.strip():
         FREE_MODE_CHUNK_TEMPLATE = f
 
 
 def _persist_mode_prompts_to_json() -> None:
-    global READ_MODE_CHUNK_TEMPLATE, TYPE_MODE_CHUNK_TEMPLATE, BEHAVIORAL_MODE_CHUNK_TEMPLATE, FREE_MODE_CHUNK_TEMPLATE
+    global READ_MODE_CHUNK_TEMPLATE, TYPE_MODE_CHUNK_TEMPLATE, BEHAVIORAL_MODE_CHUNK_TEMPLATE, INFO_MODE_CHUNK_TEMPLATE, FREE_MODE_CHUNK_TEMPLATE
     root = Path.home() / ".interview_assistant"
     root.mkdir(parents=True, exist_ok=True)
     path = root / "mode_prompts.json"
@@ -758,6 +790,7 @@ def _persist_mode_prompts_to_json() -> None:
                 "read": READ_MODE_CHUNK_TEMPLATE,
                 "type": TYPE_MODE_CHUNK_TEMPLATE,
                 "behavioral": BEHAVIORAL_MODE_CHUNK_TEMPLATE,
+                "info": INFO_MODE_CHUNK_TEMPLATE,
                 "free": FREE_MODE_CHUNK_TEMPLATE,
             },
             ensure_ascii=False,
@@ -774,7 +807,7 @@ _load_mode_prompt_overrides_from_json()
 def _active_chunk_template_override() -> str | None:
     """Resolve which chunk-prompt template should be used for the next outgoing prompt.
 
-    Read / type / behavioral / free use fixed in-process templates so the mode switch
+    Read / type / behavioral / info / free use fixed in-process templates so the mode switch
     takes effect immediately mid-interview.
     """
     if _session_mode == "read":
@@ -783,6 +816,8 @@ def _active_chunk_template_override() -> str | None:
         return TYPE_MODE_CHUNK_TEMPLATE
     if _session_mode == "behavioral":
         return BEHAVIORAL_MODE_CHUNK_TEMPLATE
+    if _session_mode == "info":
+        return INFO_MODE_CHUNK_TEMPLATE
     if _session_mode == "free":
         return FREE_MODE_CHUNK_TEMPLATE
     return None
@@ -1049,7 +1084,7 @@ def handle_ws_extension_payload(payload: dict) -> None:
     if typ == "STATUS":
         msg = str(payload.get("message", "")).strip()
         if msg:
-            queue_ui_message(f"Extension: {msg}", "left")
+            queue_ui_message(f"Ext: {msg}", "left")
 
 
 class _StealthQMenu(QMenu):
@@ -1247,6 +1282,7 @@ class InterviewWindow(QWidget):
             ("read", "Read"),
             ("type", "Type"),
             ("behavioral", "Behavioral"),
+            ("info", "Info"),
             ("free", "Free"),
         ):
             act = QAction(title, self)
@@ -1458,7 +1494,7 @@ class InterviewWindow(QWidget):
         self._free_snip_btn.setIconSize(QSize(14, 14))
         self._free_snip_btn.setAccessibleName("Snip screen region")
         self._free_snip_btn.setStyleSheet(tiny_tool_ss)
-        self._free_snip_btn.setToolTip("Snip screen (sends with Send)")
+        self._free_snip_btn.setToolTip("Snip → Send")
         self._free_snip_btn.clicked.connect(self._on_free_snip_clicked)
         self._free_stub2_btn = QToolButton()
         self._free_stub2_btn.setObjectName("FreePromptTinyTool")
@@ -1627,6 +1663,7 @@ class InterviewWindow(QWidget):
             ("read_mode", "Read mode prompt"),
             ("type_mode", "Type mode prompt"),
             ("behavioral_mode", "Behavioral mode prompt"),
+            ("info_mode", "Info mode prompt"),
             ("free_mode", "Free mode prompt"),
         ):
             b = QPushButton(label)
@@ -1717,6 +1754,8 @@ class InterviewWindow(QWidget):
             text = TYPE_MODE_CHUNK_TEMPLATE
         elif kind == "behavioral_mode":
             text = BEHAVIORAL_MODE_CHUNK_TEMPLATE
+        elif kind == "info_mode":
+            text = INFO_MODE_CHUNK_TEMPLATE
         elif kind == "free_mode":
             text = FREE_MODE_CHUNK_TEMPLATE
         elif kind in ("resume_summary", "jd_summary", "initial_interview"):
@@ -1737,7 +1776,7 @@ class InterviewWindow(QWidget):
         self._settings_editor_dirty = self._settings_editor.toPlainText() != self._settings_snap_text
 
     def _on_settings_prompt_save_clicked(self) -> None:
-        global READ_MODE_CHUNK_TEMPLATE, TYPE_MODE_CHUNK_TEMPLATE, BEHAVIORAL_MODE_CHUNK_TEMPLATE, FREE_MODE_CHUNK_TEMPLATE
+        global READ_MODE_CHUNK_TEMPLATE, TYPE_MODE_CHUNK_TEMPLATE, BEHAVIORAL_MODE_CHUNK_TEMPLATE, INFO_MODE_CHUNK_TEMPLATE, FREE_MODE_CHUNK_TEMPLATE
         kind = self._settings_active_kind
         if not kind:
             return
@@ -1745,19 +1784,23 @@ class InterviewWindow(QWidget):
         if kind == "read_mode":
             READ_MODE_CHUNK_TEMPLATE = body
             _persist_mode_prompts_to_json()
-            self.show_toast("Read mode prompt saved.", level="success")
+            self.show_toast("Read mode saved.", level="success")
         elif kind == "type_mode":
             TYPE_MODE_CHUNK_TEMPLATE = body
             _persist_mode_prompts_to_json()
-            self.show_toast("Type mode prompt saved.", level="success")
+            self.show_toast("Type mode saved.", level="success")
         elif kind == "behavioral_mode":
             BEHAVIORAL_MODE_CHUNK_TEMPLATE = body
             _persist_mode_prompts_to_json()
-            self.show_toast("Behavioral mode prompt saved.", level="success")
+            self.show_toast("Behavioral saved.", level="success")
+        elif kind == "info_mode":
+            INFO_MODE_CHUNK_TEMPLATE = body
+            _persist_mode_prompts_to_json()
+            self.show_toast("Info mode saved.", level="success")
         elif kind == "free_mode":
             FREE_MODE_CHUNK_TEMPLATE = body
             _persist_mode_prompts_to_json()
-            self.show_toast("Free mode prompt saved.", level="success")
+            self.show_toast("Free mode saved.", level="success")
         elif kind in ("resume_summary", "jd_summary", "initial_interview"):
             cid = self._settings_effective_client_id()
             url = f"{self._bridge_base}/context/template/{kind}"
@@ -1766,21 +1809,19 @@ class InterviewWindow(QWidget):
                 post_body["client_id"] = cid
             payload, status = _http_post_json_local(url, post_body)
             if status >= 400 or str(payload.get("error", "")).strip():
-                self.show_toast(
-                    f"Could not save template: {payload.get('error', payload)!s}",
-                    level="error",
-                )
+                err = str(payload.get("error", "") or "").strip()
+                self.show_toast(f"Save failed: {err[:60]}" if err else "Save failed.", level="error")
                 return
             if str(payload.get("status", "")).lower() != "ok" and payload.get("ok") is not True:
-                self.show_toast("Could not save template: unexpected bridge response.", level="error")
+                self.show_toast("Save failed (bridge).", level="error")
                 return
             prompt_store.set_template(kind, body)
             if kind == "resume_summary":
-                self.show_toast("Resume summary template saved.", level="success")
+                self.show_toast("Resume template saved.", level="success")
             elif kind == "jd_summary":
-                self.show_toast("Job description template saved.", level="success")
+                self.show_toast("JD template saved.", level="success")
             elif kind == "initial_interview":
-                self.show_toast("Initial interview template saved.", level="success")
+                self.show_toast("Interview template saved.", level="success")
         self._settings_snap_text = body
         self._settings_editor_dirty = False
 
@@ -1804,11 +1845,11 @@ class InterviewWindow(QWidget):
         self._apply_shell_visual()
 
     def _set_session_mode_from_menu(self, mode: str) -> None:
-        """Set chunk-guidance mode from the top-bar menu (read / type / behavioral / free)."""
+        """Set chunk-guidance mode from the top-bar menu (read / type / behavioral / info / free)."""
         global _session_mode
         old = _session_mode
         m = (mode or "read").strip().lower()
-        if m not in ("read", "type", "behavioral", "free"):
+        if m not in ("read", "type", "behavioral", "info", "free"):
             m = "read"
         _session_mode = m
         self._update_session_mode_button()
@@ -1816,13 +1857,15 @@ class InterviewWindow(QWidget):
         if old == m:
             return
         if m == "type":
-            self.show_toast("Switched to Type mode.", level="success")
+            self.show_toast("Type mode.", level="success")
         elif m == "behavioral":
-            self.show_toast("Switched to Behavioral mode.", level="success")
+            self.show_toast("Behavioral mode.", level="success")
+        elif m == "info":
+            self.show_toast("Info mode.", level="success")
         elif m == "free":
-            self.show_toast("Free mode: use the prompt box and send (End does not send captions).", level="success")
+            self.show_toast("Free mode: prompt + Send.", level="success")
         else:
-            self.show_toast("Switched to Read mode.", level="success")
+            self.show_toast("Read mode.", level="success")
 
     def _update_session_mode_button(self) -> None:
         global _session_mode
@@ -1840,6 +1883,10 @@ class InterviewWindow(QWidget):
             )
             self.session_mode_btn.setText("Behavioral")
             self.session_mode_btn.setAccessibleName("Behavioral mode")
+        elif _session_mode == "info":
+            self.session_mode_btn.setIcon(self._build_info_mode_svg_icon(px, col))
+            self.session_mode_btn.setText("Info")
+            self.session_mode_btn.setAccessibleName("Info mode")
         elif _session_mode == "free":
             self.session_mode_btn.setIcon(self._build_free_mode_svg_icon(px, col))
             self.session_mode_btn.setText("Free")
@@ -1898,7 +1945,7 @@ class InterviewWindow(QWidget):
         raw = (te.toPlainText() or "").strip()
         img = (getattr(self, "_free_attach_png_b64", None) or "").strip() or None
         if not raw and not img:
-            self.show_toast("Type a prompt or attach a screenshot.", level="warning")
+            self.show_toast("Need text or snip.", level="warning")
             return
         img_copy = img
         self._clear_free_snip_attachment()
@@ -1914,7 +1961,7 @@ class InterviewWindow(QWidget):
         self._free_attach_png_b64 = None
         btn = getattr(self, "_free_snip_btn", None)
         if btn is not None:
-            btn.setToolTip("Snip screen (sends with Send)")
+            btn.setToolTip("Snip → Send")
 
     def _finish_free_snip(self, img: QImage | None) -> None:
         self._free_snip_session_active = False
@@ -1922,13 +1969,13 @@ class InterviewWindow(QWidget):
             return
         b64 = _image_to_png_base64(img)
         if not b64:
-            self.show_toast("Could not encode screenshot.", level="error")
+            self.show_toast("Snip encode failed.", level="error")
             return
         self._free_attach_png_b64 = b64
         btn = getattr(self, "_free_snip_btn", None)
         if btn is not None:
-            btn.setToolTip("Screenshot ready — sends with Send (click snip to replace)")
-        self.show_toast("Screenshot attached. Add text if you want, then Send.", level="info")
+            btn.setToolTip("Snip attached. Send.")
+        self.show_toast("Snip ready. Send.", level="info")
 
     def _set_interview_topmost(self, on: bool) -> None:
         """Temporarily drop always-on-top so Windows snip (or our overlay) can sit above this window."""
@@ -1988,7 +2035,7 @@ class InterviewWindow(QWidget):
         self._set_interview_topmost(True)
         if cancelled or im is None or im.isNull():
             if cancelled:
-                self.show_toast("Snip cancelled or timed out.", level="warning")
+                self.show_toast("Snip cancelled.", level="warning")
             return
         self._finish_free_snip(im)
 
@@ -2005,10 +2052,7 @@ class InterviewWindow(QWidget):
         self._free_snip_session_active = True
         self._stop_os_snip_poll()
         self._set_interview_topmost(False)
-        self.show_toast(
-            "Windows snip (Win+Shift+S): drag a region, release — image attaches to Send.",
-            level="info",
-        )
+        self.show_toast("Snip: Win+Shift+S, then Send.", level="info")
         self._snip_poll_timer.start()
         threading.Thread(target=_win_send_snip_hotkey_worker, daemon=True).start()
 
@@ -2021,7 +2065,7 @@ class InterviewWindow(QWidget):
         except Exception:
             self._free_snip_session_active = False
             self._set_interview_topmost(True)
-            self.show_toast("Could not capture screen.", level="error")
+            self.show_toast("Screen grab failed.", level="error")
             return
 
         def _done(im: QImage | None) -> None:
@@ -2047,7 +2091,7 @@ class InterviewWindow(QWidget):
             self._begin_custom_snip_overlay_fallback()
 
     def _on_free_stub_tool_clicked(self) -> None:
-        self.show_toast("Reserved for a future tool.", level="info")
+        self.show_toast("Reserved.", level="info")
 
     def _apply_shell_visual(self) -> None:
         """Only the shell panel background fades; labels/buttons stay opaque."""
@@ -2263,74 +2307,96 @@ class InterviewWindow(QWidget):
         duration_ms: int | None = None,
     ) -> None:
         lvl = (level or "success").strip().lower()
-        if lvl not in ("success", "warning", "error"):
+        if lvl not in ("success", "warning", "error", "info"):
             lvl = "success"
         host = getattr(self, "_toast_host", None)
         if host is None:
             return
         if lvl == "error":
-            default_msg = "Something went wrong."
+            default_msg = "Error."
         elif lvl == "warning":
-            default_msg = "Notice."
+            default_msg = "Heads up."
+        elif lvl == "info":
+            default_msg = "FYI."
         else:
-            default_msg = "Done."
-        text = _toast_trim_message((message or "").strip() or default_msg)
+            default_msg = "Saved."
+        raw = _toast_trim_message((message or "").strip() or default_msg)
         self._sync_toast_host_geometry()
         host.raise_()
         frame = QFrame(host)
-        frame.setObjectName({"success": "ToastSuccess", "warning": "ToastWarning", "error": "ToastError"}[lvl])
+        frame.setObjectName(
+            {
+                "success": "ToastSuccess",
+                "warning": "ToastWarning",
+                "error": "ToastError",
+                "info": "ToastInfo",
+            }[lvl]
+        )
         frame.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
         fs = _TOAST_FONT_PX
         styles = {
-            "success": f"""
-                QFrame#ToastSuccess {{
-                    background-color: rgba(46, 125, 50, 0.94);
-                    border-radius: 8px;
-                    border: 1px solid rgba(165, 214, 167, 0.55);
-                }}
-                QFrame#ToastSuccess QLabel {{
-                    color: #e8f5e9;
-                    font-size: {fs}px;
-                    font-weight: 600;
-                    padding: 5px 10px;
+            "success": """
+                QFrame#ToastSuccess {
+                    background-color: rgba(21, 87, 36, 0.96);
+                    border-radius: 10px;
+                    border: none;
+                }
+                QFrame#ToastSuccess QLabel {
+                    color: #ffffff;
                     background: transparent;
-                }}
+                    padding: 12px 20px;
+                }
             """,
-            "warning": f"""
-                QFrame#ToastWarning {{
-                    background-color: rgba(230, 81, 0, 0.94);
-                    border-radius: 8px;
-                    border: 1px solid rgba(255, 224, 178, 0.55);
-                }}
-                QFrame#ToastWarning QLabel {{
-                    color: #fff8e1;
-                    font-size: {fs}px;
-                    font-weight: 600;
-                    padding: 5px 10px;
+            "warning": """
+                QFrame#ToastWarning {
+                    background-color: rgba(191, 54, 12, 0.96);
+                    border-radius: 10px;
+                    border: none;
+                }
+                QFrame#ToastWarning QLabel {
+                    color: #fffaf0;
                     background: transparent;
-                }}
+                    padding: 12px 20px;
+                }
             """,
-            "error": f"""
-                QFrame#ToastError {{
-                    background-color: rgba(183, 28, 28, 0.94);
-                    border-radius: 8px;
-                    border: 1px solid rgba(255, 205, 210, 0.45);
-                }}
-                QFrame#ToastError QLabel {{
-                    color: #ffebee;
-                    font-size: {fs}px;
-                    font-weight: 600;
-                    padding: 5px 10px;
+            "error": """
+                QFrame#ToastError {
+                    background-color: rgba(127, 29, 29, 0.96);
+                    border-radius: 10px;
+                    border: none;
+                }
+                QFrame#ToastError QLabel {
+                    color: #fff5f5;
                     background: transparent;
-                }}
+                    padding: 12px 20px;
+                }
+            """,
+            "info": """
+                QFrame#ToastInfo {
+                    background-color: rgba(30, 41, 59, 0.96);
+                    border-radius: 10px;
+                    border: none;
+                }
+                QFrame#ToastInfo QLabel {
+                    color: #f1f5f9;
+                    background: transparent;
+                    padding: 12px 20px;
+                }
             """,
         }
         frame.setStyleSheet(styles[lvl])
         lay = QHBoxLayout(frame)
         lay.setContentsMargins(0, 0, 0, 0)
-        lbl = QLabel(text)
-        lbl.setWordWrap(True)
-        lbl.setMaximumWidth(_TOAST_LABEL_MAX_WIDTH)
+        max_inner = min(_TOAST_LABEL_MAX_WIDTH, max(120, self.width() - 48))
+        fqt = QFont()
+        fqt.setPixelSize(fs)
+        fqt.setWeight(QFont.Weight.Black)
+        fm = QFontMetrics(fqt)
+        elided = fm.elidedText(raw, Qt.TextElideMode.ElideRight, max_inner - 8)
+        lbl = QLabel(elided)
+        lbl.setFont(fqt)
+        lbl.setWordWrap(False)
+        lbl.setMaximumWidth(max_inner)
         lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
         lbl.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
         lay.addWidget(lbl)
@@ -2349,6 +2415,8 @@ class InterviewWindow(QWidget):
                 linger = _TOAST_LINGER_ERROR_MS
             elif lvl == "warning":
                 linger = _TOAST_LINGER_WARNING_MS
+            elif lvl == "info":
+                linger = _TOAST_LINGER_INFO_MS
             else:
                 linger = _TOAST_LINGER_SUCCESS_MS
         else:
@@ -2493,6 +2561,19 @@ class InterviewWindow(QWidget):
         svg = f"""<svg xmlns="http://www.w3.org/2000/svg" width="{size}" height="{size}" viewBox="0 0 24 24">
 <path fill="{color}" d="M5 4.5h8.5A2.25 2.25 0 0 1 15.75 6.75v3.5A2.25 2.25 0 0 1 13.5 12.5h-1.9L9.25 15.5V12.5H5A2.25 2.25 0 0 1 2.75 10.25v-3.5A2.25 2.25 0 0 1 5 4.5z"/>
 <path fill="{color}" d="M10.25 9.75h7A1.85 1.85 0 0 1 19.1 11.6v2.65a1.85 1.85 0 0 1-1.85 1.85h-1.35l-1.6 2.55v-2.55h-1.05A1.85 1.85 0 0 1 12.4 14.25v-2.65a1.85 1.85 0 0 1 1.85-1.85z"/>
+</svg>"""
+        renderer = QSvgRenderer(svg.encode("utf-8"))
+        pixmap = QPixmap(size, size)
+        pixmap.fill(Qt.GlobalColor.transparent)
+        painter = QPainter(pixmap)
+        renderer.render(painter)
+        painter.end()
+        return QIcon(pixmap)
+
+    @staticmethod
+    def _build_info_mode_svg_icon(size: int, color: str) -> QIcon:
+        svg = f"""<svg xmlns="http://www.w3.org/2000/svg" width="{size}" height="{size}" viewBox="0 0 24 24">
+<path fill="{color}" d="M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm1 15h-2v-6h2v6zm0-8h-2V7h2v2z"/>
 </svg>"""
         renderer = QSvgRenderer(svg.encode("utf-8"))
         pixmap = QPixmap(size, size)
@@ -2692,17 +2773,14 @@ class InterviewWindow(QWidget):
         try:
             self._write_transcript_file(out)
         except OSError as exc:
-            self.show_toast(f"Could not save transcript file: {exc}", level="error")
+            self.show_toast(f"Transcript save failed: {exc}", level="error")
             return False
-        self.show_toast(f"Saved: {out.name}", level="success")
+        self.show_toast(f"Saved {out.name}", level="success")
         return True
 
     def _on_save_transcript_clicked(self) -> None:
         if not interview_history_has_interviewer_lines():
-            self.show_toast(
-                "No interviewer captions in this session yet — nothing to save.",
-                level="warning",
-            )
+            self.show_toast("Nothing to save yet.", level="warning")
             return
         self._prompt_save_transcript_interactive()
 
@@ -2736,10 +2814,7 @@ class InterviewWindow(QWidget):
             try:
                 self._write_transcript_file(path)
             except OSError as exc:
-                self.show_toast(
-                    f"Could not autosave transcript to {path.name}: {exc}",
-                    level="error",
-                )
+                self.show_toast(f"Autosave failed: {path.name}", level="error")
                 event.ignore()
                 return
         self._shutdown_services()
@@ -3425,13 +3500,13 @@ class InterviewWindow(QWidget):
             elif t == "caption_edit_spawn_new_draft":
                 self._spawn_new_draft_while_editing()
             elif t == "message":
-                self.show_toast(str(event.get("text", "") or "").strip() or "Notice.", level="warning")
+                self.show_toast(str(event.get("text", "") or "").strip() or "Heads up.", level="warning")
             elif t == "f9_paste":
                 text = str(event.get("text", "") or "")
                 replace_all = bool(event.get("replace_all", False))
                 app_inst = QApplication.instance()
                 if app_inst is None:
-                    self.show_toast("Could not set clipboard.", level="error")
+                    self.show_toast("Clipboard failed.", level="error")
                     continue
                 try:
                     app_inst.clipboard().setText(text)
@@ -3440,10 +3515,10 @@ class InterviewWindow(QWidget):
                         try:
                             _win32_set_clipboard_unicode(text)
                         except OSError:
-                            self.show_toast("Could not set clipboard.", level="error")
+                            self.show_toast("Clipboard failed.", level="error")
                             continue
                     else:
-                        self.show_toast("Could not set clipboard.", level="error")
+                        self.show_toast("Clipboard failed.", level="error")
                         continue
                 threading.Thread(
                     target=_do_keyboard_paste_only, args=(replace_all,), daemon=True
@@ -3757,7 +3832,7 @@ def process_chunk(raw_chunk, history_source="sent_gpt", image_png_base64=None):
         return
     if img:
         queue_ui_message(
-            "Extension not connected: screenshots cannot be sent over HTTP. Reconnect the bridge tab or send text only.",
+            "Snip needs Chrome extension.",
             "left",
         )
         if not user_text:
@@ -3820,10 +3895,7 @@ def on_press(key):
                 queue_caption_edit_spawn_new_draft()
                 return
             if _session_mode == "free":
-                queue_ui_message(
-                    "Free mode: use the prompt box and send (End does not send live captions).",
-                    "left",
-                )
+                queue_ui_message("Free mode: prompt + Send.", "left")
                 return
             text = snapshot_chunk_since_last_end()
             if text:
@@ -3834,7 +3906,7 @@ def on_press(key):
                 queue_new_empty_draft()
                 threading.Thread(target=process_chunk, args=(text,), daemon=True).start()
             else:
-                queue_ui_message("No captured text yet.", "left")
+                queue_ui_message("No caption yet.", "left")
     except AttributeError:
         pass
 
