@@ -1,0 +1,69 @@
+<ResourceDictionary xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+                    xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+                    xmlns:sys="clr-namespace:System;assembly=mscorlib">
+
+  <!-- Matches Windows Live Captions / shell UI: clean Segoe, dark ink, no mono. -->
+  <FontFamily x:Key="AppFontFamily">Segoe UI, Segoe UI Variable Text, Segoe UI Variable Display, sans-serif</FontFamily>
+  <sys:Double x:Key="AppFontSizeBody">13</sys:Double>
+  <sys:Double x:Key="AppFontSizeCaption">16</sys:Double>
+  <sys:Double x:Key="AppFontSizeSmall">11</sys:Double>
+  <sys:Double x:Key="AppFontSizeTitle">18</sys:Double>
+  <Color x:Key="AppTextColor">#111111</Color>
+  <SolidColorBrush x:Key="AppTextBrush" Color="{StaticResource AppTextColor}" />
+
+  <Style TargetType="{x:Type Control}">
+    <Setter Property="FontFamily" Value="{StaticResource AppFontFamily}" />
+    <Setter Property="TextOptions.TextFormattingMode" Value="Display" />
+    <Setter Property="TextOptions.TextRenderingMode" Value="ClearType" />
+  </Style>
+
+  <Style TargetType="{x:Type TextBlock}">
+    <Setter Property="FontFamily" Value="{StaticResource AppFontFamily}" />
+    <Setter Property="FontSize" Value="{StaticResource AppFontSizeBody}" />
+    <Setter Property="Foreground" Value="{StaticResource AppTextBrush}" />
+    <Setter Property="TextOptions.TextFormattingMode" Value="Display" />
+    <Setter Property="TextOptions.TextRenderingMode" Value="ClearType" />
+  </Style>
+
+  <Style TargetType="{x:Type TextBox}">
+    <Setter Property="FontFamily" Value="{StaticResource AppFontFamily}" />
+    <Setter Property="FontSize" Value="{StaticResource AppFontSizeBody}" />
+    <Setter Property="FontWeight" Value="Normal" />
+    <Setter Property="Foreground" Value="{StaticResource AppTextBrush}" />
+    <Setter Property="TextOptions.TextFormattingMode" Value="Display" />
+    <Setter Property="TextOptions.TextRenderingMode" Value="ClearType" />
+  </Style>
+
+  <Style TargetType="{x:Type Button}">
+    <Setter Property="FontFamily" Value="{StaticResource AppFontFamily}" />
+    <Setter Property="TextOptions.TextFormattingMode" Value="Display" />
+    <Setter Property="TextOptions.TextRenderingMode" Value="ClearType" />
+  </Style>
+
+  <Style TargetType="{x:Type Label}">
+    <Setter Property="FontFamily" Value="{StaticResource AppFontFamily}" />
+    <Setter Property="Foreground" Value="{StaticResource AppTextBrush}" />
+  </Style>
+
+  <Style TargetType="{x:Type Window}">
+    <Setter Property="FontFamily" Value="{StaticResource AppFontFamily}" />
+    <Setter Property="TextOptions.TextFormattingMode" Value="Display" />
+    <Setter Property="TextOptions.TextRenderingMode" Value="ClearType" />
+  </Style>
+
+  <Style x:Key="CaptionBubbleTextStyle" TargetType="{x:Type TextBlock}">
+    <Setter Property="FontFamily" Value="{StaticResource AppFontFamily}" />
+    <Setter Property="FontSize" Value="{StaticResource AppFontSizeCaption}" />
+    <Setter Property="FontWeight" Value="Normal" />
+    <Setter Property="Foreground" Value="{StaticResource AppTextBrush}" />
+    <Setter Property="TextWrapping" Value="Wrap" />
+    <Setter Property="TextOptions.TextFormattingMode" Value="Display" />
+    <Setter Property="TextOptions.TextRenderingMode" Value="ClearType" />
+  </Style>
+
+  <Style x:Key="SettingsEditorTextStyle" TargetType="{x:Type TextBox}" BasedOn="{StaticResource {x:Type TextBox}}">
+    <Setter Property="FontSize" Value="{StaticResource AppFontSizeBody}" />
+    <Setter Property="FontWeight" Value="Normal" />
+    <Setter Property="Foreground" Value="#1E293B" />
+  </Style>
+</ResourceDictionary>

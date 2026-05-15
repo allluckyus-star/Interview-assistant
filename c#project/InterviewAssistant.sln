@@ -1,0 +1,31 @@
+
+Microsoft Visual Studio Solution File, Format Version 12.00
+# Visual Studio Version 17
+VisualStudioVersion = 17.0.31903.59
+MinimumVisualStudioVersion = 10.0.40219.1
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "InterviewAssistant.Core", "src\InterviewAssistant.Core\InterviewAssistant.Core.csproj", "{6B5C8F1A-0D2E-4F1B-9C3A-1E8F7D6C5B4A}"
+EndProject
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "InterviewAssistant.Bridge", "src\InterviewAssistant.Bridge\InterviewAssistant.Bridge.csproj", "{7C6D9E2B-1E3F-5A2C-AD4B-2F9A8E7D6C5B}"
+EndProject
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "InterviewAssistant.App", "src\InterviewAssistant.App\InterviewAssistant.App.csproj", "{8D7EAF3C-2F4A-6B3D-BE5C-3AAB9F8E7D6C}"
+EndProject
+Global
+	GlobalSection(SolutionConfigurationPlatforms) = preSolution
+		Debug|Any CPU = Debug|Any CPU
+		Release|Any CPU = Release|Any CPU
+	EndGlobalSection
+	GlobalSection(ProjectConfigurationPlatforms) = postSolution
+		{6B5C8F1A-0D2E-4F1B-9C3A-1E8F7D6C5B4A}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{6B5C8F1A-0D2E-4F1B-9C3A-1E8F7D6C5B4A}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{6B5C8F1A-0D2E-4F1B-9C3A-1E8F7D6C5B4A}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{6B5C8F1A-0D2E-4F1B-9C3A-1E8F7D6C5B4A}.Release|Any CPU.Build.0 = Release|Any CPU
+		{7C6D9E2B-1E3F-5A2C-AD4B-2F9A8E7D6C5B}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{7C6D9E2B-1E3F-5A2C-AD4B-2F9A8E7D6C5B}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{7C6D9E2B-1E3F-5A2C-AD4B-2F9A8E7D6C5B}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{7C6D9E2B-1E3F-5A2C-AD4B-2F9A8E7D6C5B}.Release|Any CPU.Build.0 = Release|Any CPU
+		{8D7EAF3C-2F4A-6B3D-BE5C-3AAB9F8E7D6C}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{8D7EAF3C-2F4A-6B3D-BE5C-3AAB9F8E7D6C}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{8D7EAF3C-2F4A-6B3D-BE5C-3AAB9F8E7D6C}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{8D7EAF3C-2F4A-6B3D-BE5C-3AAB9F8E7D6C}.Release|Any CPU.Build.0 = Release|Any CPU
+	EndGlobalSection
+EndGlobal

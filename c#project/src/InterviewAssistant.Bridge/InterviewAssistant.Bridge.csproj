@@ -1,0 +1,10 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <TargetFramework>net8.0</TargetFramework>
+    <RootNamespace>InterviewAssistant.Bridge</RootNamespace>
+    <AssemblyName>InterviewAssistant.Bridge</AssemblyName>
+  </PropertyGroup>
+  <ItemGroup>
+    <ProjectReference Include="..\InterviewAssistant.Core\InterviewAssistant.Core.csproj" />
+  </ItemGroup>
+</Project>
