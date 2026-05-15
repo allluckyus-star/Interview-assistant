@@ -131,6 +131,7 @@ public partial class MainWindow : Window
         GptImageIconHost.Child = TopBarIcons.CreateImageIcon(14, "#111111");
         GptTextIconHost.Child = TopBarIcons.CreateTextGlyphIcon(14, "#111111");
         GptFolderIconHost.Child = TopBarIcons.CreateFolderIcon(14, "#111111");
+        WindowTaskbarHiding.Apply(this);
         ApplyWizardUi();
     }
 
