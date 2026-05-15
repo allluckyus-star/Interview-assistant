@@ -3,13 +3,15 @@ using System.Runtime.InteropServices;
 
 namespace InterviewAssistant.App.Services;
 
-/// <summary>Global End / Delete hooks (mirrors live.py on_press).</summary>
+/// <summary>Global low-level hook for End / Delete (interview).</summary>
 public sealed class InterviewHotkeyService : IDisposable
 {
     private const int WhKeyboardLl = 13;
     private const int WmKeydown = 0x0100;
+    private const int WmSyskeydown = 0x0104;
     private const int VkEnd = 0x23;
     private const int VkDelete = 0x2E;
+    private const int LlkhfUp = unchecked((int)0x80000000);
 
     private readonly LowLevelKeyboardProc _proc;
     private IntPtr _hook = IntPtr.Zero;
@@ -20,6 +22,8 @@ public sealed class InterviewHotkeyService : IDisposable
 
     private double _lastEnd;
     private double _lastDelete;
+
+    public bool IsActive => _hook != IntPtr.Zero;
 
     public event Action? EndPressed;
     public event Action? DeletePressed;
@@ -36,20 +40,23 @@ public sealed class InterviewHotkeyService : IDisposable
             return;
         try
         {
-            // hMod = 0 is correct for WH_KEYBOARD_LL (in-process low-level hook).
-            _hook = SetWindowsHookEx(WhKeyboardLl, _proc, IntPtr.Zero, 0);
+            var moduleName = Process.GetCurrentProcess().MainModule?.ModuleName;
+            var module = string.IsNullOrEmpty(moduleName)
+                ? GetModuleHandle(null)
+                : GetModuleHandle(moduleName);
+            _hook = SetWindowsHookEx(WhKeyboardLl, _proc, module, 0);
             if (_hook == IntPtr.Zero)
             {
                 var err = Marshal.GetLastWin32Error();
-                Trace.WriteLine($"[InterviewAssistant] Global hotkeys failed (error {err})");
+                Trace.WriteLine($"[InterviewAssistant] End/Delete hotkey hook failed (error {err})");
                 return;
             }
 
-            Trace.WriteLine("[InterviewAssistant] Global hotkeys active (End/Delete)");
+            Trace.WriteLine("[InterviewAssistant] End/Delete global hotkeys active");
         }
         catch (Exception ex)
         {
-            Trace.WriteLine($"[InterviewAssistant] Global hotkeys failed: {ex.Message}");
+            Trace.WriteLine($"[InterviewAssistant] End/Delete hotkey hook failed: {ex.Message}");
             _hook = IntPtr.Zero;
         }
     }
@@ -65,11 +72,15 @@ public sealed class InterviewHotkeyService : IDisposable
 
     private IntPtr HookCallback(int nCode, IntPtr wParam, IntPtr lParam)
     {
-        if (nCode >= 0 && wParam == (IntPtr)WmKeydown && _hook != IntPtr.Zero)
+        if (nCode >= 0 && _hook != IntPtr.Zero && IsKeyDownMessage(wParam))
         {
             try
             {
-                var vk = Marshal.ReadInt32(lParam);
+                var vk = Marshal.ReadInt32(lParam, 0);
+                var flags = Marshal.ReadInt32(lParam, 8);
+                if ((flags & LlkhfUp) != 0)
+                    return CallNextHookEx(_hook, nCode, wParam, lParam);
+
                 var now = Environment.TickCount64 / 1000.0;
                 switch (vk)
                 {
@@ -100,6 +111,9 @@ public sealed class InterviewHotkeyService : IDisposable
         return CallNextHookEx(_hook, nCode, wParam, lParam);
     }
 
+    private static bool IsKeyDownMessage(IntPtr wParam) =>
+        wParam == (IntPtr)WmKeydown || wParam == (IntPtr)WmSyskeydown;
+
     public void Dispose()
     {
         Stop();
@@ -109,7 +123,7 @@ public sealed class InterviewHotkeyService : IDisposable
 
     private delegate IntPtr LowLevelKeyboardProc(int nCode, IntPtr wParam, IntPtr lParam);
 
-    [DllImport("user32.dll", CharSet = CharSet.Auto, SetLastError = true)]
+    [DllImport("user32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
     private static extern IntPtr SetWindowsHookEx(int idHook, LowLevelKeyboardProc lpfn, IntPtr hMod, uint dwThreadId);
 
     [DllImport("user32.dll", CharSet = CharSet.Auto, SetLastError = true)]
@@ -118,4 +132,7 @@ public sealed class InterviewHotkeyService : IDisposable
 
     [DllImport("user32.dll", CharSet = CharSet.Auto, SetLastError = true)]
     private static extern IntPtr CallNextHookEx(IntPtr hhk, int nCode, IntPtr wParam, IntPtr lParam);
+
+    [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+    private static extern IntPtr GetModuleHandle(string? lpModuleName);
 }

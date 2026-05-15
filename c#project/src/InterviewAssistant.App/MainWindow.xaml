@@ -78,8 +78,8 @@
                     SmallChange="1"
                     LargeChange="10"
                     IsSnapToTickEnabled="False"
-                    ToolTip="Drag to fade the entire window."
-                    Value="100"
+                    ToolTip="Drag to fade the window. Alt+Shift+1 = recent opacity, Alt+Shift+2 = hide (0%)."
+                    Value="80"
                     ValueChanged="OpacitySlider_OnValueChanged" />
           </StackPanel>
         </Grid>
@@ -114,6 +114,13 @@
                 <TextBlock x:Name="SessionModeLabel" VerticalAlignment="Center" Text="Read" />
               </StackPanel>
             </Button>
+            <ToggleButton x:Name="StealthToggleButton"
+                          Style="{StaticResource TopBarCyanCircleToggleStyle}"
+                          Margin="0,0,6,0"
+                          Click="StealthToggleButton_OnClick"
+                          ToolTip="Stealth: hidden from screen capture">
+              <Viewbox x:Name="StealthIconHost" Width="16" Height="16" />
+            </ToggleButton>
             <Button x:Name="SaveTranscriptButton"
                     Style="{StaticResource TopBarCyanCircleButtonStyle}"
                     Margin="0,0,6,0"

@@ -157,6 +157,54 @@
     </Setter>
   </Style>
 
+  <Style x:Key="TopBarCyanCircleToggleStyle" TargetType="ToggleButton">
+    <Setter Property="OverridesDefaultStyle" Value="True" />
+    <Setter Property="Width" Value="28" />
+    <Setter Property="Height" Value="28" />
+    <Setter Property="Padding" Value="0" />
+    <Setter Property="Background" Value="#b2ebf2" />
+    <Setter Property="BorderThickness" Value="0" />
+    <Setter Property="Cursor" Value="Hand" />
+    <Setter Property="Template">
+      <Setter.Value>
+        <ControlTemplate TargetType="ToggleButton">
+          <Border x:Name="Bd"
+                  Width="28"
+                  Height="28"
+                  Background="#b2ebf2"
+                  CornerRadius="14">
+            <Border.Effect>
+              <DropShadowEffect BlurRadius="14" ShadowDepth="2" Opacity="0.22" Color="#000000" />
+            </Border.Effect>
+            <ContentPresenter HorizontalAlignment="Center" VerticalAlignment="Center" />
+          </Border>
+          <ControlTemplate.Triggers>
+            <Trigger Property="IsChecked" Value="True">
+              <Setter TargetName="Bd" Property="Background" Value="#4dd0e1" />
+            </Trigger>
+            <Trigger Property="IsMouseOver" Value="True">
+              <Setter TargetName="Bd" Property="Background" Value="#80deea" />
+              <Setter TargetName="Bd" Property="Opacity" Value="0.92" />
+            </Trigger>
+            <MultiTrigger>
+              <MultiTrigger.Conditions>
+                <Condition Property="IsMouseOver" Value="True" />
+                <Condition Property="IsChecked" Value="True" />
+              </MultiTrigger.Conditions>
+              <Setter TargetName="Bd" Property="Background" Value="#26c6da" />
+            </MultiTrigger>
+            <Trigger Property="IsPressed" Value="True">
+              <Setter TargetName="Bd" Property="Opacity" Value="0.85" />
+            </Trigger>
+            <Trigger Property="IsEnabled" Value="False">
+              <Setter TargetName="Bd" Property="Opacity" Value="0.45" />
+            </Trigger>
+          </ControlTemplate.Triggers>
+        </ControlTemplate>
+      </Setter.Value>
+    </Setter>
+  </Style>
+
   <Style x:Key="TopBarCloseCircleButtonStyle" TargetType="Button" BasedOn="{StaticResource TopBarCyanCircleButtonStyle}">
     <Setter Property="Template">
       <Setter.Value>

@@ -58,7 +58,9 @@ public partial class MainWindow : Window
     private bool _sendInProgress;
     private readonly string _webViewUserDataDir;
     private readonly DispatcherTimer _loginPollTimer;
-    private double _lastChatPageOpacity01 = 1.0;
+    private const double DefaultOpacityFraction = 0.8;
+    private double _recentOpacity = DefaultOpacityFraction;
+    private double _lastChatPageOpacity01 = DefaultOpacityFraction;
     private readonly SemaphoreSlim _webViewScriptGate = new(1, 1);
     private readonly ConcurrentDictionary<string, TaskCompletionSource<GptSendResult>> _prepSendCompletes = new();
     private readonly ConcurrentDictionary<string, TaskCompletionSource<GptSendResult>> _attachCompletes = new();
@@ -68,11 +70,15 @@ public partial class MainWindow : Window
         PropertyNameCaseInsensitive = true,
     };
 
+    private readonly InterviewHotkeyService _hotkeys = new();
+    private readonly OpacityWindowHotkeys _opacityHotkeys;
     private readonly InterviewSessionCoordinator _interview;
     private bool _interviewSessionActive;
     private bool _settingsViewActive;
     private bool _chunkSendInProgress;
     private bool _snipInProgress;
+    private bool _captureStealthEnabled = WindowCaptureStealth.IsSupported;
+    private DispatcherTimer? _stealthAffinityTimer;
     private readonly string? _startupToastMessage;
     private readonly ToastLevel _startupToastLevel;
     private string _latestGptAnswer = "";
@@ -84,7 +90,13 @@ public partial class MainWindow : Window
         ToastService.Register(AppToastHost);
         _startupToastMessage = startupToastMessage;
         _startupToastLevel = startupToastLevel;
-        _interview = new InterviewSessionCoordinator(promptStore, bridgeHost, bridgePort);
+        _opacityHotkeys = new OpacityWindowHotkeys(this);
+        _opacityHotkeys.OpacityFullPressed += () =>
+            Dispatcher.BeginInvoke(RestoreRecentOpacityWithHotkey);
+        _opacityHotkeys.OpacityZeroPressed += () =>
+            Dispatcher.BeginInvoke(HideOpacityWithHotkey);
+        _opacityHotkeys.Attach();
+        _interview = new InterviewSessionCoordinator(promptStore, bridgeHost, bridgePort, _hotkeys);
         WireInterviewSession();
         InitInterviewTopBarIcons();
         InterviewSettingsPanel.Bind(_interview.ModePrompts);
@@ -106,6 +118,14 @@ public partial class MainWindow : Window
         Directory.CreateDirectory(_webViewUserDataDir);
         _loginPollTimer = new DispatcherTimer { Interval = TimeSpan.FromMilliseconds(550) };
         _loginPollTimer.Tick += LoginPollTimer_OnTick;
+        _stealthAffinityTimer = new DispatcherTimer { Interval = TimeSpan.FromMilliseconds(80) };
+        _stealthAffinityTimer.Tick += (_, _) =>
+        {
+            _stealthAffinityTimer?.Stop();
+            ApplyCaptureStealth();
+        };
+        SizeChanged += (_, _) => ScheduleCaptureStealthSync();
+        LocationChanged += (_, _) => ScheduleCaptureStealthSync();
         ApplyShellPrepChrome();
         GptCopyResultIconHost.Child = TopBarIcons.CreateCopyGlyphIcon(14, "#111111");
         GptImageIconHost.Child = TopBarIcons.CreateImageIcon(14, "#111111");
@@ -154,7 +174,59 @@ public partial class MainWindow : Window
         SessionModeIconHost.Child = TopBarIcons.CreateReadModeIcon(16);
         SaveTranscriptIconHost.Child = TopBarIcons.CreateSaveIcon(16);
         SettingsNavIconHost.Child = TopBarIcons.CreateKebabIcon(16);
+        StealthToggleButton.IsEnabled = WindowCaptureStealth.IsSupported;
+        StealthToggleButton.IsChecked = _captureStealthEnabled;
+        UpdateStealthToggleUi();
         UpdateSessionModeButtonUi("read");
+    }
+
+    protected override void OnSourceInitialized(EventArgs e)
+    {
+        base.OnSourceInitialized(e);
+        ApplyCaptureStealth();
+    }
+
+    private void ScheduleCaptureStealthSync()
+    {
+        if (!WindowCaptureStealth.IsSupported || !_captureStealthEnabled)
+            return;
+        _stealthAffinityTimer?.Stop();
+        _stealthAffinityTimer?.Start();
+    }
+
+    private void ApplyCaptureStealth()
+    {
+        if (!WindowCaptureStealth.IsSupported)
+            return;
+        WindowCaptureStealth.SetEnabled(this, _captureStealthEnabled);
+    }
+
+    private void UpdateStealthToggleUi()
+    {
+        var stealthed = _captureStealthEnabled && WindowCaptureStealth.IsSupported;
+        StealthIconHost.Child = TopBarIcons.CreateHumanStealthIcon(16, "#111111", stealthed);
+        StealthToggleButton.IsChecked = stealthed;
+        StealthToggleButton.ToolTip = stealthed
+            ? "Stealth on — hidden from screen capture / share"
+            : WindowCaptureStealth.IsSupported
+                ? "Stealth off — visible in screen capture / share"
+                : "Stealth requires Windows";
+    }
+
+    private void StealthToggleButton_OnClick(object sender, RoutedEventArgs e)
+    {
+        if (!WindowCaptureStealth.IsSupported)
+            return;
+
+        _captureStealthEnabled = StealthToggleButton.IsChecked == true;
+        ApplyCaptureStealth();
+        ScheduleCaptureStealthSync();
+        UpdateStealthToggleUi();
+        ToastService.Show(
+            _captureStealthEnabled
+                ? "Stealth on — window hidden from capture."
+                : "Stealth off — window visible in capture.",
+            ToastLevel.Info);
     }
 
     private void UpdateSessionModeButtonUi(string mode)
@@ -669,14 +741,47 @@ public partial class MainWindow : Window
     {
         if (!IsLoaded)
             return;
-        ApplyContentOpacity(OpacitySlider.Value / 100.0);
+        var fraction = OpacitySlider.Value / 100.0;
+        if (fraction > 0.01)
+            _recentOpacity = fraction;
+        ApplyContentOpacity(fraction);
     }
 
     private void MainWindow_OnLoaded(object sender, RoutedEventArgs e)
     {
         if (!string.IsNullOrWhiteSpace(_startupToastMessage))
             ToastService.Show(_startupToastMessage, _startupToastLevel);
+        _hotkeys.Start();
+        if (!_opacityHotkeys.IsRegistered)
+            ToastService.Show("Alt+Shift+1/2 not registered (another app may own that combo).", ToastLevel.Warning);
         _ = EnsureWebViewAsync();
+    }
+
+    private void HideOpacityWithHotkey()
+    {
+        if (!IsLoaded)
+            return;
+        var current = Opacity;
+        if (current > 0.01)
+            _recentOpacity = current;
+        SetOpacityFromHotkey(0, "Alt+Shift+2");
+    }
+
+    private void RestoreRecentOpacityWithHotkey()
+    {
+        if (!IsLoaded)
+            return;
+        SetOpacityFromHotkey(_recentOpacity, "Alt+Shift+1");
+    }
+
+    private void SetOpacityFromHotkey(double fraction, string shortcutLabel)
+    {
+        if (!IsLoaded)
+            return;
+        OpacitySlider.Value = fraction * 100.0;
+        ApplyContentOpacity(fraction);
+        var pct = (int)Math.Round(fraction * 100);
+        ToastService.Show($"Shortcut caught: {shortcutLabel} → opacity {pct}%.", ToastLevel.Success);
     }
 
     private async Task EnsureWebViewAsync()
@@ -1369,6 +1474,8 @@ public partial class MainWindow : Window
     protected override void OnClosed(EventArgs e)
     {
         LeaveMainInterviewMode();
+        _opacityHotkeys.Dispose();
+        _hotkeys.Dispose();
         _interview.Dispose();
         base.OnClosed(e);
     }

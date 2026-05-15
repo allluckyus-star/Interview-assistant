@@ -14,7 +14,7 @@ public sealed class InterviewSessionCoordinator : IDisposable
     private readonly CaptionState _captionState = new();
     private readonly InterviewHistory _history = new();
     private readonly LiveCaptionsCaptureService _capture;
-    private readonly InterviewHotkeyService _hotkeys = new();
+    private readonly InterviewHotkeyService _hotkeys;
     private readonly HttpClient _http = new() { Timeout = TimeSpan.FromSeconds(3) };
     private readonly string _bridgeBase;
     private readonly Dispatcher? _uiDispatcher;
@@ -23,10 +23,11 @@ public sealed class InterviewSessionCoordinator : IDisposable
     private string _pendingRequestId = "";
     private string _lastAnswerRequestId = "";
 
-    public InterviewSessionCoordinator(PromptStore promptStore, string bridgeHost, int bridgePort)
+    public InterviewSessionCoordinator(PromptStore promptStore, string bridgeHost, int bridgePort, InterviewHotkeyService hotkeys)
     {
         _promptStore = promptStore;
         _modePrompts = new ModePromptStore();
+        _hotkeys = hotkeys;
         _bridgeBase = $"http://{bridgeHost}:{bridgePort}";
         _uiDispatcher = System.Windows.Application.Current?.Dispatcher;
         _capture = new LiveCaptionsCaptureService(_captionState);
@@ -73,7 +74,6 @@ public sealed class InterviewSessionCoordinator : IDisposable
             LiveCaptionsRestarter.Restart();
 
             _capture.Start();
-            _hotkeys.Start();
             _pollCts = new CancellationTokenSource();
             _ = Task.Run(() => PollAnswersLoop(_pollCts.Token));
             IsRunning = true;
@@ -95,7 +95,6 @@ public sealed class InterviewSessionCoordinator : IDisposable
         _pollCts?.Dispose();
         _pollCts = null;
         _capture.Stop();
-        _hotkeys.Stop();
     }
 
     private void OnDraftUpdated(string draft) => DraftCaptionChanged?.Invoke(draft);
@@ -216,7 +215,6 @@ public sealed class InterviewSessionCoordinator : IDisposable
     {
         Stop();
         _capture.Dispose();
-        _hotkeys.Dispose();
         _http.Dispose();
     }
 }

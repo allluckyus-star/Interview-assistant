@@ -83,6 +83,21 @@ public static class TopBarIcons
             "0 0 24 24",
             filled: true);
 
+    /// <summary>Person icon: filled body when visible; dashed outline only when stealthed from capture.</summary>
+    public static ShapesPath CreateHumanStealthIcon(double size, string color, bool stealthed)
+    {
+        const string person =
+            "M12 12c2.21 0 4-1.79 4-4s-1.79-4-4-4-4 1.79-4 4 1.79 4 4 4zm0 2c-2.67 0-8 1.34-8 4v2h16v-2c0-2.66-5.33-4-8-4z";
+
+        if (!stealthed)
+            return PathFromSvg(size, person, color, "0 0 24 24", filled: true);
+
+        var path = PathFromSvg(size, person, color, "0 0 24 24", stroke: true);
+        path.StrokeDashArray = new DoubleCollection { 1.35, 1.35 };
+        path.StrokeThickness = 1.45;
+        return path;
+    }
+
     public static ShapesPath CreateKebabIcon(double size = 16, string color = "#111111")
     {
         var g = new GeometryGroup();
