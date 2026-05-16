@@ -14,6 +14,21 @@ The solution targets **.NET 8** (`net8.0` / `net8.0-windows`). If `dotnet` is no
 
 **Runtime:** **Windows** desktop and the **WebView2 Evergreen Runtime** (usually already present on up-to-date Windows).
 
+## Single-file exe (copy to another PC)
+
+On a machine **with** the .NET 8 SDK, build a self-contained one-file app (~75 MB):
+
+```powershell
+cd "D:\AI\Auto Script\Interview-assistant\c#project"
+.\publish.ps1
+```
+
+Output: `publish\win-x64\InterviewAssistant.App.exe` — copy **only that file** to another Windows 10/11 x64 PC. No SDK or .NET install required there.
+
+- First launch may take a few seconds (bundled files extract to a temp folder).
+- Target PC still needs the **WebView2 Runtime** ([installer](https://go.microsoft.com/fwlink/p/?LinkId=2124703) if ChatGPT pane fails).
+- For ARM laptops: `.\publish.ps1 -Runtime win-arm64`
+
 ## Configuration
 
 - `src/InterviewAssistant.App/appsettings.json` — `Bridge:Host` and `Bridge:Port` (default `127.0.0.1:8765`, matching `PromptBridgeServer` in `bridge_server.py`). Change the port if the Python bridge is already running.

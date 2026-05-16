@@ -62,6 +62,8 @@ public partial class MainWindow : Window
     private bool _sendInProgress;
     private readonly string _webViewUserDataDir;
     private readonly DispatcherTimer _loginPollTimer;
+    private const double MinSliderOpacityPercent = 4;
+    private const double MinSliderOpacityFraction = MinSliderOpacityPercent / 100.0;
     private const double DefaultOpacityFraction = 0.8;
     private double _recentOpacity = DefaultOpacityFraction;
     private double _lastChatPageOpacity01 = DefaultOpacityFraction;
@@ -77,13 +79,14 @@ public partial class MainWindow : Window
     private readonly InterviewHotkeyService _hotkeys = new();
     private readonly OpacityWindowHotkeys _opacityHotkeys;
     private readonly ClickThroughHotkeys _clickThroughHotkeys;
+    private readonly CaptureStealthHotkeys _stealthHotkeys;
     private readonly InterviewSessionCoordinator _interview;
     private bool _interviewSessionActive;
     private bool _settingsViewActive;
     private bool _chunkSendInProgress;
     private bool _snipInProgress;
     private bool _folderCombineBusy;
-    private bool _captureStealthEnabled = WindowCaptureStealth.IsSupported;
+    private bool _captureStealthEnabled;
     private bool _clickThroughEnabled;
     private CaptureStealthMonitor? _captureStealthMonitor;
     private WindowClickThroughController? _clickThroughController;
@@ -119,6 +122,10 @@ public partial class MainWindow : Window
         _clickThroughHotkeys.ClickThroughTogglePressed += () =>
             Dispatcher.BeginInvoke(ToggleClickThroughWithHotkey);
         _clickThroughHotkeys.Attach();
+        _stealthHotkeys = new CaptureStealthHotkeys(this);
+        _stealthHotkeys.StealthTogglePressed += () =>
+            Dispatcher.BeginInvoke(ToggleCaptureStealthWithHotkey);
+        _stealthHotkeys.Attach();
         _interview = new InterviewSessionCoordinator(promptStore, bridgeHost, bridgePort, _hotkeys);
         WireInterviewSession();
         InitInterviewTopBarIcons();
@@ -236,25 +243,37 @@ public partial class MainWindow : Window
         StealthIconHost.Child = TopBarIcons.CreateHumanStealthIcon(16, "#111111", stealthed);
         StealthToggleButton.IsChecked = stealthed;
         StealthToggleButton.ToolTip = stealthed
-            ? null
+            ? "Stealth on (Alt+Shift+3) — hidden from screen capture / share"
             : WindowCaptureStealth.IsSupported
-                ? "Stealth off — visible in screen capture / share"
+                ? "Stealth off (Alt+Shift+3) — visible in screen capture / share"
                 : "Stealth requires Windows";
     }
 
-    private void StealthToggleButton_OnClick(object sender, RoutedEventArgs e)
+    private void StealthToggleButton_OnClick(object sender, RoutedEventArgs e) =>
+        SetCaptureStealth(StealthToggleButton.IsChecked == true, fromHotkey: false);
+
+    private void ToggleCaptureStealthWithHotkey()
+    {
+        if (!IsLoaded || !WindowCaptureStealth.IsSupported)
+            return;
+        SetCaptureStealth(!_captureStealthEnabled, fromHotkey: true);
+    }
+
+    private void SetCaptureStealth(bool enabled, bool fromHotkey)
     {
         if (!WindowCaptureStealth.IsSupported)
             return;
 
-        _captureStealthEnabled = StealthToggleButton.IsChecked == true;
+        _captureStealthEnabled = enabled;
+        StealthToggleButton.IsChecked = enabled;
         ApplyCaptureStealth();
         UpdateStealthToggleUi();
-        ToastService.Show(
-            _captureStealthEnabled
-                ? "Stealth on — window hidden from capture."
-                : "Stealth off — window visible in capture.",
-            ToastLevel.Info);
+        var msg = enabled
+            ? "Stealth on — window hidden from capture."
+            : "Stealth off — window visible in capture.";
+        if (fromHotkey)
+            msg = $"Alt+Shift+3 → {msg}";
+        ToastService.Show(msg, ToastLevel.Info);
     }
 
     private void UpdateClickThroughToggleUi()
@@ -1253,7 +1272,7 @@ public partial class MainWindow : Window
         if (!IsLoaded)
             return;
         var fraction = OpacitySlider.Value / 100.0;
-        if (fraction > 0.01)
+        if (fraction >= MinSliderOpacityFraction)
             _recentOpacity = fraction;
         ApplyContentOpacity(fraction);
     }
@@ -1263,7 +1282,7 @@ public partial class MainWindow : Window
         if (!string.IsNullOrWhiteSpace(_startupToastMessage))
             ToastService.Show(_startupToastMessage, _startupToastLevel);
         _hotkeys.Start();
-        if (!_opacityHotkeys.IsRegistered || !_clickThroughHotkeys.IsRegistered)
+        if (!_opacityHotkeys.IsRegistered || !_clickThroughHotkeys.IsRegistered || !_stealthHotkeys.IsRegistered)
         {
             var missing = string.Join(
                 ", ",
@@ -1271,6 +1290,7 @@ public partial class MainWindow : Window
                     {
                         !_opacityHotkeys.IsRegistered ? "Alt+Shift+1 (opacity)" : null,
                         !_clickThroughHotkeys.IsRegistered ? "Alt+Shift+2 (click-through)" : null,
+                        !_stealthHotkeys.IsRegistered ? "Alt+Shift+3 (stealth)" : null,
                     }.Where(s => s is not null));
             ToastService.Show(
                 ToastMessages.Trim($"Hotkey(s) not registered: {missing}. Another app may own the combo."),
@@ -1285,7 +1305,7 @@ public partial class MainWindow : Window
             return;
         if (Opacity > 0.01)
         {
-            _recentOpacity = Opacity;
+            _recentOpacity = Math.Max(MinSliderOpacityFraction, OpacitySlider.Value / 100.0);
             SetOpacityFromHotkey(0, "Alt+Shift+1");
         }
         else
@@ -1296,9 +1316,18 @@ public partial class MainWindow : Window
     {
         if (!IsLoaded)
             return;
-        OpacitySlider.Value = fraction * 100.0;
-        ApplyContentOpacity(fraction);
-        var pct = (int)Math.Round(fraction * 100);
+
+        if (fraction <= 0)
+        {
+            ApplyContentOpacity(0);
+            ToastService.Show($"Shortcut caught: {shortcutLabel} → hidden.", ToastLevel.Success);
+            return;
+        }
+
+        var restore = Math.Max(MinSliderOpacityFraction, fraction);
+        OpacitySlider.Value = restore * 100.0;
+        ApplyContentOpacity(restore);
+        var pct = (int)Math.Round(restore * 100);
         ToastService.Show($"Shortcut caught: {shortcutLabel} → opacity {pct}%.", ToastLevel.Success);
     }
 
@@ -2141,6 +2170,7 @@ public partial class MainWindow : Window
         _clickThroughController?.Dispose();
         _clickThroughController = null;
         _clickThroughHotkeys.Dispose();
+        _stealthHotkeys.Dispose();
         _opacityHotkeys.Dispose();
         _hotkeys.Dispose();
         _interview.Dispose();

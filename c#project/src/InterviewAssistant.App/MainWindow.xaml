@@ -72,16 +72,16 @@
                        FontWeight="Bold"
                        Foreground="#222222"
                        Text="Opacity"
-                       ToolTip="Whole-window opacity (0 = transparent)." />
+                       ToolTip="Whole-window opacity (slider 4–100%). Alt+Shift+1 hides completely." />
             <Slider x:Name="OpacitySlider"
                     Width="200"
                     VerticalAlignment="Center"
                     Maximum="100"
-                    Minimum="0"
+                    Minimum="4"
                     SmallChange="1"
                     LargeChange="10"
                     IsSnapToTickEnabled="False"
-                    ToolTip="Drag to fade the window. Alt+Shift+1 toggles opacity. Alt+Shift+2 toggles click-through."
+                    ToolTip="Drag 4–100%. Alt+Shift+1 hides (0%). Alt+Shift+2 click-through. Alt+Shift+3 stealth."
                     Value="80"
                     ValueChanged="OpacitySlider_OnValueChanged" />
           </StackPanel>
@@ -221,7 +221,7 @@
                           Style="{StaticResource TopBarCyanCircleToggleStyle}"
                           Margin="0,0,6,0"
                           Click="StealthToggleButton_OnClick"
-                          ToolTip="Stealth: hidden from screen capture">
+                          ToolTip="Stealth (Alt+Shift+3): hidden from screen capture">
               <Viewbox x:Name="StealthIconHost" Width="16" Height="16" />
             </ToggleButton>
             <Button x:Name="SaveTranscriptButton"

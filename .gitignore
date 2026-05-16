@@ -47,3 +47,6 @@ registered_clients.json
 Thumbs.db
 # Accidental Windows reserved-name files (e.g. `command > nul` creates this in Git Bash)
 /nul
+
+# .NET single-file publish output
+c#project/publish/
