@@ -2,6 +2,7 @@ using System.Collections.Concurrent;
 using System.Diagnostics;
 using System.Globalization;
 using System.IO;
+using System.Linq;
 using System.Text;
 using System.Text.Json;
 using System.Text.Json.Serialization;
@@ -75,6 +76,7 @@ public partial class MainWindow : Window
 
     private readonly InterviewHotkeyService _hotkeys = new();
     private readonly OpacityWindowHotkeys _opacityHotkeys;
+    private readonly ClickThroughHotkeys _clickThroughHotkeys;
     private readonly InterviewSessionCoordinator _interview;
     private bool _interviewSessionActive;
     private bool _settingsViewActive;
@@ -82,7 +84,9 @@ public partial class MainWindow : Window
     private bool _snipInProgress;
     private bool _folderCombineBusy;
     private bool _captureStealthEnabled = WindowCaptureStealth.IsSupported;
+    private bool _clickThroughEnabled;
     private CaptureStealthMonitor? _captureStealthMonitor;
+    private WindowClickThroughController? _clickThroughController;
     private readonly string? _startupToastMessage;
     private readonly ToastLevel _startupToastLevel;
     private string _latestGptAnswer = "";
@@ -108,11 +112,13 @@ public partial class MainWindow : Window
         _startupToastMessage = startupToastMessage;
         _startupToastLevel = startupToastLevel;
         _opacityHotkeys = new OpacityWindowHotkeys(this);
-        _opacityHotkeys.OpacityFullPressed += () =>
-            Dispatcher.BeginInvoke(RestoreRecentOpacityWithHotkey);
-        _opacityHotkeys.OpacityZeroPressed += () =>
-            Dispatcher.BeginInvoke(HideOpacityWithHotkey);
+        _opacityHotkeys.OpacityTogglePressed += () =>
+            Dispatcher.BeginInvoke(ToggleOpacityWithHotkey);
         _opacityHotkeys.Attach();
+        _clickThroughHotkeys = new ClickThroughHotkeys(this);
+        _clickThroughHotkeys.ClickThroughTogglePressed += () =>
+            Dispatcher.BeginInvoke(ToggleClickThroughWithHotkey);
+        _clickThroughHotkeys.Attach();
         _interview = new InterviewSessionCoordinator(promptStore, bridgeHost, bridgePort, _hotkeys);
         WireInterviewSession();
         InitInterviewTopBarIcons();
@@ -190,6 +196,9 @@ public partial class MainWindow : Window
         SessionModeBehavioralIconHost.Child = TopBarIcons.CreateBehavioralModeIcon(14);
         SaveTranscriptIconHost.Child = TopBarIcons.CreateSaveIcon(16);
         SettingsNavIconHost.Child = TopBarIcons.CreateKebabIcon(16);
+        ClickThroughIconHost.Child = TopBarIcons.CreateClickThroughIcon(16, "#111111", false);
+        ClickThroughToggleButton.IsChecked = false;
+        UpdateClickThroughToggleUi();
         StealthToggleButton.IsEnabled = WindowCaptureStealth.IsSupported;
         StealthToggleButton.IsChecked = _captureStealthEnabled;
         UpdateStealthToggleUi();
@@ -199,6 +208,11 @@ public partial class MainWindow : Window
     protected override void OnSourceInitialized(EventArgs e)
     {
         base.OnSourceInitialized(e);
+        _clickThroughController = new WindowClickThroughController(
+            this,
+            () => TopBarChromeGrid,
+            SetWpfContentReceivesMouseHits);
+        _clickThroughController.SetEnabled(_clickThroughEnabled);
         ApplyCaptureStealth();
     }
 
@@ -241,6 +255,73 @@ public partial class MainWindow : Window
                 ? "Stealth on — window hidden from capture."
                 : "Stealth off — window visible in capture.",
             ToastLevel.Info);
+    }
+
+    private void UpdateClickThroughToggleUi()
+    {
+        ClickThroughIconHost.Child = TopBarIcons.CreateClickThroughIcon(16, "#111111", _clickThroughEnabled);
+        ClickThroughToggleButton.IsChecked = _clickThroughEnabled;
+        ClickThroughToggleButton.ToolTip = _clickThroughEnabled
+            ? "Click-through on (Alt+Shift+2) — mouse goes to apps behind; top bar still works"
+            : "Click-through off — mouse controls this window";
+    }
+
+    private void ClickThroughToggleButton_OnClick(object sender, RoutedEventArgs e) =>
+        ApplyClickThrough(ClickThroughToggleButton.IsChecked == true, fromHotkey: false);
+
+    private void ToggleClickThroughWithHotkey()
+    {
+        if (!IsLoaded)
+            return;
+        ApplyClickThrough(!_clickThroughEnabled, fromHotkey: true);
+    }
+
+    private void ScheduleClickThroughHwndRefresh()
+    {
+        _clickThroughController?.RefreshChildHwnds();
+        _ = Dispatcher.InvokeAsync(async () =>
+        {
+            await Task.Delay(350).ConfigureAwait(true);
+            _clickThroughController?.RefreshChildHwnds();
+            await Task.Delay(700).ConfigureAwait(true);
+            _clickThroughController?.RefreshChildHwnds();
+        });
+    }
+
+    private void SetWpfContentReceivesMouseHits(bool receivesHits)
+    {
+        ContentHost.IsHitTestVisible = receivesHits;
+    }
+
+    private void ApplyClickThrough(bool enabled, bool fromHotkey)
+    {
+        _clickThroughEnabled = enabled;
+        ClickThroughToggleButton.IsChecked = enabled;
+        _clickThroughController?.UpdateTopChromeBounds();
+        _clickThroughController?.SetEnabled(_clickThroughEnabled);
+        if (_clickThroughEnabled)
+        {
+            Topmost = true;
+            ScheduleClickThroughHwndRefresh();
+        }
+        UpdateClickThroughToggleUi();
+        if (fromHotkey)
+        {
+            var pct = _clickThroughEnabled ? "on" : "off";
+            ToastService.Show(
+                _clickThroughEnabled
+                    ? "Alt+Shift+2 → click-through on. Window stays visible on top; hover top bar for buttons."
+                    : "Alt+Shift+2 → click-through off.",
+                ToastLevel.Info);
+        }
+        else
+        {
+            ToastService.Show(
+                _clickThroughEnabled
+                    ? "Click-through on — window stays on top; mouse controls apps behind. Use top bar or Alt+Shift+2 to turn off."
+                    : "Click-through off — mouse controls this app again.",
+                ToastLevel.Info);
+        }
     }
 
     private void UpdateSessionModeButtonUi(string mode, bool animate = false)
@@ -1182,26 +1263,33 @@ public partial class MainWindow : Window
         if (!string.IsNullOrWhiteSpace(_startupToastMessage))
             ToastService.Show(_startupToastMessage, _startupToastLevel);
         _hotkeys.Start();
-        if (!_opacityHotkeys.IsRegistered)
-            ToastService.Show("Alt+Shift+1/2 not registered (another app may own that combo).", ToastLevel.Warning);
+        if (!_opacityHotkeys.IsRegistered || !_clickThroughHotkeys.IsRegistered)
+        {
+            var missing = string.Join(
+                ", ",
+                new[]
+                    {
+                        !_opacityHotkeys.IsRegistered ? "Alt+Shift+1 (opacity)" : null,
+                        !_clickThroughHotkeys.IsRegistered ? "Alt+Shift+2 (click-through)" : null,
+                    }.Where(s => s is not null));
+            ToastService.Show(
+                ToastMessages.Trim($"Hotkey(s) not registered: {missing}. Another app may own the combo."),
+                ToastLevel.Warning);
+        }
         _ = EnsureWebViewAsync();
     }
 
-    private void HideOpacityWithHotkey()
+    private void ToggleOpacityWithHotkey()
     {
         if (!IsLoaded)
             return;
-        var current = Opacity;
-        if (current > 0.01)
-            _recentOpacity = current;
-        SetOpacityFromHotkey(0, "Alt+Shift+2");
-    }
-
-    private void RestoreRecentOpacityWithHotkey()
-    {
-        if (!IsLoaded)
-            return;
-        SetOpacityFromHotkey(_recentOpacity, "Alt+Shift+1");
+        if (Opacity > 0.01)
+        {
+            _recentOpacity = Opacity;
+            SetOpacityFromHotkey(0, "Alt+Shift+1");
+        }
+        else
+            SetOpacityFromHotkey(_recentOpacity, "Alt+Shift+1");
     }
 
     private void SetOpacityFromHotkey(double fraction, string shortcutLabel)
@@ -1314,6 +1402,8 @@ public partial class MainWindow : Window
             await EnsurePipelineInjectedAsync().ConfigureAwait(true);
             await PushChatGptDomOpacityAsync().ConfigureAwait(true);
             ScheduleCaptureStealthSync();
+            if (_clickThroughEnabled)
+                ScheduleClickThroughHwndRefresh();
         }
         catch
         {
@@ -2048,6 +2138,9 @@ public partial class MainWindow : Window
         LeaveMainInterviewMode();
         _captureStealthMonitor?.Dispose();
         _captureStealthMonitor = null;
+        _clickThroughController?.Dispose();
+        _clickThroughController = null;
+        _clickThroughHotkeys.Dispose();
         _opacityHotkeys.Dispose();
         _hotkeys.Dispose();
         _interview.Dispose();

@@ -38,8 +38,10 @@
           Padding="14">
     <Grid>
       <DockPanel LastChildFill="True">
-      <!-- Top bar -->
-      <Grid DockPanel.Dock="Top" Height="36">
+      <!-- Top bar (stays mouse-interactive when click-through mode is on) -->
+      <Grid x:Name="TopBarChromeGrid"
+            DockPanel.Dock="Top"
+            Height="36">
         <Grid.ColumnDefinitions>
           <ColumnDefinition Width="Auto" />
           <ColumnDefinition Width="*" />
@@ -79,7 +81,7 @@
                     SmallChange="1"
                     LargeChange="10"
                     IsSnapToTickEnabled="False"
-                    ToolTip="Drag to fade the window. Alt+Shift+1 = recent opacity, Alt+Shift+2 = hide (0%)."
+                    ToolTip="Drag to fade the window. Alt+Shift+1 toggles opacity. Alt+Shift+2 toggles click-through."
                     Value="80"
                     ValueChanged="OpacitySlider_OnValueChanged" />
           </StackPanel>
@@ -208,6 +210,13 @@
                 </Button>
               </StackPanel>
             </Border>
+            <ToggleButton x:Name="ClickThroughToggleButton"
+                          Style="{StaticResource TopBarCyanCircleToggleStyle}"
+                          Margin="0,0,6,0"
+                          Click="ClickThroughToggleButton_OnClick"
+                          ToolTip="Click-through (Alt+Shift+2): mouse passes through the window; top bar still works">
+              <Viewbox x:Name="ClickThroughIconHost" Width="16" Height="16" />
+            </ToggleButton>
             <ToggleButton x:Name="StealthToggleButton"
                           Style="{StaticResource TopBarCyanCircleToggleStyle}"
                           Margin="0,0,6,0"

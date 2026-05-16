@@ -5,25 +5,25 @@ using System.Windows.Interop;
 
 namespace InterviewAssistant.App.Services;
 
-/// <summary>Alt+Shift+1 toggles window opacity (hide ↔ last non-zero) via RegisterHotKey — reliable on Windows (WM_HOTKEY).</summary>
-public sealed class OpacityWindowHotkeys : IDisposable
+/// <summary>Alt+Shift+2 toggles window click-through (see <see cref="WindowClickThroughController"/>).</summary>
+public sealed class ClickThroughHotkeys : IDisposable
 {
     private const int WmHotkey = 0x0312;
-    private const int IdOpacityToggle = 0x8A01;
+    private const int IdClickThroughToggle = 0x8A03;
     private const uint ModAlt = 0x0001;
     private const uint ModShift = 0x0004;
     private const uint ModNoRepeat = 0x4000;
-    private const uint Vk1 = 0x31;
+    private const uint Vk2 = 0x32;
 
     private readonly Window _window;
     private HwndSource? _source;
     private bool _registered;
 
-    public event Action? OpacityTogglePressed;
+    public event Action? ClickThroughTogglePressed;
 
     public bool IsRegistered => _registered;
 
-    public OpacityWindowHotkeys(Window window) => _window = window;
+    public ClickThroughHotkeys(Window window) => _window = window;
 
     public void Attach()
     {
@@ -54,30 +54,24 @@ public sealed class OpacityWindowHotkeys : IDisposable
 
         _source.AddHook(WndProc);
         var mods = ModAlt | ModShift | ModNoRepeat;
-        var ok = RegisterHotKey(hwnd, IdOpacityToggle, mods, Vk1);
+        var ok = RegisterHotKey(hwnd, IdClickThroughToggle, mods, Vk2);
         _registered = ok;
         if (!_registered)
         {
             var err = Marshal.GetLastWin32Error();
-            Trace.WriteLine($"[InterviewAssistant] RegisterHotKey opacity toggle failed (error {err})");
+            Trace.WriteLine($"[InterviewAssistant] RegisterHotKey click-through failed (error {err})");
         }
         else
-        {
-            Trace.WriteLine("[InterviewAssistant] Opacity hotkey registered (Alt+Shift+1 toggle)");
-        }
+            Trace.WriteLine("[InterviewAssistant] Click-through hotkey registered (Alt+Shift+2)");
     }
 
     private IntPtr WndProc(IntPtr hwnd, int msg, IntPtr wParam, IntPtr lParam, ref bool handled)
     {
-        if (msg != WmHotkey)
+        if (msg != WmHotkey || wParam.ToInt32() != IdClickThroughToggle)
             return IntPtr.Zero;
 
-        if (wParam.ToInt32() == IdOpacityToggle)
-        {
-            OpacityTogglePressed?.Invoke();
-            handled = true;
-        }
-
+        ClickThroughTogglePressed?.Invoke();
+        handled = true;
         return IntPtr.Zero;
     }
 
@@ -86,9 +80,7 @@ public sealed class OpacityWindowHotkeys : IDisposable
         _window.SourceInitialized -= OnSourceInitialized;
         var hwnd = _window.IsLoaded ? new WindowInteropHelper(_window).Handle : IntPtr.Zero;
         if (hwnd != IntPtr.Zero)
-        {
-            UnregisterHotKey(hwnd, IdOpacityToggle);
-        }
+            UnregisterHotKey(hwnd, IdClickThroughToggle);
 
         if (_source is not null)
         {

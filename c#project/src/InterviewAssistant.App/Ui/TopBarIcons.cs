@@ -83,6 +83,20 @@ public static class TopBarIcons
             "0 0 24 24",
             filled: true);
 
+    /// <summary>Frame with diagonal — dashed when click-through is on.</summary>
+    public static ShapesPath CreateClickThroughIcon(double size, string color, bool active)
+    {
+        var path = PathFromSvg(
+            size,
+            "M5 5h14v14H5V5z M8 16l8-8",
+            color,
+            "0 0 24 24",
+            stroke: true);
+        path.StrokeThickness = active ? 1.65 : 1.35;
+        path.StrokeDashArray = active ? new DoubleCollection { 2.2, 1.6 } : null;
+        return path;
+    }
+
     /// <summary>Person icon: filled body when visible; dashed outline only when stealthed from capture.</summary>
     public static ShapesPath CreateHumanStealthIcon(double size, string color, bool stealthed)
     {
