@@ -406,18 +406,8 @@ function __iaDismissComposerDragDropOverlay(primary, partner) {
   } catch (_e2) {}
 }
 
-function __iaTryAttachPngDataToElement(el, base64Png, partnerForCleanup) {
-  if (!(el instanceof HTMLElement) || !base64Png) return false;
-  var trimmed = String(base64Png).trim();
-  if (!trimmed) return false;
-  var bytes;
-  try {
-    bytes = __iaBase64ToUint8Array(trimmed);
-  } catch (_e) {
-    return false;
-  }
-  var name = "ia-snip-" + Date.now() + ".png";
-  var file = new File([bytes], name, { type: "image/png" });
+function __iaTryAttachFileToElement(el, file, partnerForCleanup) {
+  if (!(el instanceof HTMLElement) || !file) return false;
   var dt = new DataTransfer();
   try {
     dt.items.add(file);
@@ -446,6 +436,21 @@ function __iaTryAttachPngDataToElement(el, base64Png, partnerForCleanup) {
   return ok;
 }
 
+function __iaTryAttachPngDataToElement(el, base64Png, partnerForCleanup) {
+  if (!(el instanceof HTMLElement) || !base64Png) return false;
+  var trimmed = String(base64Png).trim();
+  if (!trimmed) return false;
+  var bytes;
+  try {
+    bytes = __iaBase64ToUint8Array(trimmed);
+  } catch (_e) {
+    return false;
+  }
+  var name = "ia-snip-" + Date.now() + ".png";
+  var file = new File([bytes], name, { type: "image/png" });
+  return __iaTryAttachFileToElement(el, file, partnerForCleanup);
+}
+
 function __iaTryAttachPngToComposer(composer, base64Png) {
   if (!composer || !base64Png) return false;
   var surf = __iaGetComposerSurface();
@@ -454,16 +459,58 @@ function __iaTryAttachPngToComposer(composer, base64Png) {
   return __iaTryAttachPngDataToElement(el, base64Png, partner);
 }
 
-function __iaTryAttachPngToInnerComposer(composer, base64Png) {
-  if (!(composer instanceof HTMLElement) || !base64Png) return false;
+function __iaTryAttachFileToComposer(composer, file) {
+  if (!composer || !file) return false;
   var surf = __iaGetComposerSurface();
-  var partner = surf instanceof HTMLElement && !surf.isSameNode(composer) ? surf : null;
-  return __iaTryAttachPngDataToElement(composer, base64Png, partner);
+  var el = surf instanceof HTMLElement ? surf : composer;
+  var partner = el === composer ? null : composer;
+  return __iaTryAttachFileToElement(el, file, partner);
 }
 
-function __iaComposerHasVisibleAttachment(root) {
+function __iaTryAttachPngToInnerComposer(composer, base64Png) {
+  if (!(composer instanceof HTMLElement) || !base64Png) return false;
+  var trimmed = String(base64Png).trim();
+  if (!trimmed) return false;
+  var bytes;
+  try {
+    bytes = __iaBase64ToUint8Array(trimmed);
+  } catch (_e) {
+    return false;
+  }
+  var file = new File([bytes], "ia-snip-" + Date.now() + ".png", { type: "image/png" });
+  return __iaTryAttachFileToInnerComposer(composer, file);
+}
+
+function __iaTryAttachFileToInnerComposer(composer, file) {
+  if (!(composer instanceof HTMLElement) || !file) return false;
+  var surf = __iaGetComposerSurface();
+  var partner = surf instanceof HTMLElement && !surf.isSameNode(composer) ? surf : null;
+  return __iaTryAttachFileToElement(composer, file, partner);
+}
+
+function __iaBasenameHint(p) {
+  var s = String(p || "").replace(/\\/g, "/");
+  var i = s.lastIndexOf("/");
+  return i >= 0 ? s.slice(i + 1) : s;
+}
+
+function __iaIsImageFile(file) {
+  if (!file) return false;
+  var t = String(file.type || "").toLowerCase();
+  if (t.indexOf("image/") === 0) return true;
+  var n = String(file.name || "").toLowerCase();
+  return /\.(png|jpe?g|gif|webp|bmp|heic|heif|svg)$/.test(n);
+}
+
+function __iaComposerHasVisibleAttachment(root, fileNameHint) {
   if (!(root instanceof HTMLElement)) return false;
-  var hints = ['[data-testid*="attachment"]', 'button[aria-label*="Remove"]', 'button[aria-label*="remove"]'];
+  var hints = [
+    '[data-testid*="attachment"]',
+    '[data-testid*="file"]',
+    '[data-testid*="upload"]',
+    'button[aria-label*="Remove"]',
+    'button[aria-label*="remove"]',
+  ];
   for (var i = 0; i < hints.length; i += 1) {
     try {
       if (root.querySelector(hints[i])) return true;
@@ -474,13 +521,20 @@ function __iaComposerHasVisibleAttachment(root) {
     var src = (imgs[j].getAttribute("src") || "").trim();
     if (src.indexOf("blob:") === 0 || src.indexOf("data:image") === 0) return true;
   }
+  var base = __iaBasenameHint(fileNameHint);
+  if (base.length >= 3) {
+    try {
+      var txt = (root.innerText || root.textContent || "").trim();
+      if (txt.indexOf(base) >= 0) return true;
+    } catch (_e2) {}
+  }
   return false;
 }
 
-async function __iaWaitForComposerAttachment(root, maxMs) {
+async function __iaWaitForComposerAttachment(root, maxMs, fileNameHint) {
   var limit = Date.now() + (maxMs || 12000);
   while (Date.now() < limit) {
-    if (__iaComposerHasVisibleAttachment(root)) return true;
+    if (__iaComposerHasVisibleAttachment(root, fileNameHint)) return true;
     await __iaWait(90);
   }
   return false;
@@ -679,20 +733,54 @@ function __iaClickComposerAttachButton() {
   return false;
 }
 
-function __iaTryAttachViaFileInput(base64Png) {
-  var trimmed = String(base64Png || "").trim();
-  if (!trimmed) return false;
-  var bytes;
-  try {
-    bytes = __iaBase64ToUint8Array(trimmed);
-  } catch (_e) {
-    return false;
+/** After + is open, pick a menu row that leads to local file upload (documents + images). */
+function __iaTryClickAddPhotosAndFilesOrSimilar() {
+  var candidates = document.querySelectorAll('[role="menuitem"], [role="option"], button[type="button"], a[role="menuitem"]');
+  for (var i = 0; i < candidates.length; i += 1) {
+    var el = candidates[i];
+    if (!(el instanceof HTMLElement) || !__iaIsElementVisible(el)) continue;
+    var t = (el.textContent || "").replace(/\s+/g, " ").trim();
+    if (!t || t.length > 120) continue;
+    if (/connect|drive|dropbox|onedrive|link only|paste url|microphone(?!.*file)/i.test(t)) continue;
+    if (/\bupload\b|\bfile\b|\bphoto\b|\bimage\b|\battach\b|\bcomputer\b|\bbrowse\b|\bdocument\b/i.test(t)) {
+      try {
+        el.click();
+        return true;
+      } catch (_e) {}
+    }
   }
-  var file = new File([bytes], "ia-snip-" + Date.now() + ".png", { type: "image/png" });
-  var inputs = document.querySelectorAll('input[type="file"]');
-  for (var i = 0; i < inputs.length; i++) {
-    var input = inputs[i];
+  return false;
+}
+
+function __iaInputAcceptScore(input, file) {
+  var acc = (input.getAttribute("accept") || "").trim().toLowerCase();
+  var ftype = (file.type || "").toLowerCase();
+  var fname = (file.name || "").toLowerCase();
+  var dot = fname.lastIndexOf(".");
+  var ext = dot >= 0 ? fname.slice(dot) : "";
+
+  if (!acc) return 80;
+  if ((acc === "image/*" || acc.split(",").every(function (p) { return p.trim() === "image/*"; })) && ftype.indexOf("image/") !== 0)
+    return -1;
+
+  var score = 10;
+  if (acc.indexOf("*/*") >= 0 || acc === "*") score = 90;
+  if (acc.indexOf(ftype) >= 0) score += 60;
+  if (ext && acc.indexOf(ext) >= 0) score += 50;
+  if (ftype.indexOf("text/") === 0 && (acc.indexOf("text") >= 0 || acc.indexOf(".txt") >= 0)) score += 55;
+  return score;
+}
+
+function __iaTryAttachViaFileInputWithFile(file) {
+  if (!file) return false;
+  var list = Array.prototype.slice.call(document.querySelectorAll('input[type="file"]'), 0);
+  list.sort(function (a, b) {
+    return __iaInputAcceptScore(b, file) - __iaInputAcceptScore(a, file);
+  });
+  for (var i = 0; i < list.length; i += 1) {
+    var input = list[i];
     if (!(input instanceof HTMLInputElement)) continue;
+    if (__iaInputAcceptScore(input, file) < 0) continue;
     try {
       var dt = new DataTransfer();
       dt.items.add(file);
@@ -705,12 +793,26 @@ function __iaTryAttachViaFileInput(base64Png) {
   return false;
 }
 
-/** Attach PNG to ChatGPT composer only — does not click Send. */
-async function __iaWpfAttachPngToComposer(imagePngBase64) {
-  var imgB64 = String(imagePngBase64 || "").trim();
-  if (!imgB64) {
-    return { ok: false, error: "image_missing" };
+function __iaTryAttachViaFileInput(base64Png) {
+  var trimmed = String(base64Png || "").trim();
+  if (!trimmed) return false;
+  var bytes;
+  try {
+    bytes = __iaBase64ToUint8Array(trimmed);
+  } catch (_e) {
+    return false;
   }
+  var file = new File([bytes], "ia-snip-" + Date.now() + ".png", { type: "image/png" });
+  return __iaTryAttachViaFileInputWithFile(file);
+}
+
+/** Attach one File to ChatGPT composer only — does not click Send. */
+async function __iaWpfAttachPreparedFileToComposer(file) {
+  if (!file) {
+    return { ok: false, error: "file_missing" };
+  }
+  var fileHint = file.name || "";
+  var isImg = __iaIsImageFile(file);
   var composer = await __iaWaitForComposer(28000);
   if (!composer) {
     return { ok: false, error: "composer_not_found" };
@@ -734,38 +836,107 @@ async function __iaWpfAttachPngToComposer(imagePngBase64) {
   }
   await __iaWait(220);
   await __iaWaitAnimationFrames(3);
-  var dropped = __iaTryAttachPngToComposer(composer, imgB64);
-  await __iaWaitAnimationFrames(3);
-  var chip = await __iaWaitForComposerAttachment(attachRoot, 8000);
-  if (!chip) {
-    await __iaWait(350);
-    dropped = __iaTryAttachPngToComposer(composer, imgB64) || dropped;
-    await __iaWaitAnimationFrames(3);
-    chip = await __iaWaitForComposerAttachment(attachRoot, 6000);
-  }
-  if (!chip && surf instanceof HTMLElement && composer instanceof HTMLElement && !surf.isSameNode(composer)) {
-    dropped = __iaTryAttachPngToInnerComposer(composer, imgB64) || dropped;
-    await __iaWaitAnimationFrames(3);
-    chip = await __iaWaitForComposerAttachment(attachRoot, 6000);
-  }
-  if (!chip && !dropped) {
-    __iaClickComposerAttachButton();
+
+  async function tryMenuAndFileInput() {
+    if (!__iaClickComposerAttachButton()) return false;
+    await __iaWait(360);
+    __iaTryClickAddPhotosAndFilesOrSimilar();
     await __iaWait(280);
-    dropped = __iaTryAttachViaFileInput(imgB64) || dropped;
+    if (!__iaTryAttachViaFileInputWithFile(file)) return false;
     await __iaWait(400);
-    chip = await __iaWaitForComposerAttachment(attachRoot, 8000);
+    return true;
   }
+
+  var chip = false;
+
+  // Documents (.txt, etc.): ChatGPT usually needs + → upload menu + real file input (not image-only or drag alone).
+  if (!isImg) {
+    await tryMenuAndFileInput();
+    chip = await __iaWaitForComposerAttachment(attachRoot, 11000, fileHint);
+  }
+
+  if (!chip) {
+    var dropped = __iaTryAttachFileToComposer(composer, file);
+    await __iaWaitAnimationFrames(3);
+    chip = await __iaWaitForComposerAttachment(attachRoot, 8000, fileHint);
+    if (!chip) {
+      await __iaWait(350);
+      dropped = __iaTryAttachFileToComposer(composer, file) || dropped;
+      await __iaWaitAnimationFrames(3);
+      chip = await __iaWaitForComposerAttachment(attachRoot, 6000, fileHint);
+    }
+  }
+
+  if (!chip && surf instanceof HTMLElement && composer instanceof HTMLElement && !surf.isSameNode(composer)) {
+    __iaTryAttachFileToInnerComposer(composer, file);
+    await __iaWaitAnimationFrames(3);
+    chip = await __iaWaitForComposerAttachment(attachRoot, 6000, fileHint);
+  }
+
+  if (!chip) {
+    await tryMenuAndFileInput();
+    chip = await __iaWaitForComposerAttachment(attachRoot, 10000, fileHint);
+  }
+
   await __iaWait(120);
   __iaDismissComposerDragDropOverlay(attachRoot, composer);
   await __iaWaitAnimationFrames(2);
   try {
     composer.focus();
   } catch (_e3) {}
-  if (chip || dropped) {
+
+  if (__iaComposerHasVisibleAttachment(attachRoot, fileHint)) {
     return { ok: true, phase: "attached" };
   }
   return { ok: false, error: "attachment_not_visible" };
 }
+
+/** Attach PNG to ChatGPT composer only — does not click Send. */
+async function __iaWpfAttachPngToComposer(imagePngBase64) {
+  var imgB64 = String(imagePngBase64 || "").trim();
+  if (!imgB64) {
+    return { ok: false, error: "image_missing" };
+  }
+  var bytes;
+  try {
+    bytes = __iaBase64ToUint8Array(imgB64);
+  } catch (_e0) {
+    return { ok: false, error: "image_missing" };
+  }
+  var pngFile = new File([bytes], "ia-snip-" + Date.now() + ".png", { type: "image/png" });
+  return __iaWpfAttachPreparedFileToComposer(pngFile);
+}
+
+window.__iaWpfAttachBinaryFileToComposer = function (base64, fileName, mimeType) {
+  try {
+    var trimmed = String(base64 || "").trim();
+    if (!trimmed) return Promise.resolve({ ok: false, error: "file_missing" });
+    var bytes = __iaBase64ToUint8Array(trimmed);
+    var name = String(fileName || "attachment.txt").trim() || "attachment.txt";
+    var mime = String(mimeType || "text/plain").trim() || "text/plain";
+    var f = new File([bytes], name, { type: mime });
+    return __iaWpfAttachPreparedFileToComposer(f);
+  } catch (e) {
+    return Promise.resolve({ ok: false, error: String((e && e.message) || e) });
+  }
+};
+
+/** Load bytes from WebView2 virtual-host mapped folder (https://ia-export-host/...) then attach — avoids huge host JSON. */
+window.__iaWpfAttachFileFromVirtualUrl = async function (fileUrl, fileName, mimeType) {
+  try {
+    var url = String(fileUrl || "").trim();
+    if (!url) return { ok: false, error: "url_missing" };
+    var name = String(fileName || "snapshot.txt").trim() || "snapshot.txt";
+    var mime = String(mimeType || "text/plain").trim() || "text/plain";
+    var r = await fetch(url, { credentials: "omit", cache: "no-store" });
+    if (!r.ok) return { ok: false, error: "fetch_failed_" + r.status };
+    var buf = await r.arrayBuffer();
+    var f = new File([buf], name, { type: mime });
+    return await __iaWpfAttachPreparedFileToComposer(f);
+  } catch (e) {
+    return { ok: false, error: String((e && e.message) || e) };
+  }
+};
 
 window.__iaWpfAttachImageToComposer = function (imagePngBase64) {
   return __iaWpfAttachPngToComposer(imagePngBase64);
@@ -881,6 +1052,25 @@ window.__iaWpfPasteTextToComposer = function (text, append) {
     var requestId = msg.requestId || "";
     if (msg.type === "ia_attach_image") {
       __iaWpfAttachPngToComposer(msg.imagePngBase64 || "")
+        .then(function (result) {
+          window.chrome.webview.postMessage({
+            type: "ia_attach_result",
+            requestId: requestId,
+            result: result && typeof result === "object" ? result : { ok: false, error: "empty_result" },
+          });
+        })
+        .catch(function (e) {
+          window.chrome.webview.postMessage({
+            type: "ia_attach_result",
+            requestId: requestId,
+            result: { ok: false, error: String((e && e.message) || e) },
+          });
+        });
+      return;
+    }
+    if (msg.type === "ia_attach_file") {
+      window
+        .__iaWpfAttachBinaryFileToComposer(msg.fileBase64 || "", msg.fileName || "", msg.mimeType || "text/plain")
         .then(function (result) {
           window.chrome.webview.postMessage({
             type: "ia_attach_result",

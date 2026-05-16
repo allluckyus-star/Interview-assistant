@@ -19,6 +19,7 @@ using InterviewAssistant.App.Ui;
 using InterviewAssistant.Bridge;
 using Microsoft.Web.WebView2.Core;
 using Microsoft.Win32;
+using Ookii.Dialogs.Wpf;
 
 namespace InterviewAssistant.App;
 
@@ -79,11 +80,18 @@ public partial class MainWindow : Window
     private bool _settingsViewActive;
     private bool _chunkSendInProgress;
     private bool _snipInProgress;
+    private bool _folderCombineBusy;
     private bool _captureStealthEnabled = WindowCaptureStealth.IsSupported;
     private CaptureStealthMonitor? _captureStealthMonitor;
     private readonly string? _startupToastMessage;
     private readonly ToastLevel _startupToastLevel;
     private string _latestGptAnswer = "";
+
+    /// <summary>Maps to <see cref="SnapshotExportDirectory"/> — registered in WebView2 before navigating to ChatGPT.</summary>
+    private const string SnapshotExportVirtualHost = "ia-export-host";
+
+    private static string SnapshotExportDirectory =>
+        Path.Combine(Path.GetTempPath(), "InterviewAssistant", "exports");
     private static readonly Color SessionModeDeepColor =
         (Color)ColorConverter.ConvertFromString("#4dd0e1")!;
     /// <summary>Same as the session mode outer bar fill so idle segments match the track.</summary>
@@ -698,6 +706,115 @@ public partial class MainWindow : Window
         }
     }
 
+    private async Task<GptSendResult?> AttachBinaryFileToComposerAsync(string fileBase64, string fileName, string mimeType)
+    {
+        if (GptWebView.CoreWebView2 is null)
+            return new GptSendResult { Ok = false, Error = "webview_not_ready" };
+
+        var bridgeReady = await ExecuteWebViewScriptAsync(
+                "(() => !!(window.__iaWpfMessageBridgeInstalled && typeof window.__iaWpfAttachBinaryFileToComposer === 'function'))()")
+            .ConfigureAwait(true);
+        if (bridgeReady is not "true")
+            await EnsurePipelineInjectedAsync().ConfigureAwait(true);
+
+        if (!_pipelineInjected)
+            return new GptSendResult { Ok = false, Error = "attach_missing" };
+
+        GptWebView.Focus();
+        await Task.Delay(120).ConfigureAwait(true);
+
+        var requestId = Guid.NewGuid().ToString("N");
+        var tcs = new TaskCompletionSource<GptSendResult>(TaskCreationOptions.RunContinuationsAsynchronously);
+        _attachCompletes[requestId] = tcs;
+        try
+        {
+            var payload = JsonSerializer.Serialize(new
+            {
+                type = "ia_attach_file",
+                requestId,
+                fileBase64,
+                fileName,
+                mimeType,
+            });
+            GptWebView.CoreWebView2.PostWebMessageAsJson(payload);
+
+            var completed = await Task.WhenAny(tcs.Task, Task.Delay(TimeSpan.FromSeconds(90))).ConfigureAwait(true);
+            if (completed != tcs.Task)
+                return new GptSendResult { Ok = false, Error = "attach_timeout" };
+
+            return await tcs.Task.ConfigureAwait(true);
+        }
+        finally
+        {
+            _attachCompletes.TryRemove(requestId, out _);
+        }
+    }
+
+    /// <summary>
+    /// Loads a snapshot .txt from the mapped export folder via HTTPS (no megabyte JSON), builds a <c>File</c>, attaches like a PNG.
+    /// Requires <see cref="SnapshotExportVirtualHost"/> mapping before ChatGPT navigation.
+    /// </summary>
+    private async Task<GptSendResult?> AttachSnapshotFromExportViaVirtualHostAsync(string exportFileName, string mimeType)
+    {
+        if (GptWebView.CoreWebView2 is null)
+            return new GptSendResult { Ok = false, Error = "webview_not_ready" };
+
+        EnsureSnapshotExportHostMapped();
+
+        var safeName = Path.GetFileName(exportFileName);
+        if (string.IsNullOrEmpty(safeName)
+            || !string.Equals(safeName, exportFileName, StringComparison.Ordinal)
+            || safeName.Contains("..", StringComparison.Ordinal))
+            return new GptSendResult { Ok = false, Error = "invalid_name" };
+
+        var fullPath = Path.Combine(SnapshotExportDirectory, safeName);
+        if (!File.Exists(fullPath))
+            return new GptSendResult { Ok = false, Error = "file_not_found" };
+
+        var bridgeReady = await ExecuteWebViewScriptAsync(
+                "(() => typeof window.__iaWpfAttachFileFromVirtualUrl === 'function')()")
+            .ConfigureAwait(true);
+        if (bridgeReady is not "true")
+            await EnsurePipelineInjectedAsync().ConfigureAwait(true);
+
+        if (!_pipelineInjected)
+            return new GptSendResult { Ok = false, Error = "attach_missing" };
+
+        GptWebView.Focus();
+        await Task.Delay(120).ConfigureAwait(true);
+
+        var enc = Uri.EscapeDataString(safeName);
+        var virtualUrl = $"https://{SnapshotExportVirtualHost}/{enc}";
+        var urlLit = JsonSerializer.Serialize(virtualUrl);
+        var nameLit = JsonSerializer.Serialize(safeName);
+        var mimeLit = JsonSerializer.Serialize(mimeType);
+
+        var tail =
+            "(async function(){ " +
+            "if (typeof window.__iaWpfAttachFileFromVirtualUrl !== 'function') return { ok: false, error: 'attach_url_helper_missing' }; " +
+            "return await window.__iaWpfAttachFileFromVirtualUrl(" + urlLit + "," + nameLit + "," + mimeLit + "); " +
+            "})()";
+        var script = await ComposePipelineScriptAsync(tail).ConfigureAwait(false);
+        var raw = await ExecuteWebViewScriptAsync(script).ConfigureAwait(true);
+        LogWebViewScriptResult(raw);
+        return TryParseGptSendResult(raw);
+    }
+
+    /// <summary>
+    /// Maps <see cref="SnapshotExportVirtualHost"/> to the export folder with CORS allowed so chatgpt.com can
+    /// <c>fetch()</c> snapshot bytes. Idempotent; call before first navigation and again before upload if needed.
+    /// </summary>
+    private void EnsureSnapshotExportHostMapped()
+    {
+        if (GptWebView.CoreWebView2 is null)
+            return;
+        Directory.CreateDirectory(SnapshotExportDirectory);
+        GptWebView.CoreWebView2.SetVirtualHostNameToFolderMapping(
+            SnapshotExportVirtualHost,
+            SnapshotExportDirectory,
+            CoreWebView2HostResourceAccessKind.Allow);
+    }
+
     private static string ToastMessageForImageAttach(GptSendResult? result)
     {
         var err = (result?.Error ?? "").Trim();
@@ -711,6 +828,27 @@ public partial class MainWindow : Window
             "could_not_focus_composer" => "Could not focus ChatGPT input.",
             _ when err.Length > 0 => ToastMessages.Trim($"Could not attach image. {err}"),
             _ => "Could not attach image.",
+        };
+    }
+
+    private static string ToastMessageForFileAttach(GptSendResult? result)
+    {
+        var err = (result?.Error ?? "").Trim();
+        return err switch
+        {
+            "composer_not_found" => "ChatGPT composer not found.",
+            "attachment_not_visible" => "Could not attach file. Drag the snapshot .txt into ChatGPT if needed.",
+            "file_missing" => "No file to attach.",
+            "attach_missing" => "Attach helper not loaded. Restart the app.",
+            "attach_timeout" => "Attach timed out. Click the ChatGPT box and try again.",
+            "could_not_focus_composer" => "Could not focus ChatGPT input.",
+            "invalid_name" => "Invalid snapshot file name.",
+            "file_not_found" => "Snapshot file missing — try the folder action again.",
+            "attach_url_helper_missing" => "Attach helper out of date. Restart the app.",
+            _ when err.StartsWith("fetch_failed_", StringComparison.Ordinal) =>
+                ToastMessages.Trim($"Could not load snapshot into ChatGPT. ({err})"),
+            _ when err.Length > 0 => ToastMessages.Trim($"Could not attach file. {err}"),
+            _ => "Could not attach file.",
         };
     }
 
@@ -1088,6 +1226,7 @@ public partial class MainWindow : Window
             GptWebView.DefaultBackgroundColor = System.Drawing.Color.FromArgb(0, 0, 0, 0);
             await GptWebView.EnsureCoreWebView2Async(env).ConfigureAwait(true);
             GptWebView.CoreWebView2.Settings.IsStatusBarEnabled = false;
+            EnsureSnapshotExportHostMapped();
             GptWebView.CoreWebView2.WebMessageReceived += CoreWebView2_OnWebMessageReceived;
             GptWebView.NavigationCompleted += GptWebView_OnNavigationCompleted;
             GptWebView.Source = new Uri("https://chatgpt.com/");
@@ -1411,7 +1550,147 @@ public partial class MainWindow : Window
         }
     }
 
-    private void GptFolderButton_OnClick(object sender, RoutedEventArgs e)
+    private async void GptFolderButton_OnClick(object sender, RoutedEventArgs e)
+    {
+        if (Keyboard.Modifiers == ModifierKeys.Shift)
+        {
+            OpenInterviewTranscriptsFolder();
+            return;
+        }
+
+        if (_folderCombineBusy)
+            return;
+
+        if (!_webViewInitialized || GptWebView.CoreWebView2 is null)
+        {
+            ToastService.Show("ChatGPT panel is not ready yet.", ToastLevel.Warning);
+            return;
+        }
+
+        var dlg = new VistaFolderBrowserDialog
+        {
+            Description =
+                "Choose a project folder. Text/code files are combined into one .txt snapshot and uploaded to the prompt (nothing is sent).",
+            Multiselect = false,
+            UseDescriptionForTitle = true,
+        };
+
+        if (dlg.ShowDialog(this) != true || string.IsNullOrWhiteSpace(dlg.SelectedPath))
+            return;
+
+        var selectedPath = dlg.SelectedPath;
+
+        _folderCombineBusy = true;
+        GptFolderButton.IsEnabled = false;
+        try
+        {
+            Directory.CreateDirectory(SnapshotExportDirectory);
+            var label = SafeExportFileLabel(selectedPath);
+            var outName = $"project-snapshot-{label}-{DateTime.UtcNow:yyyyMMddHHmmss}.txt";
+            var outPath = Path.Combine(SnapshotExportDirectory, outName);
+
+            ProjectDirectoryCombine.FileExportResult export;
+            try
+            {
+                export = await Task.Run(() => ProjectDirectoryCombine.ExportCombinedToFile(selectedPath, outPath))
+                    .ConfigureAwait(true);
+            }
+            catch (Exception ex)
+            {
+                ToastService.Show(ToastMessages.ForException(ex), ToastLevel.Error);
+                return;
+            }
+
+            if (!string.IsNullOrEmpty(export.TruncateNote) && export.FilesIncluded == 0)
+            {
+                ToastService.Show(ToastMessages.Trim(export.TruncateNote), ToastLevel.Warning);
+                return;
+            }
+
+            var folderDisplay =
+                Path.GetFileName(selectedPath.TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar));
+
+            if (export.FilesIncluded == 0)
+            {
+                ToastService.Show(ToastMessages.ForProjectCombineToast(0, false, folderDisplay), ToastLevel.Warning);
+                return;
+            }
+
+            try
+            {
+                _ = new FileInfo(outPath).Length;
+            }
+            catch (Exception ex)
+            {
+                ToastService.Show(ToastMessages.ForException(ex), ToastLevel.Error);
+                return;
+            }
+
+            // Fetch snapshot from host-mapped HTTPS URL inside WebView (same-origin-friendly), build File, attach like PNG.
+            var attachResult = await AttachSnapshotFromExportViaVirtualHostAsync(Path.GetFileName(outPath), "text/plain")
+                .ConfigureAwait(true);
+            if (attachResult?.Ok != true)
+            {
+                attachResult = await AttachSnapshotFromExportViaVirtualHostAsync(
+                        Path.GetFileName(outPath),
+                        "application/octet-stream")
+                    .ConfigureAwait(true);
+            }
+
+            if (attachResult?.Ok != true)
+            {
+                TryOpenExplorerSelectFile(outPath);
+                ToastService.Show(
+                    ToastMessages.Trim(
+                        $"{ToastMessageForFileAttach(attachResult)} Explorer opened on the .txt — drag it into ChatGPT if needed."),
+                    ToastLevel.Warning);
+                return;
+            }
+
+            var extraAttach = export.Truncated && !string.IsNullOrEmpty(export.TruncateNote)
+                ? $" {ToastMessages.Trim(export.TruncateNote)}"
+                : "";
+            ToastService.Show(
+                ToastMessages.Trim($"Snapshot uploaded to prompt ({export.FilesIncluded} files).{extraAttach}"),
+                ToastLevel.Success);
+        }
+        finally
+        {
+            _folderCombineBusy = false;
+            GptFolderButton.IsEnabled = true;
+        }
+    }
+
+    private static string SafeExportFileLabel(string folderPath)
+    {
+        var name = Path.GetFileName(folderPath.TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar));
+        if (string.IsNullOrWhiteSpace(name))
+            name = "project";
+        foreach (var c in Path.GetInvalidFileNameChars())
+            name = name.Replace(c, '_');
+        name = name.Trim();
+        return name.Length > 40 ? name[..40] : name;
+    }
+
+    private static bool TryOpenExplorerSelectFile(string filePath)
+    {
+        try
+        {
+            Process.Start(new ProcessStartInfo
+            {
+                FileName = "explorer.exe",
+                Arguments = "/select,\"" + filePath + "\"",
+                UseShellExecute = true,
+            });
+            return true;
+        }
+        catch
+        {
+            return false;
+        }
+    }
+
+    private void OpenInterviewTranscriptsFolder()
     {
         try
         {

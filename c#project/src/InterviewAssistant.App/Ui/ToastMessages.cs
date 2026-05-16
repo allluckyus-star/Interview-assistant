@@ -23,7 +23,30 @@ internal static class ToastMessages
         return $"Captured text: \"\"\"{t}\"\"\"";
     }
 
-    /// <summary>Short toast only — not pasted into ChatGPT.</summary>
+    /// <summary>Project folder snapshot pasted inline (not OCR — do not use Captured text label).</summary>
+    public static string FormatProjectSnapshotForPaste(string combinedBody)
+    {
+        var t = (combinedBody ?? "").Trim();
+        if (t.Length == 0)
+            return "Project snapshot:\n\n\"\"\"\"\"\"";
+        return $"Project snapshot:\n\n\"\"\"{t}\"\"\"";
+    }
+
+    /// <summary>Backward-compatible name; prefers <see cref="FormatProjectSnapshotForPaste"/>.</summary>
+    public static string FormatProjectFolderForPaste(string combinedBody) =>
+        FormatProjectSnapshotForPaste(combinedBody);
+
+    /// <summary>Short toast after combining a folder for GPT (not the pasted body).</summary>
+    public static string ForProjectCombineToast(int fileCount, bool truncated, string? folderName)
+    {
+        var label = string.IsNullOrEmpty(folderName) ? "folder" : Trim(folderName, 40);
+        if (fileCount <= 0)
+            return "No code/text files matched in that folder.";
+        return truncated
+            ? Trim($"Project snapshot: {fileCount} files (truncated). Source: {label}.")
+            : Trim($"Project snapshot: {fileCount} files. Source: {label}.");
+    }
+
     public static string ForSnipRecognizedToast(string? rawOcr)
     {
         var t = (rawOcr ?? "").Replace("\r\n", " ", StringComparison.Ordinal)

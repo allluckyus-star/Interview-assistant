@@ -308,7 +308,7 @@
                       Width="28"
                       Height="28"
                       shell:WindowChrome.IsHitTestVisibleInChrome="True"
-                      ToolTip="Open saved interview transcripts folder"
+                      ToolTip="Pick folder → upload combined snapshot .txt to ChatGPT (like image attach; does not send). Shift+click: open transcripts folder."
                       Click="GptFolderButton_OnClick">
                 <Viewbox x:Name="GptFolderIconHost" Width="14" Height="14" />
               </Button>
