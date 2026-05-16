@@ -45,3 +45,5 @@ registered_clients.json
 # OS metadata
 .DS_Store
 Thumbs.db
+# Accidental Windows reserved-name files (e.g. `command > nul` creates this in Git Bash)
+/nul

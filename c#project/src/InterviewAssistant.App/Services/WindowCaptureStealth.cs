@@ -1,3 +1,4 @@
+using System.Diagnostics;
 using System.Runtime.InteropServices;
 using System.Windows;
 using System.Windows.Interop;
@@ -8,6 +9,7 @@ namespace InterviewAssistant.App.Services;
 public static class WindowCaptureStealth
 {
     private const uint WdaNone = 0x00000000;
+    private const uint WdaMonitor = 0x00000001;
     private const uint WdaExcludeFromCapture = 0x00000011;
 
     public static bool IsSupported => OperatingSystem.IsWindows();
@@ -21,9 +23,32 @@ public static class WindowCaptureStealth
         if (hwnd == IntPtr.Zero)
             return false;
 
-        var affinity = excludeFromCapture ? WdaExcludeFromCapture : WdaNone;
-        return SetWindowDisplayAffinity(hwnd, affinity);
+        return SetHwndExcludeFromCapture(hwnd, excludeFromCapture);
     }
+
+    /// <summary>Exclude an arbitrary HWND from screen capture (e.g. Windows Live Captions).</summary>
+    public static bool SetHwndExcludeFromCapture(IntPtr hwnd, bool excludeFromCapture)
+    {
+        if (!IsSupported || hwnd == IntPtr.Zero)
+            return false;
+
+        if (!excludeFromCapture)
+            return SetAffinity(hwnd, WdaNone);
+
+        if (SetAffinity(hwnd, WdaExcludeFromCapture))
+            return true;
+
+        if (SetAffinity(hwnd, WdaMonitor))
+            return true;
+
+        var err = Marshal.GetLastWin32Error();
+        Trace.WriteLine(
+            $"[InterviewAssistant] SetWindowDisplayAffinity failed hwnd=0x{hwnd.ToInt64():X} err={err}");
+        return false;
+    }
+
+    private static bool SetAffinity(IntPtr hwnd, uint affinity) =>
+        SetWindowDisplayAffinity(hwnd, affinity);
 
     [DllImport("user32.dll", SetLastError = true)]
     private static extern bool SetWindowDisplayAffinity(IntPtr hwnd, uint dwAffinity);

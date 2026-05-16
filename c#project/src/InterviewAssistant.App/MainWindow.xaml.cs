@@ -1404,9 +1404,9 @@ public partial class MainWindow : Window
             ScheduleCaptureStealthSync();
             if (_clickThroughEnabled)
                 ScheduleClickThroughHwndRefresh();
-        }
-        catch
-        {
+            }
+            catch
+            {
             // ignore
         }
     }
