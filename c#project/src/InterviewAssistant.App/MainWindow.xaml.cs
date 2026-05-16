@@ -10,7 +10,9 @@ using System.Windows;
 using System.Windows.Controls;
 using System.Windows.Controls.Primitives;
 using System.Windows.Input;
+using System.Windows.Interop;
 using System.Windows.Media;
+using System.Windows.Media.Animation;
 using System.Windows.Threading;
 using InterviewAssistant.App.Services;
 using InterviewAssistant.App.Ui;
@@ -78,10 +80,17 @@ public partial class MainWindow : Window
     private bool _chunkSendInProgress;
     private bool _snipInProgress;
     private bool _captureStealthEnabled = WindowCaptureStealth.IsSupported;
-    private DispatcherTimer? _stealthAffinityTimer;
+    private CaptureStealthMonitor? _captureStealthMonitor;
     private readonly string? _startupToastMessage;
     private readonly ToastLevel _startupToastLevel;
     private string _latestGptAnswer = "";
+    private static readonly Color SessionModeDeepColor =
+        (Color)ColorConverter.ConvertFromString("#4dd0e1")!;
+    /// <summary>Same as the session mode outer bar fill so idle segments match the track.</summary>
+    private static readonly Color SessionModeLightColor =
+        (Color)ColorConverter.ConvertFromString("#b2ebf2")!;
+    private const double SessionModeMinWidthInactive = 28;
+    private string? _sessionModeUiShown;
     private static int _gptCopyInFlight;
 
     public MainWindow(PromptStore promptStore, string bridgeHost, int bridgePort, string? startupToastMessage = null, ToastLevel startupToastLevel = ToastLevel.Warning)
@@ -118,12 +127,8 @@ public partial class MainWindow : Window
         Directory.CreateDirectory(_webViewUserDataDir);
         _loginPollTimer = new DispatcherTimer { Interval = TimeSpan.FromMilliseconds(550) };
         _loginPollTimer.Tick += LoginPollTimer_OnTick;
-        _stealthAffinityTimer = new DispatcherTimer { Interval = TimeSpan.FromMilliseconds(80) };
-        _stealthAffinityTimer.Tick += (_, _) =>
-        {
-            _stealthAffinityTimer?.Stop();
-            ApplyCaptureStealth();
-        };
+        _captureStealthMonitor = new CaptureStealthMonitor(this, () => _captureStealthEnabled);
+        _captureStealthMonitor.Start();
         SizeChanged += (_, _) => ScheduleCaptureStealthSync();
         LocationChanged += (_, _) => ScheduleCaptureStealthSync();
         ApplyShellPrepChrome();
@@ -172,13 +177,15 @@ public partial class MainWindow : Window
 
     private void InitInterviewTopBarIcons()
     {
-        SessionModeIconHost.Child = TopBarIcons.CreateReadModeIcon(16);
+        SessionModeReadIconHost.Child = TopBarIcons.CreateReadModeIcon(14);
+        SessionModeTypeIconHost.Child = TopBarIcons.CreateTypeModeIcon(14);
+        SessionModeBehavioralIconHost.Child = TopBarIcons.CreateBehavioralModeIcon(14);
         SaveTranscriptIconHost.Child = TopBarIcons.CreateSaveIcon(16);
         SettingsNavIconHost.Child = TopBarIcons.CreateKebabIcon(16);
         StealthToggleButton.IsEnabled = WindowCaptureStealth.IsSupported;
         StealthToggleButton.IsChecked = _captureStealthEnabled;
         UpdateStealthToggleUi();
-        UpdateSessionModeButtonUi("read");
+        UpdateSessionModeButtonUi("read", animate: false);
     }
 
     protected override void OnSourceInitialized(EventArgs e)
@@ -191,15 +198,14 @@ public partial class MainWindow : Window
     {
         if (!WindowCaptureStealth.IsSupported || !_captureStealthEnabled)
             return;
-        _stealthAffinityTimer?.Stop();
-        _stealthAffinityTimer?.Start();
+        _captureStealthMonitor?.SyncNow(excludeFromCapture: true);
     }
 
     private void ApplyCaptureStealth()
     {
         if (!WindowCaptureStealth.IsSupported)
             return;
-        WindowCaptureStealth.SetEnabled(this, _captureStealthEnabled);
+        _captureStealthMonitor?.SyncNow(_captureStealthEnabled);
     }
 
     private void UpdateStealthToggleUi()
@@ -208,7 +214,7 @@ public partial class MainWindow : Window
         StealthIconHost.Child = TopBarIcons.CreateHumanStealthIcon(16, "#111111", stealthed);
         StealthToggleButton.IsChecked = stealthed;
         StealthToggleButton.ToolTip = stealthed
-            ? "Stealth on — hidden from screen capture / share"
+            ? null
             : WindowCaptureStealth.IsSupported
                 ? "Stealth off — visible in screen capture / share"
                 : "Stealth requires Windows";
@@ -221,7 +227,6 @@ public partial class MainWindow : Window
 
         _captureStealthEnabled = StealthToggleButton.IsChecked == true;
         ApplyCaptureStealth();
-        ScheduleCaptureStealthSync();
         UpdateStealthToggleUi();
         ToastService.Show(
             _captureStealthEnabled
@@ -230,16 +235,309 @@ public partial class MainWindow : Window
             ToastLevel.Info);
     }
 
-    private void UpdateSessionModeButtonUi(string mode)
+    private void UpdateSessionModeButtonUi(string mode, bool animate = false)
     {
         _interview.ModePrompts.SessionMode = mode;
-        SessionModeLabel.Text = char.ToUpper(mode[0]) + mode[1..];
-        SessionModeIconHost.Child = mode switch
+        var m = _interview.ModePrompts.SessionMode;
+        var fromUi = _sessionModeUiShown;
+
+        if (!animate)
         {
-            "type" => TopBarIcons.CreateTypeModeIcon(16),
-            "behavioral" => TopBarIcons.CreateBehavioralModeIcon(16),
-            _ => TopBarIcons.CreateReadModeIcon(16),
+            StopSessionModeSegmentAnimations();
+            ApplySessionModeSegmentsImmediate(m);
+            _sessionModeUiShown = m;
+            return;
+        }
+
+        if (fromUi == m)
+            return;
+
+        StopSessionModeSegmentAnimations();
+
+        if (fromUi is null)
+        {
+            ApplySessionModeSegmentsImmediate(m);
+            _sessionModeUiShown = m;
+            return;
+        }
+
+        ApplySessionModeSegmentsImmediate(fromUi);
+        _sessionModeUiShown = m;
+        AnimateSessionModeSwitch(fromUi, m);
+    }
+
+    private static double SessionModePreferredAnimWidth(string mode) =>
+        mode switch
+        {
+            "behavioral" => 120,
+            "type" => 66,
+            _ => 64,
         };
+
+    private static double SessionModeClipWidthExpanded(string mode) =>
+        mode switch
+        {
+            "type" => 40,
+            "behavioral" => 132,
+            _ => 36,
+        };
+
+    private static double SessionModeMinWidthActive(string mode) =>
+        mode switch
+        {
+            "type" => 60,
+            "behavioral" => 116,
+            _ => 58,
+        };
+
+    private (Button Button, TextBlock Label, Viewbox Icon, FrameworkElement TextClip) SessionModeSegmentParts(
+        string mode) =>
+        mode switch
+        {
+            "type" => (SessionModeTypeButton, SessionModeTypeLabel, SessionModeTypeIconHost, SessionModeTypeTextClip),
+            "behavioral" => (
+                SessionModeBehavioralButton,
+                SessionModeBehavioralLabel,
+                SessionModeBehavioralIconHost,
+                SessionModeBehavioralTextClip),
+            _ => (SessionModeReadButton, SessionModeReadLabel, SessionModeReadIconHost, SessionModeReadTextClip),
+        };
+
+    private void StopSessionModeSegmentAnimations()
+    {
+        foreach (var mode in new[] { "read", "type", "behavioral" })
+        {
+            var (btn, label, icon, clip) = SessionModeSegmentParts(mode);
+            label.BeginAnimation(UIElement.OpacityProperty, null);
+            btn.BeginAnimation(FrameworkElement.MinWidthProperty, null);
+            btn.BeginAnimation(FrameworkElement.WidthProperty, null);
+            clip.BeginAnimation(FrameworkElement.MaxWidthProperty, null);
+            if (btn.Background is SolidColorBrush { IsFrozen: false } b)
+                b.BeginAnimation(SolidColorBrush.ColorProperty, null);
+            if (icon.RenderTransform is ScaleTransform st)
+            {
+                st.BeginAnimation(ScaleTransform.ScaleXProperty, null);
+                st.BeginAnimation(ScaleTransform.ScaleYProperty, null);
+                st.ScaleX = 1;
+                st.ScaleY = 1;
+            }
+        }
+    }
+
+    private void ApplySessionModeSegmentsImmediate(string m)
+    {
+        ApplySessionModeSegmentStateImmediate(SessionModeReadButton, SessionModeReadLabel, SessionModeReadTextClip, "read", m == "read");
+        ApplySessionModeSegmentStateImmediate(SessionModeTypeButton, SessionModeTypeLabel, SessionModeTypeTextClip, "type", m == "type");
+        ApplySessionModeSegmentStateImmediate(
+            SessionModeBehavioralButton,
+            SessionModeBehavioralLabel,
+            SessionModeBehavioralTextClip,
+            "behavioral",
+            m == "behavioral");
+    }
+
+    private static void ApplySessionModeSegmentStateImmediate(
+        Button segment,
+        TextBlock label,
+        FrameworkElement textClip,
+        string modeKey,
+        bool active)
+    {
+        label.BeginAnimation(UIElement.OpacityProperty, null);
+        label.Opacity = 1;
+        label.Visibility = Visibility.Visible;
+        textClip.BeginAnimation(FrameworkElement.MaxWidthProperty, null);
+        segment.BeginAnimation(FrameworkElement.MinWidthProperty, null);
+        segment.BeginAnimation(FrameworkElement.WidthProperty, null);
+
+        textClip.Visibility = active ? Visibility.Visible : Visibility.Collapsed;
+
+        if (segment.Background is SolidColorBrush { IsFrozen: false } oldB)
+            oldB.BeginAnimation(SolidColorBrush.ColorProperty, null);
+
+        if (active)
+        {
+            segment.ClearValue(FrameworkElement.WidthProperty);
+            segment.MinWidth = SessionModeMinWidthActive(modeKey);
+        }
+        else
+        {
+            segment.Width = SessionModeMinWidthInactive;
+            segment.MinWidth = SessionModeMinWidthInactive;
+        }
+
+        textClip.MaxWidth = active ? SessionModeClipWidthExpanded(modeKey) : 0;
+        segment.Background = new SolidColorBrush(active ? SessionModeDeepColor : SessionModeLightColor);
+    }
+
+    private void AnimateSessionModeSwitch(string from, string to)
+    {
+        var (fromBtn, _, _, fromClip) = SessionModeSegmentParts(from);
+        var (toBtn, _, toIcon, toClip) = SessionModeSegmentParts(to);
+
+        var dur = TimeSpan.FromMilliseconds(260);
+        var ease = new CubicEase { EasingMode = EasingMode.EaseInOut };
+        var stagger = TimeSpan.FromMilliseconds(35);
+
+        fromBtn.UpdateLayout();
+        var fromW = Math.Max(SessionModeMinWidthInactive, fromBtn.ActualWidth);
+        if (fromW < SessionModePreferredAnimWidth(from))
+            fromW = SessionModePreferredAnimWidth(from);
+
+        fromClip.Visibility = Visibility.Visible;
+
+        fromBtn.MinWidth = SessionModeMinWidthInactive;
+        fromBtn.BeginAnimation(FrameworkElement.WidthProperty, null);
+        fromBtn.Width = fromW;
+
+        AnimateDouble(
+            fromClip,
+            FrameworkElement.MaxWidthProperty,
+            SessionModeClipWidthExpanded(from),
+            0,
+            dur,
+            ease,
+            onCompleted: () =>
+            {
+                fromClip.BeginAnimation(FrameworkElement.MaxWidthProperty, null);
+                fromClip.Visibility = Visibility.Collapsed;
+            });
+        AnimateSegmentBackground(fromBtn, SessionModeDeepColor, SessionModeLightColor, 260);
+        AnimateDouble(
+            fromBtn,
+            FrameworkElement.WidthProperty,
+            fromW,
+            SessionModeMinWidthInactive,
+            dur,
+            ease,
+            onCompleted: () =>
+            {
+                fromBtn.BeginAnimation(FrameworkElement.WidthProperty, null);
+                fromBtn.Width = SessionModeMinWidthInactive;
+                fromBtn.MinWidth = SessionModeMinWidthInactive;
+            });
+
+        toBtn.MinWidth = SessionModeMinWidthInactive;
+        toBtn.BeginAnimation(FrameworkElement.WidthProperty, null);
+        toBtn.Width = SessionModeMinWidthInactive;
+        toClip.Visibility = Visibility.Visible;
+        toClip.MaxWidth = 0;
+        var toTarget = SessionModePreferredAnimWidth(to);
+
+        AnimateDouble(
+            toClip,
+            FrameworkElement.MaxWidthProperty,
+            0,
+            SessionModeClipWidthExpanded(to),
+            dur,
+            ease,
+            stagger);
+        AnimateSegmentBackground(toBtn, SessionModeLightColor, SessionModeDeepColor, 270, stagger);
+        AnimateDouble(
+            toBtn,
+            FrameworkElement.WidthProperty,
+            SessionModeMinWidthInactive,
+            toTarget,
+            dur,
+            ease,
+            stagger,
+            onCompleted: () =>
+            {
+                toBtn.BeginAnimation(FrameworkElement.WidthProperty, null);
+                toBtn.ClearValue(FrameworkElement.WidthProperty);
+                toBtn.MinWidth = SessionModeMinWidthActive(to);
+            });
+
+        PulseSessionModeIcon(toIcon);
+    }
+
+    private static void AnimateDouble(
+        FrameworkElement el,
+        DependencyProperty prop,
+        double from,
+        double to,
+        TimeSpan dur,
+        IEasingFunction ease,
+        TimeSpan? beginTime = null,
+        Action? onCompleted = null)
+    {
+        el.BeginAnimation(prop, null);
+        var a = new DoubleAnimation(from, to, dur) { EasingFunction = ease };
+        if (beginTime.HasValue)
+            a.BeginTime = beginTime;
+        if (onCompleted is not null)
+            a.Completed += (_, _) => onCompleted();
+        el.BeginAnimation(prop, a);
+    }
+
+    private static void AnimateDouble(
+        FrameworkElement el,
+        DependencyProperty prop,
+        double from,
+        double to,
+        TimeSpan dur,
+        IEasingFunction ease,
+        TimeSpan? beginTime)
+    {
+        AnimateDouble(el, prop, from, to, dur, ease, beginTime, null);
+    }
+
+    private static void AnimateSegmentBackground(Button btn, Color from, Color to, int ms, TimeSpan? beginTime = null)
+    {
+        if (btn.Background is SolidColorBrush { IsFrozen: false } existing)
+            existing.BeginAnimation(SolidColorBrush.ColorProperty, null);
+        var brush = new SolidColorBrush(from);
+        btn.Background = brush;
+        var anim = new ColorAnimation(from, to, TimeSpan.FromMilliseconds(ms))
+        {
+            EasingFunction = new QuadraticEase { EasingMode = EasingMode.EaseOut },
+        };
+        if (beginTime.HasValue)
+            anim.BeginTime = beginTime;
+        brush.BeginAnimation(SolidColorBrush.ColorProperty, anim);
+    }
+
+    private static void PulseSessionModeIcon(Viewbox icon)
+    {
+        if (icon.RenderTransform is not ScaleTransform st)
+            return;
+        st.BeginAnimation(ScaleTransform.ScaleXProperty, null);
+        st.BeginAnimation(ScaleTransform.ScaleYProperty, null);
+        st.ScaleX = 1;
+        st.ScaleY = 1;
+
+        const double keyMid = 0.42;
+        var dur = TimeSpan.FromMilliseconds(300);
+        var ax = new DoubleAnimationUsingKeyFrames { Duration = dur };
+        ax.KeyFrames.Add(new LinearDoubleKeyFrame(1, KeyTime.FromTimeSpan(TimeSpan.Zero)));
+        ax.KeyFrames.Add(new EasingDoubleKeyFrame(
+            1.12,
+            KeyTime.FromPercent(keyMid),
+            new CubicEase { EasingMode = EasingMode.EaseOut }));
+        ax.KeyFrames.Add(new EasingDoubleKeyFrame(
+            1,
+            KeyTime.FromPercent(1),
+            new QuadraticEase { EasingMode = EasingMode.EaseInOut }));
+
+        var ay = new DoubleAnimationUsingKeyFrames { Duration = dur };
+        ay.KeyFrames.Add(new LinearDoubleKeyFrame(1, KeyTime.FromTimeSpan(TimeSpan.Zero)));
+        ay.KeyFrames.Add(new EasingDoubleKeyFrame(
+            1.12,
+            KeyTime.FromPercent(keyMid),
+            new CubicEase { EasingMode = EasingMode.EaseOut }));
+        ay.KeyFrames.Add(new EasingDoubleKeyFrame(
+            1,
+            KeyTime.FromPercent(1),
+            new QuadraticEase { EasingMode = EasingMode.EaseInOut }));
+
+        var sb = new Storyboard();
+        Storyboard.SetTarget(ax, st);
+        Storyboard.SetTargetProperty(ax, new PropertyPath("ScaleX"));
+        Storyboard.SetTarget(ay, st);
+        Storyboard.SetTargetProperty(ay, new PropertyPath("ScaleY"));
+        sb.Children.Add(ax);
+        sb.Children.Add(ay);
+        sb.Begin();
     }
 
     private void EnterMainInterviewMode()
@@ -263,7 +561,7 @@ public partial class MainWindow : Window
 
         _interviewSessionActive = true;
         InterviewTopBarPanel.Visibility = Visibility.Visible;
-        UpdateSessionModeButtonUi(_interview.ModePrompts.SessionMode);
+        UpdateSessionModeButtonUi(_interview.ModePrompts.SessionMode, animate: false);
     }
 
     private void LeaveMainInterviewMode()
@@ -300,20 +598,13 @@ public partial class MainWindow : Window
         }
     }
 
-    private void SessionModeButton_OnClick(object sender, RoutedEventArgs e)
+    private void SessionModeSegment_OnClick(object sender, RoutedEventArgs e)
     {
-        if (sender is Button b && b.ContextMenu is not null)
-        {
-            b.ContextMenu.PlacementTarget = b;
-            b.ContextMenu.IsOpen = true;
-        }
-    }
-
-    private void SessionModeMenu_OnClick(object sender, RoutedEventArgs e)
-    {
-        if (sender is not MenuItem item || item.Tag is not string mode)
+        if (sender is not Button { Tag: string mode })
             return;
-        UpdateSessionModeButtonUi(mode);
+        if (_interview.ModePrompts.SessionMode == mode)
+            return;
+        UpdateSessionModeButtonUi(mode, animate: true);
         var label = char.ToUpper(mode[0]) + mode[1..] + " mode.";
         ToastService.Show(label, ToastLevel.Success);
     }
@@ -883,6 +1174,7 @@ public partial class MainWindow : Window
         {
             await EnsurePipelineInjectedAsync().ConfigureAwait(true);
             await PushChatGptDomOpacityAsync().ConfigureAwait(true);
+            ScheduleCaptureStealthSync();
         }
         catch
         {
@@ -1475,6 +1767,8 @@ public partial class MainWindow : Window
     protected override void OnClosed(EventArgs e)
     {
         LeaveMainInterviewMode();
+        _captureStealthMonitor?.Dispose();
+        _captureStealthMonitor = null;
         _opacityHotkeys.Dispose();
         _hotkeys.Dispose();
         _interview.Dispose();

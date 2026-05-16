@@ -4,9 +4,7 @@ using System.Windows.Interop;
 
 namespace InterviewAssistant.App.Services;
 
-/// <summary>
-/// Win32 SetWindowDisplayAffinity — hide window from screen capture / share (live.py stealth).
-/// </summary>
+/// <summary>Win32 SetWindowDisplayAffinity entry points (see <see cref="CaptureStealthMonitor"/>).</summary>
 public static class WindowCaptureStealth
 {
     private const uint WdaNone = 0x00000000;
