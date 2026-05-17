@@ -19,6 +19,7 @@ using InterviewAssistant.App.Services;
 using InterviewAssistant.App.Ui;
 using InterviewAssistant.Bridge;
 using Microsoft.Web.WebView2.Core;
+using Microsoft.Web.WebView2.Wpf;
 using Microsoft.Win32;
 using Ookii.Dialogs.Wpf;
 
@@ -57,6 +58,8 @@ public partial class MainWindow : Window
     }
 
     private WizardStep _step = WizardStep.Step1ResumeJd;
+    private WebView2? GptWebView;
+    private CoreWebView2? GptCore => GptWebView?.CoreWebView2;
     private bool _webViewInitialized;
     private bool _pipelineInjected;
     private bool _sendInProgress;
@@ -110,7 +113,21 @@ public partial class MainWindow : Window
 
     public MainWindow(PromptStore promptStore, string bridgeHost, int bridgePort, string? startupToastMessage = null, ToastLevel startupToastLevel = ToastLevel.Warning)
     {
-        InitializeComponent();
+        StartupDiagnostics.Log("MainWindow: before InitializeComponent");
+        ApplyOpaqueWindowFallbackIfRequested();
+        try
+        {
+            InitializeComponent();
+        }
+        catch (Exception ex)
+        {
+            StartupDiagnostics.Log($"MainWindow: InitializeComponent failed: {ex}");
+            throw;
+        }
+
+        StartupDiagnostics.Log("MainWindow: after InitializeComponent");
+        TryCreateGptWebViewControl();
+        StartupDiagnostics.Log("MainWindow: after WebView setup");
         ToastService.Register(AppToastHost);
         _startupToastMessage = startupToastMessage;
         _startupToastLevel = startupToastLevel;
@@ -159,6 +176,60 @@ public partial class MainWindow : Window
         GptFolderIconHost.Child = TopBarIcons.CreateFolderIcon(14, "#111111");
         WindowTaskbarHiding.Apply(this);
         ApplyWizardUi();
+        StartupDiagnostics.Log("MainWindow: constructor done");
+    }
+
+    /// <summary>
+    /// Default UI uses a transparent window so opacity shows the desktop behind.
+    /// Set env <c>IA_OPAQUE_WINDOW=1</c> only if transparency crashes on a specific PC.
+    /// </summary>
+    private void ApplyOpaqueWindowFallbackIfRequested()
+    {
+        if (!string.Equals(
+                Environment.GetEnvironmentVariable("IA_OPAQUE_WINDOW"),
+                "1",
+                StringComparison.OrdinalIgnoreCase))
+            return;
+
+        AllowsTransparency = false;
+        Background = new SolidColorBrush(Color.FromRgb(0xF0, 0xF2, 0xF5));
+        StartupDiagnostics.Log("MainWindow: IA_OPAQUE_WINDOW=1 (dimmed opacity, not see-through)");
+    }
+
+    private void TryCreateGptWebViewControl()
+    {
+        if (GptWebView is not null)
+            return;
+
+        if (!WebView2RuntimeCheck.TryGetInstalledVersion(out var version, out var error))
+        {
+            StartupDiagnostics.Log(
+                $"WebView2 runtime not available: {error ?? "not installed"}");
+            GptWebViewHost.Children.Add(new TextBlock
+            {
+                Text = "WebView2 Runtime is required for ChatGPT.\n\n"
+                    + "Install: https://go.microsoft.com/fwlink/p/?LinkId=2124703\n"
+                    + "Then restart this app.",
+                TextWrapping = TextWrapping.Wrap,
+                VerticalAlignment = VerticalAlignment.Center,
+                HorizontalAlignment = HorizontalAlignment.Center,
+                Margin = new Thickness(16),
+                Foreground = new SolidColorBrush(Color.FromRgb(0x33, 0x33, 0x33)),
+            });
+            return;
+        }
+
+        try
+        {
+            StartupDiagnostics.Log($"WebView2 runtime: {version}");
+            GptWebView = new WebView2 { Visibility = Visibility.Visible };
+            GptWebViewHost.Children.Add(GptWebView);
+        }
+        catch (Exception ex)
+        {
+            StartupDiagnostics.Log($"WebView2 control create failed: {ex}");
+            StartupDiagnostics.ShowFatalDialog("WebView2 could not load.", ex);
+        }
     }
 
     private void WireInterviewSession()
@@ -764,7 +835,7 @@ public partial class MainWindow : Window
 
     private async Task<GptSendResult?> AttachImageToComposerAsync(string imagePngBase64)
     {
-        if (GptWebView.CoreWebView2 is null)
+        if (GptCore is null)
             return new GptSendResult { Ok = false, Error = "webview_not_ready" };
 
         var bridgeReady = await ExecuteWebViewScriptAsync(
@@ -792,7 +863,7 @@ public partial class MainWindow : Window
                 requestId,
                 imagePngBase64,
             });
-            GptWebView.CoreWebView2.PostWebMessageAsJson(payload);
+            GptCore.PostWebMessageAsJson(payload);
 
             var completed = await Task.WhenAny(tcs.Task, Task.Delay(TimeSpan.FromSeconds(60))).ConfigureAwait(true);
             if (completed != tcs.Task)
@@ -808,7 +879,7 @@ public partial class MainWindow : Window
 
     private async Task<GptSendResult?> AttachBinaryFileToComposerAsync(string fileBase64, string fileName, string mimeType)
     {
-        if (GptWebView.CoreWebView2 is null)
+        if (GptCore is null)
             return new GptSendResult { Ok = false, Error = "webview_not_ready" };
 
         var bridgeReady = await ExecuteWebViewScriptAsync(
@@ -836,7 +907,7 @@ public partial class MainWindow : Window
                 fileName,
                 mimeType,
             });
-            GptWebView.CoreWebView2.PostWebMessageAsJson(payload);
+            GptCore.PostWebMessageAsJson(payload);
 
             var completed = await Task.WhenAny(tcs.Task, Task.Delay(TimeSpan.FromSeconds(90))).ConfigureAwait(true);
             if (completed != tcs.Task)
@@ -856,7 +927,7 @@ public partial class MainWindow : Window
     /// </summary>
     private async Task<GptSendResult?> AttachSnapshotFromExportViaVirtualHostAsync(string exportFileName, string mimeType)
     {
-        if (GptWebView.CoreWebView2 is null)
+        if (GptCore is null)
             return new GptSendResult { Ok = false, Error = "webview_not_ready" };
 
         EnsureSnapshotExportHostMapped();
@@ -906,10 +977,10 @@ public partial class MainWindow : Window
     /// </summary>
     private void EnsureSnapshotExportHostMapped()
     {
-        if (GptWebView.CoreWebView2 is null)
+        if (GptCore is null)
             return;
         Directory.CreateDirectory(SnapshotExportDirectory);
-        GptWebView.CoreWebView2.SetVirtualHostNameToFolderMapping(
+        GptCore.SetVirtualHostNameToFolderMapping(
             SnapshotExportVirtualHost,
             SnapshotExportDirectory,
             CoreWebView2HostResourceAccessKind.Allow);
@@ -954,7 +1025,7 @@ public partial class MainWindow : Window
 
     private async Task<GptSendResult?> PasteTextToComposerAsync(string text, bool append = true)
     {
-        if (GptWebView.CoreWebView2 is null)
+        if (GptCore is null)
             return new GptSendResult { Ok = false, Error = "webview_not_ready" };
 
         if (!await EnsurePipelineInjectedAsync().ConfigureAwait(true))
@@ -1002,7 +1073,7 @@ public partial class MainWindow : Window
 
     private async Task<GptSendResult?> PasteTextViaPostMessageAsync(string text, bool append)
     {
-        if (GptWebView.CoreWebView2 is null)
+        if (GptCore is null)
             return null;
 
         var requestId = Guid.NewGuid().ToString("N");
@@ -1017,7 +1088,7 @@ public partial class MainWindow : Window
                 text,
                 append,
             });
-            GptWebView.CoreWebView2.PostWebMessageAsJson(payload);
+            GptCore.PostWebMessageAsJson(payload);
 
             var completed = await Task.WhenAny(tcs.Task, Task.Delay(TimeSpan.FromSeconds(20))).ConfigureAwait(true);
             return completed != tcs.Task
@@ -1139,7 +1210,7 @@ public partial class MainWindow : Window
             return;
         }
 
-        if (!_webViewInitialized || GptWebView.CoreWebView2 is null)
+        if (!_webViewInitialized || GptCore is null)
         {
             ToastService.Show("Send failed. GPT not ready.", ToastLevel.Warning);
             return;
@@ -1210,7 +1281,7 @@ public partial class MainWindow : Window
 
     private async Task PushChatGptDomOpacityAsync()
     {
-        if (!_webViewInitialized || GptWebView.CoreWebView2 is null)
+        if (!_webViewInitialized || GptCore is null)
             return;
         var o = _lastChatPageOpacity01;
         if (o < 0)
@@ -1254,7 +1325,7 @@ public partial class MainWindow : Window
 
     private async Task<string> ExecuteWebViewScriptAsync(string script)
     {
-        if (GptWebView.CoreWebView2 is null)
+        if (GptCore is null)
             return "";
         await _webViewScriptGate.WaitAsync().ConfigureAwait(true);
         try
@@ -1335,6 +1406,13 @@ public partial class MainWindow : Window
     {
         if (_webViewInitialized)
             return;
+        if (GptWebView is null)
+        {
+            TryCreateGptWebViewControl();
+            if (GptWebView is null)
+                return;
+        }
+
         try
         {
             var env = await CoreWebView2Environment
@@ -1342,9 +1420,9 @@ public partial class MainWindow : Window
                 .ConfigureAwait(true);
             GptWebView.DefaultBackgroundColor = System.Drawing.Color.FromArgb(0, 0, 0, 0);
             await GptWebView.EnsureCoreWebView2Async(env).ConfigureAwait(true);
-            GptWebView.CoreWebView2.Settings.IsStatusBarEnabled = false;
+            GptCore.Settings.IsStatusBarEnabled = false;
             EnsureSnapshotExportHostMapped();
-            GptWebView.CoreWebView2.WebMessageReceived += CoreWebView2_OnWebMessageReceived;
+            GptCore.WebMessageReceived += CoreWebView2_OnWebMessageReceived;
             GptWebView.NavigationCompleted += GptWebView_OnNavigationCompleted;
             GptWebView.Source = new Uri("https://chatgpt.com/");
             _webViewInitialized = true;
@@ -1352,6 +1430,7 @@ public partial class MainWindow : Window
         }
         catch (Exception ex)
         {
+            StartupDiagnostics.Log($"WebView2 init failed: {ex}");
             ToastService.Show(ToastMessages.Trim($"WebView2 failed. {ex.Message}"), ToastLevel.Error);
         }
     }
@@ -1420,7 +1499,7 @@ public partial class MainWindow : Window
 
     private async void GptWebView_OnNavigationCompleted(object? sender, CoreWebView2NavigationCompletedEventArgs e)
     {
-        if (!e.IsSuccess || GptWebView.CoreWebView2 is null)
+        if (!e.IsSuccess || GptCore is null)
             return;
         var uri = GptWebView.Source?.ToString() ?? "";
         if (!uri.Contains("chatgpt.com", StringComparison.OrdinalIgnoreCase))
@@ -1442,7 +1521,7 @@ public partial class MainWindow : Window
 
     private async Task<bool> EnsurePipelineInjectedAsync()
     {
-        if (GptWebView.CoreWebView2 is null)
+        if (GptCore is null)
             return false;
 
         var ready = await ExecuteWebViewScriptAsync(
@@ -1587,7 +1666,7 @@ public partial class MainWindow : Window
         if (_snipInProgress)
             return;
 
-        if (_step != WizardStep.Main || !_webViewInitialized || GptWebView.CoreWebView2 is null)
+        if (_step != WizardStep.Main || !_webViewInitialized || GptCore is null)
         {
             ToastService.Show("Snip is available in the main interview view.", ToastLevel.Warning);
             return;
@@ -1680,7 +1759,7 @@ public partial class MainWindow : Window
         if (_folderCombineBusy)
             return;
 
-        if (!_webViewInitialized || GptWebView.CoreWebView2 is null)
+        if (!_webViewInitialized || GptCore is null)
         {
             ToastService.Show("ChatGPT panel is not ready yet.", ToastLevel.Warning);
             return;
@@ -1861,7 +1940,7 @@ public partial class MainWindow : Window
         if (!string.IsNullOrWhiteSpace(_latestGptAnswer))
             return _latestGptAnswer;
 
-        if (!_webViewInitialized || GptWebView.CoreWebView2 is null)
+        if (!_webViewInitialized || GptCore is null)
             return "";
 
         if (!_pipelineInjected)
@@ -1893,7 +1972,7 @@ public partial class MainWindow : Window
 
     private async void LoginPollTimer_OnTick(object? sender, EventArgs e)
     {
-        if (_step != WizardStep.Step2Login || !_webViewInitialized || GptWebView.CoreWebView2 is null)
+        if (_step != WizardStep.Step2Login || !_webViewInitialized || GptCore is null)
             return;
         try
         {
@@ -1970,7 +2049,7 @@ public partial class MainWindow : Window
 
     private async Task RunPrepSendAsync(PrepSendKind kind)
     {
-        if (_sendInProgress || !_webViewInitialized || GptWebView.CoreWebView2 is null)
+        if (_sendInProgress || !_webViewInitialized || GptCore is null)
             return;
         _sendInProgress = true;
         SetWizardFooterButtonsEnabled(false);
@@ -2164,6 +2243,7 @@ public partial class MainWindow : Window
 
     protected override void OnClosed(EventArgs e)
     {
+        StartupDiagnostics.Log("MainWindow: OnClosed (window closed — app will exit if last window)");
         LeaveMainInterviewMode();
         _captureStealthMonitor?.Dispose();
         _captureStealthMonitor = null;

@@ -32,8 +32,7 @@
   <Border x:Name="ShellCard"
           Margin="8"
           Background="#FCFCFF"
-          BorderBrush="#E2E8F0"
-          BorderThickness="1"
+          BorderThickness="0"
           CornerRadius="12"
           Padding="14">
     <Grid>
@@ -270,9 +269,8 @@
               <ColumnDefinition Width="*" />
               <ColumnDefinition Width="Auto" />
             </Grid.ColumnDefinitions>
-            <wv2:WebView2 x:Name="GptWebView"
-                          Grid.Column="0"
-                          Visibility="Visible" />
+            <Grid x:Name="GptWebViewHost"
+                  Grid.Column="0" />
             <StackPanel x:Name="GptSideToolStack"
                         Grid.Column="1"
                         VerticalAlignment="Top"

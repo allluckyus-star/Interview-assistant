@@ -31,5 +31,9 @@ if (-not (Test-Path -LiteralPath $exe)) {
 $sizeMb = [math]::Round((Get-Item -LiteralPath $exe).Length / 1MB, 1)
 Write-Host ""
 Write-Host "Done: $exe ($sizeMb MB)"
-Write-Host "Copy that .exe to another Windows PC and run it."
-Write-Host "If WebView2 is missing, install: https://go.microsoft.com/fwlink/p/?LinkId=2124703"
+Write-Host "Copy ONLY that .exe to another Windows PC (64-bit Win10 2004+ or Win11)."
+Write-Host "No .NET install needed on the target PC (runtime is inside the exe)."
+Copy-Item -Force (Join-Path $root "publish\READ-ME-on-other-PC.txt") (Join-Path $outDir "READ-ME-on-other-PC.txt") -ErrorAction SilentlyContinue
+Write-Host "If it won't start, check InterviewAssistant-startup.log next to the exe"
+Write-Host "  or $env:TEMP\InterviewAssistant\startup.log"
+Write-Host "WebView2 (if ChatGPT pane fails): https://go.microsoft.com/fwlink/p/?LinkId=2124703"

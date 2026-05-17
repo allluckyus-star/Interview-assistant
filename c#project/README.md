@@ -31,7 +31,7 @@ Output: `publish\win-x64\InterviewAssistant.App.exe` — copy **only that file**
 
 ## Configuration
 
-- `src/InterviewAssistant.App/appsettings.json` — `Bridge:Host` and `Bridge:Port` (default `127.0.0.1:8765`, matching `PromptBridgeServer` in `bridge_server.py`). Change the port if the Python bridge is already running.
+- `src/InterviewAssistant.App/appsettings.json` — `Bridge:Host` and `Bridge:Port` (default `127.0.0.1:1212`). Change if that port is already in use. Python `bridge_server.py` and the browser extension still default to `8765` unless you update those too.
 
 ## WebView2 profile
 
