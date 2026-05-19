@@ -83,11 +83,13 @@ public partial class MainWindow : Window
     private readonly OpacityWindowHotkeys _opacityHotkeys;
     private readonly ClickThroughHotkeys _clickThroughHotkeys;
     private readonly CaptureStealthHotkeys _stealthHotkeys;
+    private readonly SnipComposerHotkeys _snipHotkeys;
     private readonly InterviewSessionCoordinator _interview;
     private bool _interviewSessionActive;
     private bool _settingsViewActive;
     private bool _chunkSendInProgress;
     private bool _snipInProgress;
+    private CancellationTokenSource? _snipCaptureCts;
     private bool _folderCombineBusy;
     private bool _captureStealthEnabled;
     private bool _clickThroughEnabled;
@@ -143,6 +145,12 @@ public partial class MainWindow : Window
         _stealthHotkeys.StealthTogglePressed += () =>
             Dispatcher.BeginInvoke(ToggleCaptureStealthWithHotkey);
         _stealthHotkeys.Attach();
+        _snipHotkeys = new SnipComposerHotkeys(this);
+        _snipHotkeys.ImageSnipPressed += () =>
+            Dispatcher.BeginInvoke(() => _ = RunSnipThenAsync(attachImage: true));
+        _snipHotkeys.TextSnipPressed += () =>
+            Dispatcher.BeginInvoke(() => _ = RunSnipThenAsync(attachImage: false));
+        _snipHotkeys.Attach();
         _interview = new InterviewSessionCoordinator(promptStore, bridgeHost, bridgePort, _hotkeys);
         WireInterviewSession();
         InitInterviewTopBarIcons();
@@ -1135,7 +1143,7 @@ public partial class MainWindow : Window
         };
     }
 
-    private async Task<byte[]?> CaptureScreenSnipAsync(bool forTextOcr = false)
+    private async Task<byte[]?> CaptureScreenSnipAsync(bool forTextOcr, CancellationToken cancellationToken)
     {
         Topmost = false;
         ToastService.Clear();
@@ -1143,7 +1151,8 @@ public partial class MainWindow : Window
             ? "Snip on-screen text only (not this app or chat)."
             : "Snip: Win+Shift+S, then select an area.";
         ToastService.Show(hint, ToastLevel.Info);
-        return await WindowsScreenSnipCapture.CaptureViaOsSnipAsync(Dispatcher).ConfigureAwait(true);
+        return await WindowsScreenSnipCapture.CaptureViaOsSnipAsync(Dispatcher, cancellationToken)
+            .ConfigureAwait(true);
     }
 
     private static GptSendResult? TryParseGptSendResult(string? raw)
@@ -1353,7 +1362,8 @@ public partial class MainWindow : Window
         if (!string.IsNullOrWhiteSpace(_startupToastMessage))
             ToastService.Show(_startupToastMessage, _startupToastLevel);
         _hotkeys.Start();
-        if (!_opacityHotkeys.IsRegistered || !_clickThroughHotkeys.IsRegistered || !_stealthHotkeys.IsRegistered)
+        if (!_opacityHotkeys.IsRegistered || !_clickThroughHotkeys.IsRegistered || !_stealthHotkeys.IsRegistered
+            || !_snipHotkeys.IsImageRegistered || !_snipHotkeys.IsTextRegistered)
         {
             var missing = string.Join(
                 ", ",
@@ -1362,6 +1372,8 @@ public partial class MainWindow : Window
                         !_opacityHotkeys.IsRegistered ? "Alt+Shift+1 (opacity)" : null,
                         !_clickThroughHotkeys.IsRegistered ? "Alt+Shift+2 (click-through)" : null,
                         !_stealthHotkeys.IsRegistered ? "Alt+Shift+3 (stealth)" : null,
+                        !_snipHotkeys.IsImageRegistered ? "Ctrl+Insert (image snip)" : null,
+                        !_snipHotkeys.IsTextRegistered ? "Ctrl+Home (text snip)" : null,
                     }.Where(s => s is not null));
             ToastService.Show(
                 ToastMessages.Trim($"Hotkey(s) not registered: {missing}. Another app may own the combo."),
@@ -1672,13 +1684,18 @@ public partial class MainWindow : Window
             return;
         }
 
+        _snipCaptureCts?.Cancel();
+        _snipCaptureCts?.Dispose();
+        _snipCaptureCts = new CancellationTokenSource();
+        var snipCt = _snipCaptureCts.Token;
+
         _snipInProgress = true;
         GptImageButton.IsEnabled = false;
         GptTextButton.IsEnabled = false;
         var wasTopmost = Topmost;
         try
         {
-            var png = await CaptureScreenSnipAsync(forTextOcr: !attachImage).ConfigureAwait(true);
+            var png = await CaptureScreenSnipAsync(forTextOcr: !attachImage, snipCt).ConfigureAwait(true);
             if (png is null || png.Length == 0)
             {
                 ToastService.Show("Snip cancelled.", ToastLevel.Warning);
@@ -1724,8 +1741,6 @@ public partial class MainWindow : Window
             }
 
             var pastePayload = ToastMessages.FormatCapturedTextForPaste(text);
-            Trace.WriteLine($"[InterviewAssistant][ocr] raw chars={text.Length}");
-            Trace.WriteLine($"[InterviewAssistant][paste] payload={pastePayload}");
             ToastService.Show(ToastMessages.ForSnipRecognizedToast(text), ToastLevel.Info);
 
             var pasteResult = await PasteTextToComposerAsync(pastePayload).ConfigureAwait(true);
@@ -1740,11 +1755,12 @@ public partial class MainWindow : Window
         }
         finally
         {
-            if (Topmost != wasTopmost)
-                Topmost = wasTopmost;
+            Topmost = wasTopmost;
             GptImageButton.IsEnabled = true;
             GptTextButton.IsEnabled = true;
             _snipInProgress = false;
+            _snipCaptureCts?.Dispose();
+            _snipCaptureCts = null;
         }
     }
 
@@ -2027,10 +2043,17 @@ public partial class MainWindow : Window
     {
         if (_sendInProgress)
             return;
-        if (_step is WizardStep.Step3ResumeSummary or WizardStep.Step4JdSummary or WizardStep.Step5Interview)
+        switch (_step)
         {
-            _step = WizardStep.Main;
-            ApplyWizardUi();
+            case WizardStep.Step3ResumeSummary:
+            case WizardStep.Step4JdSummary:
+                _step = (WizardStep)((int)_step + 1);
+                ApplyWizardUi();
+                break;
+            case WizardStep.Step5Interview:
+                _step = WizardStep.Main;
+                ApplyWizardUi();
+                break;
         }
     }
 
@@ -2251,6 +2274,7 @@ public partial class MainWindow : Window
         _clickThroughController = null;
         _clickThroughHotkeys.Dispose();
         _stealthHotkeys.Dispose();
+        _snipHotkeys.Dispose();
         _opacityHotkeys.Dispose();
         _hotkeys.Dispose();
         _interview.Dispose();

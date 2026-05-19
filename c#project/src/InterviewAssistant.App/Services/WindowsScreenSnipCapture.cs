@@ -1,6 +1,8 @@
 using System.Diagnostics;
 using System.IO;
 using System.Runtime.InteropServices;
+using System.Text;
+using System.Threading;
 using System.Windows;
 using System.Windows.Media;
 using System.Windows.Media.Imaging;
@@ -11,8 +13,12 @@ namespace InterviewAssistant.App.Services;
 /// <summary>Win+Shift+S snip (same flow as live.py) — poll clipboard for a new image.</summary>
 public static class WindowsScreenSnipCapture
 {
-    private const int MaxPollCount = 600;
+    private const int MaxPollCount = 300;
     private static readonly TimeSpan PollInterval = TimeSpan.FromMilliseconds(200);
+    private static readonly TimeSpan OverallTimeout = TimeSpan.FromSeconds(90);
+    private static readonly TimeSpan NoSnipUiFallback = TimeSpan.FromSeconds(12);
+
+    private static readonly string[] SnipProcessNames = ["ScreenSnipping", "SnippingTool"];
 
     private const byte VkLWin = 0x5B;
     private const byte VkShift = 0x10;
@@ -35,10 +41,17 @@ public static class WindowsScreenSnipCapture
         }, DispatcherPriority.Normal).Task.ConfigureAwait(false);
 
         var pollCount = 0;
+        var snipTriggered = false;
+        var snipTriggeredAt = DateTime.MinValue;
+        var snipUiWasVisible = false;
         DispatcherTimer? timer = null;
+        var completed = 0;
 
         void Complete(byte[]? result)
         {
+            if (Interlocked.Exchange(ref completed, 1) != 0)
+                return;
+
             if (timer is not null)
             {
                 timer.Stop();
@@ -50,6 +63,9 @@ public static class WindowsScreenSnipCapture
 
         void OnTick(object? sender, EventArgs e)
         {
+            if (Volatile.Read(ref completed) != 0)
+                return;
+
             pollCount++;
             if (pollCount > MaxPollCount)
             {
@@ -58,13 +74,29 @@ public static class WindowsScreenSnipCapture
             }
 
             var current = TryEncodeClipboardImageToPng();
-            if (current is null || current.Length == 0)
+            if (current is not null && current.Length > 0
+                && (imageBefore is null || !imageBefore.AsSpan().SequenceEqual(current)))
+            {
+                Complete(current);
+                return;
+            }
+
+            var snipUiVisible = IsWindowsSnipUiVisible();
+            if (snipUiVisible)
+                snipUiWasVisible = true;
+
+            if (!snipTriggered)
                 return;
 
-            if (imageBefore is not null && imageBefore.AsSpan().SequenceEqual(current))
+            var sinceTrigger = DateTime.UtcNow - snipTriggeredAt;
+            if (snipUiWasVisible && !snipUiVisible)
+            {
+                Complete(null);
                 return;
+            }
 
-            Complete(current);
+            if (!snipUiWasVisible && sinceTrigger > NoSnipUiFallback)
+                Complete(null);
         }
 
         await dispatcher.InvokeAsync(() =>
@@ -80,7 +112,13 @@ public static class WindowsScreenSnipCapture
             {
                 await Task.Delay(350, cancellationToken).ConfigureAwait(false);
                 if (!TriggerWindowsSnip())
+                {
                     await dispatcher.InvokeAsync(() => Complete(null)).Task.ConfigureAwait(false);
+                    return;
+                }
+
+                snipTriggered = true;
+                snipTriggeredAt = DateTime.UtcNow;
             }
             catch (OperationCanceledException)
             {
@@ -90,13 +128,92 @@ public static class WindowsScreenSnipCapture
 
         try
         {
-            return await tcs.Task.WaitAsync(TimeSpan.FromMinutes(2), cancellationToken).ConfigureAwait(false);
+            return await tcs.Task.WaitAsync(OverallTimeout, cancellationToken).ConfigureAwait(false);
         }
         catch (TimeoutException)
         {
             await dispatcher.InvokeAsync(() => Complete(null)).Task.ConfigureAwait(false);
             return null;
         }
+        catch (OperationCanceledException)
+        {
+            await dispatcher.InvokeAsync(() => Complete(null)).Task.ConfigureAwait(false);
+            return null;
+        }
+    }
+
+    private static bool IsWindowsSnipUiVisible()
+    {
+        foreach (var name in SnipProcessNames)
+        {
+            Process[] processes;
+            try
+            {
+                processes = Process.GetProcessesByName(name);
+            }
+            catch
+            {
+                continue;
+            }
+
+            foreach (var proc in processes)
+            {
+                using (proc)
+                {
+                    if (proc.HasExited)
+                        continue;
+                    if (ProcessHasVisibleWindow(proc.Id))
+                        return true;
+                }
+            }
+        }
+
+        return IsSnipTitleWindowVisible();
+    }
+
+    private static bool IsSnipTitleWindowVisible()
+    {
+        var found = false;
+        EnumWindows((hwnd, _) =>
+        {
+            if (!IsWindowVisible(hwnd))
+                return true;
+
+            var len = GetWindowTextLength(hwnd);
+            if (len <= 0)
+                return true;
+
+            var sb = new StringBuilder(len + 1);
+            _ = GetWindowText(hwnd, sb, sb.Capacity);
+            var title = sb.ToString();
+            if (title.Contains("snip", StringComparison.OrdinalIgnoreCase)
+                || title.Contains("screen clip", StringComparison.OrdinalIgnoreCase))
+            {
+                found = true;
+                return false;
+            }
+
+            return true;
+        }, IntPtr.Zero);
+        return found;
+    }
+
+    private static bool ProcessHasVisibleWindow(int processId)
+    {
+        var found = false;
+        EnumWindows((hwnd, _) =>
+        {
+            if (!IsWindowVisible(hwnd))
+                return true;
+
+            GetWindowThreadProcessId(hwnd, out uint pid);
+            if ((int)pid != processId)
+                return true;
+
+            found = true;
+            return false;
+        }, IntPtr.Zero);
+        return found;
     }
 
     private static bool TriggerWindowsSnip()
@@ -163,6 +280,24 @@ public static class WindowsScreenSnipCapture
             return null;
         }
     }
+
+    private delegate bool EnumWindowsProc(IntPtr hWnd, IntPtr lParam);
+
+    [DllImport("user32.dll")]
+    private static extern bool EnumWindows(EnumWindowsProc lpEnumFunc, IntPtr lParam);
+
+    [DllImport("user32.dll")]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool IsWindowVisible(IntPtr hWnd);
+
+    [DllImport("user32.dll", SetLastError = true)]
+    private static extern uint GetWindowThreadProcessId(IntPtr hWnd, out uint lpdwProcessId);
+
+    [DllImport("user32.dll", CharSet = CharSet.Unicode)]
+    private static extern int GetWindowText(IntPtr hWnd, StringBuilder lpString, int nMaxCount);
+
+    [DllImport("user32.dll", CharSet = CharSet.Unicode)]
+    private static extern int GetWindowTextLength(IntPtr hWnd);
 
     [DllImport("user32.dll", SetLastError = true)]
     private static extern void keybd_event(byte bVk, byte bScan, uint dwFlags, UIntPtr dwExtraInfo);

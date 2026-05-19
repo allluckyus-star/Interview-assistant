@@ -66,8 +66,8 @@ public sealed class CaptionState
             return;
         lock (_lock)
         {
-            var oldFull = _refinedFullCaption;
             var oldNext = _nextChunkStartIndex;
+            var oldFullLen = _refinedFullCaption.Length;
             if (_previousRefinedText.Length - refinedText.Length > 100)
             {
                 var head = _previousRefinedText[..Math.Min(500, _previousRefinedText.Length)];
@@ -78,10 +78,20 @@ public sealed class CaptionState
 
             _refinedFullCaption = _fixedCaption + refinedText;
             _previousRefinedText = refinedText;
+
             if (!string.IsNullOrEmpty(_chunkAnchorPrefix))
-                _nextChunkStartIndex = Math.Clamp(oldNext, 0, _refinedFullCaption.Length);
+            {
+                var mapped = CaptionChunkBoundaryRealign.Realign(
+                    _refinedFullCaption,
+                    _chunkAnchorPrefix,
+                    Math.Min(oldNext, oldFullLen));
+                _nextChunkStartIndex = Math.Clamp(mapped, 0, _refinedFullCaption.Length);
+            }
             else
+            {
                 _nextChunkStartIndex = Math.Clamp(oldNext, 0, _refinedFullCaption.Length);
+            }
+
         }
     }
 

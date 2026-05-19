@@ -294,7 +294,7 @@
                       Height="28"
                       Margin="0,0,0,4"
                       shell:WindowChrome.IsHitTestVisibleInChrome="True"
-                      ToolTip="Snip screen → add image to ChatGPT prompt (does not send)"
+                      ToolTip="Snip screen → add image to ChatGPT prompt (Ctrl+Insert; does not send)"
                       Click="GptImageButton_OnClick">
                 <Viewbox x:Name="GptImageIconHost" Width="14" Height="14" />
               </Button>
@@ -305,7 +305,7 @@
                       Height="28"
                       Margin="0,0,0,4"
                       shell:WindowChrome.IsHitTestVisibleInChrome="True"
-                      ToolTip="Snip screen → OCR text into ChatGPT prompt (does not send)"
+                      ToolTip="Snip screen → OCR text into ChatGPT prompt (Ctrl+Home; does not send)"
                       Click="GptTextButton_OnClick">
                 <Viewbox x:Name="GptTextIconHost" Width="14" Height="14" />
               </Button>
