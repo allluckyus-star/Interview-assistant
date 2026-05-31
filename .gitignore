@@ -1,25 +1,15 @@
-# Python virtual environments
-.venv/
-venv/
-env/
-ENV/
+# .NET build output
+**/bin/
+**/obj/
+.vs/
+*.user
+*.suo
+*.cache
+publish/
 
-# Python cache and build artifacts
-__pycache__/
-*.py[cod]
-*.pyo
-*.pyd
-*.so
-*.egg
-*.egg-info/
-.pytest_cache/
-.mypy_cache/
-.ruff_cache/
-.coverage
-.coverage.*
-htmlcov/
-dist/
-build/
+# Logs and runtime
+*.log
+*.pid
 
 # Environment and secrets
 .env
@@ -28,25 +18,11 @@ build/
 *.key
 *.crt
 
-# Logs and runtime files
-*.log
-*.pid
-*.out
-*.err
-live.txt
-resume.txt
-client_files/
-registered_clients.json
-
-# IDE/editor metadata
+# IDE
 .vscode/
 .idea/
 
-# OS metadata
+# OS
 .DS_Store
 Thumbs.db
-# Accidental Windows reserved-name files (e.g. `command > nul` creates this in Git Bash)
 /nul
-
-# .NET single-file publish output
-c#project/publish/
