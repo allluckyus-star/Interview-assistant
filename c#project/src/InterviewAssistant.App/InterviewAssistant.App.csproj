@@ -31,13 +31,13 @@
     <None Update="Assets\error_mode_prompt.txt">
       <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
     </None>
-    <None Include="..\..\..\prompt_resume_summary.txt" Link="prompt_resume_summary.txt">
+    <None Update="Assets\prompt_resume_summary.txt">
       <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
     </None>
-    <None Include="..\..\..\prompt_jd_summary.txt" Link="prompt_jd_summary.txt">
+    <None Update="Assets\prompt_jd_summary.txt">
       <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
     </None>
-    <None Include="..\..\..\prompt_initial_interview.txt" Link="prompt_initial_interview.txt">
+    <None Update="Assets\prompt_initial_interview.txt">
       <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
     </None>
   </ItemGroup>

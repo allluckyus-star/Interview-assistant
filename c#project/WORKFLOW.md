@@ -15,8 +15,8 @@ End-to-end guide for **building**, **running**, and **using** the WPF app in `c#
 
 Optional:
 
-- **Chrome extension + Python bridge** — only if you use the legacy extension path; default C# bridge is optional (`appsettings.json`).
 - **OCR** — text snip uses Windows OCR when available.
+- **HTTP bridge** — optional extension polling (`appsettings.json`, `IA_ENABLE_BRIDGE=1`).
 
 ---
 
@@ -70,7 +70,7 @@ c#project/
 ├── README.md
 └── src/
     ├── InterviewAssistant.App/     WPF UI, wizard, WebView2, interview loop
-    ├── InterviewAssistant.Bridge/    Optional local HTTP bridge (subset of Python bridge)
+    ├── InterviewAssistant.Bridge/    Optional local HTTP bridge
     └── InterviewAssistant.Core/     Shared JSON DTOs
 ```
 
@@ -101,9 +101,9 @@ flowchart TD
 |------|-------------------|-------------|-------------------|
 | **1** | Resume & Job Description | Paste resume + JD, **Next** | Saves text via `ResumeJdStore`; does **not** start captions. |
 | **2** | Login to ChatGPT | Log in in embedded WebView; **Next** (blocked until composer ready) | Polls ChatGPT DOM for login/composer; overlay blocks clicks until ready. |
-| **3** | Resume summary | **Send** (prep) | Builds prompt from `prompt_resume_summary.txt`, sends into ChatGPT via `GptSendPipeline.js`. |
-| **4** | JD summary | **Send** (prep) | Same for `prompt_jd_summary.txt`. |
-| **5** | Initial interview | **Send** (prep) | Same for `prompt_initial_interview.txt`. |
+| **3** | Resume summary | **Send** (prep) | Builds prompt from `Assets/prompt_resume_summary.txt`, sends into ChatGPT via `GptSendPipeline.js`. |
+| **4** | JD summary | **Send** (prep) | Same for `Assets/prompt_jd_summary.txt`. |
+| **5** | Initial interview | **Send** (prep) | Same for `Assets/prompt_initial_interview.txt`. |
 | **Main** | Live interview | Use captions + modes + **End** | 30% caption panel / 70% ChatGPT; starts `InterviewSessionCoordinator`. |
 
 ```mermaid
@@ -195,7 +195,7 @@ Edit prompts: **Settings** (gear) → nav item per mode. Seed files:
 
 ## Caption chunk model (End / Delete)
 
-Mirrors `live.py` behavior:
+Caption edit / endpoint behavior:
 
 - **`full`** = archived fixed text + live window (`_refinedFullCaption`)
 - **`index`** = start of unsent **draft** in `full`
@@ -212,11 +212,11 @@ Debug logging: set `IA_CAPTION_LOG=1` → `%TEMP%\InterviewAssistant\caption.log
 2. `MainWindow` runs `GptSendPipeline.js` in WebView2 to paste/send into ChatGPT.
 3. If bridge is enabled, coordinator may poll `GET /latest-answer` for extension-supplied answers.
 
-Prep wizard sends (steps 3–5) use the same WebView pipeline with prep templates from repo root:
+Prep wizard sends (steps 3–5) use prep templates from `Assets/`:
 
-- `prompt_resume_summary.txt`
-- `prompt_jd_summary.txt`
-- `prompt_initial_interview.txt`
+- `Assets/prompt_resume_summary.txt`
+- `Assets/prompt_jd_summary.txt`
+- `Assets/prompt_initial_interview.txt`
 
 ---
 
@@ -254,14 +254,14 @@ From **Main** only:
 
 ## Optional local bridge
 
-When enabled, `InterviewAssistant.Bridge` exposes a **subset** of Python `bridge_server.py`:
+When enabled, `InterviewAssistant.Bridge` exposes HTTP routes for optional answer polling:
 
 | Method | Path |
 |--------|------|
 | GET | `/ping`, `/health`, `/next-prompt`, `/latest-answer`, `/context` |
 | POST | `/ack` |
 
-Default port **1212** (Python extension often uses **8765** — align configs if you mix stacks).
+Default port **1212** (`Bridge:Port` in `appsettings.json`).
 
 ---
 
@@ -285,17 +285,4 @@ Default port **1212** (Python extension often uses **8765** — align configs if
 | WebView blank | Install WebView2 Runtime |
 | Step 2 Next disabled | Finish ChatGPT login; wait for composer detection |
 | No captions | Ensure Live Captions is running; check caption log with `IA_CAPTION_LOG=1` |
-| GPT not answering | Confirm send in WebView; enable bridge + extension if you rely on polling |
-
----
-
-## Relation to Python `live.py`
-
-| Area | C# `c#project` | Python `live.py` |
-|------|----------------|------------------|
-| Wizard + WebView | `MainWindow` | PySide6 + WebEngine |
-| Modes | Read, Type, Error, Behavioral, Closing (+ settings) | Also Info, Free |
-| Captions | `CaptionState` + UI Automation | Same concepts in `live.py` |
-| Extension bridge | Optional subset | Full `bridge_server.py` |
-
-For Python-only workflow, run `python live.py` from the repo root (no `dotnet build`).
+| GPT not answering | Confirm send in WebView; enable bridge if you rely on polling |

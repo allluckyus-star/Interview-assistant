@@ -5,7 +5,7 @@ namespace InterviewAssistant.App;
 
 /// <summary>
 /// Resolves <c>prompt_resume_summary.txt</c>, <c>prompt_jd_summary.txt</c>, <c>prompt_initial_interview.txt</c>
-/// from the app output directory or by walking up from <see cref="AppContext.BaseDirectory"/> toward the repo root.
+/// from the app output directory (<c>Assets/</c> or base dir).
 /// </summary>
 public static class PromptTemplateResolver
 {
@@ -58,26 +58,18 @@ public static class PromptTemplateResolver
 
     private static string TryReadFile(string fileName)
     {
-        var dir = AppContext.BaseDirectory;
-        for (var i = 0; i < 8; i++)
+        foreach (var path in CandidatePaths(fileName))
         {
-            var p = Path.Combine(dir, fileName);
-            if (File.Exists(p))
+            if (!File.Exists(path))
+                continue;
+            try
             {
-                try
-                {
-                    return File.ReadAllText(p, Encoding.UTF8);
-                }
-                catch
-                {
-                    return "";
-                }
+                return File.ReadAllText(path, Encoding.UTF8);
             }
-
-            var parent = Directory.GetParent(dir);
-            if (parent is null)
-                break;
-            dir = parent.FullName;
+            catch
+            {
+                return "";
+            }
         }
 
         return "";
@@ -85,18 +77,19 @@ public static class PromptTemplateResolver
 
     private static string ResolveWritablePath(string fileName)
     {
-        var dir = AppContext.BaseDirectory;
-        for (var i = 0; i < 8; i++)
+        foreach (var path in CandidatePaths(fileName))
         {
-            var p = Path.Combine(dir, fileName);
-            if (File.Exists(p))
-                return p;
-            var parent = Directory.GetParent(dir);
-            if (parent is null)
-                break;
-            dir = parent.FullName;
+            if (File.Exists(path))
+                return path;
         }
 
-        return Path.Combine(AppContext.BaseDirectory, fileName);
+        return Path.Combine(AppContext.BaseDirectory, "Assets", fileName);
+    }
+
+    private static IEnumerable<string> CandidatePaths(string fileName)
+    {
+        var baseDir = AppContext.BaseDirectory;
+        yield return Path.Combine(baseDir, "Assets", fileName);
+        yield return Path.Combine(baseDir, fileName);
     }
 }
