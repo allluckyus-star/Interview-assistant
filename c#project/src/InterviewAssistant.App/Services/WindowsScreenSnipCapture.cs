@@ -14,9 +14,10 @@ namespace InterviewAssistant.App.Services;
 public static class WindowsScreenSnipCapture
 {
     private const int MaxPollCount = 300;
-    private static readonly TimeSpan PollInterval = TimeSpan.FromMilliseconds(200);
+    private static readonly TimeSpan PollInterval = TimeSpan.FromMilliseconds(100);
     private static readonly TimeSpan OverallTimeout = TimeSpan.FromSeconds(90);
     private static readonly TimeSpan NoSnipUiFallback = TimeSpan.FromSeconds(12);
+    private static readonly TimeSpan SnipTriggerDelay = TimeSpan.FromMilliseconds(120);
 
     private static readonly string[] SnipProcessNames = ["ScreenSnipping", "SnippingTool"];
 
@@ -110,7 +111,7 @@ public static class WindowsScreenSnipCapture
         {
             try
             {
-                await Task.Delay(350, cancellationToken).ConfigureAwait(false);
+                await Task.Delay(SnipTriggerDelay, cancellationToken).ConfigureAwait(false);
                 if (!TriggerWindowsSnip())
                 {
                     await dispatcher.InvokeAsync(() => Complete(null)).Task.ConfigureAwait(false);

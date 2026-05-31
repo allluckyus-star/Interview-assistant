@@ -4,6 +4,7 @@
   <ScrollViewer x:Name="Scroller"
                 VerticalScrollBarVisibility="Auto"
                 HorizontalScrollBarVisibility="Disabled">
-    <StackPanel x:Name="BubbleStack" />
+    <StackPanel x:Name="BubbleStack"
+                HorizontalAlignment="Stretch" />
   </ScrollViewer>
 </UserControl>

@@ -62,9 +62,31 @@ public partial class MainWindow : Window
     private CoreWebView2? GptCore => GptWebView?.CoreWebView2;
     private bool _webViewInitialized;
     private bool _pipelineInjected;
+    private bool _loginPageReady;
+    private Storyboard? _wizardTitleStoryboard;
+    private const string WizardStep1Title = "Resume & Job Description";
+    private static readonly TimeSpan WizardTitleAnimDuration = TimeSpan.FromMilliseconds(300);
     private bool _sendInProgress;
     private readonly string _webViewUserDataDir;
     private readonly DispatcherTimer _loginPollTimer;
+    private const string LoginChatReadyScript =
+        """
+        (() => {
+          try {
+            if (document.readyState !== 'complete') return false;
+            if (typeof __iaFindComposer !== 'function') return false;
+            var c = __iaFindComposer();
+            if (!c) return false;
+            var surface = document.querySelector('[data-composer-surface="true"]');
+            if (surface) {
+              var st = window.getComputedStyle(surface);
+              if (st.display === 'none' || st.visibility === 'hidden' || Number(st.opacity) === 0) return false;
+            }
+            return true;
+          } catch (_e) { return false; }
+        })()
+        """;
+
     private const double MinSliderOpacityPercent = 4;
     private const double MinSliderOpacityFraction = MinSliderOpacityPercent / 100.0;
     private const double DefaultOpacityFraction = 0.8;
@@ -158,9 +180,16 @@ public partial class MainWindow : Window
         InterviewSettingsPanel.BackRequested += (_, _) => ShowInterviewSettings(false);
         CaptionFeed.CopyPromptBuilder = text =>
         {
-            var (_, finalPrompt) = ChunkPromptBuilder.Build(text, _interview.ModePrompts.GetActiveTemplate());
+            var intent = _interview.ResolveInterviewerIntentForPrompt(text);
+            var (_, finalPrompt) = ChunkPromptBuilder.Build(intent, _interview.ModePrompts.GetActiveTemplate());
             return string.IsNullOrWhiteSpace(finalPrompt) ? null : finalPrompt;
         };
+        CaptionFeed.GetEndpointWordChoices = count =>
+            _interview.GetEndpointWordChoices(count);
+        CaptionFeed.SetEndpointAtIndex = idx =>
+            _interview.SetDraftEndpointAt(idx);
+        CaptionFeed.CaptureDraftForEdit = label =>
+            _interview.CaptureDraftForInlineEdit(label);
 
         var (resume, jd) = ResumeJdStore.Load();
         ResumeTextBox.Text = resume;
@@ -263,7 +292,8 @@ public partial class MainWindow : Window
             {
                 if (string.Equals(source, "sent_gpt", StringComparison.OrdinalIgnoreCase))
                 {
-                    var (_, clip) = ChunkPromptBuilder.Build(text, _interview.ModePrompts.GetActiveTemplate());
+                    var intent = _interview.ResolveInterviewerIntentForPrompt(text);
+                    var (_, clip) = ChunkPromptBuilder.Build(intent, _interview.ModePrompts.GetActiveTemplate());
                     CaptionFeed.FinalizeDraft(text, clip);
                 }
                 else
@@ -279,7 +309,9 @@ public partial class MainWindow : Window
     {
         SessionModeReadIconHost.Child = TopBarIcons.CreateReadModeIcon(14);
         SessionModeTypeIconHost.Child = TopBarIcons.CreateTypeModeIcon(14);
+        SessionModeErrorIconHost.Child = TopBarIcons.CreateErrorModeIcon(14);
         SessionModeBehavioralIconHost.Child = TopBarIcons.CreateBehavioralModeIcon(14);
+        SessionModeClosingIconHost.Child = TopBarIcons.CreateClosingModeIcon(14);
         SaveTranscriptIconHost.Child = TopBarIcons.CreateSaveIcon(16);
         SettingsNavIconHost.Child = TopBarIcons.CreateKebabIcon(16);
         ClickThroughIconHost.Child = TopBarIcons.CreateClickThroughIcon(16, "#111111", false);
@@ -457,7 +489,9 @@ public partial class MainWindow : Window
         mode switch
         {
             "behavioral" => 120,
+            "closing" => 72,
             "type" => 66,
+            "error" => 58,
             _ => 64,
         };
 
@@ -465,7 +499,9 @@ public partial class MainWindow : Window
         mode switch
         {
             "type" => 40,
+            "error" => 38,
             "behavioral" => 132,
+            "closing" => 52,
             _ => 36,
         };
 
@@ -473,7 +509,9 @@ public partial class MainWindow : Window
         mode switch
         {
             "type" => 60,
+            "error" => 54,
             "behavioral" => 116,
+            "closing" => 68,
             _ => 58,
         };
 
@@ -482,17 +520,23 @@ public partial class MainWindow : Window
         mode switch
         {
             "type" => (SessionModeTypeButton, SessionModeTypeLabel, SessionModeTypeIconHost, SessionModeTypeTextClip),
+            "error" => (SessionModeErrorButton, SessionModeErrorLabel, SessionModeErrorIconHost, SessionModeErrorTextClip),
             "behavioral" => (
                 SessionModeBehavioralButton,
                 SessionModeBehavioralLabel,
                 SessionModeBehavioralIconHost,
                 SessionModeBehavioralTextClip),
+            "closing" => (
+                SessionModeClosingButton,
+                SessionModeClosingLabel,
+                SessionModeClosingIconHost,
+                SessionModeClosingTextClip),
             _ => (SessionModeReadButton, SessionModeReadLabel, SessionModeReadIconHost, SessionModeReadTextClip),
         };
 
     private void StopSessionModeSegmentAnimations()
     {
-        foreach (var mode in new[] { "read", "type", "behavioral" })
+        foreach (var mode in new[] { "read", "type", "error", "behavioral", "closing" })
         {
             var (btn, label, icon, clip) = SessionModeSegmentParts(mode);
             label.BeginAnimation(UIElement.OpacityProperty, null);
@@ -515,12 +559,19 @@ public partial class MainWindow : Window
     {
         ApplySessionModeSegmentStateImmediate(SessionModeReadButton, SessionModeReadLabel, SessionModeReadTextClip, "read", m == "read");
         ApplySessionModeSegmentStateImmediate(SessionModeTypeButton, SessionModeTypeLabel, SessionModeTypeTextClip, "type", m == "type");
+        ApplySessionModeSegmentStateImmediate(SessionModeErrorButton, SessionModeErrorLabel, SessionModeErrorTextClip, "error", m == "error");
         ApplySessionModeSegmentStateImmediate(
             SessionModeBehavioralButton,
             SessionModeBehavioralLabel,
             SessionModeBehavioralTextClip,
             "behavioral",
             m == "behavioral");
+        ApplySessionModeSegmentStateImmediate(
+            SessionModeClosingButton,
+            SessionModeClosingLabel,
+            SessionModeClosingTextClip,
+            "closing",
+            m == "closing");
     }
 
     private static void ApplySessionModeSegmentStateImmediate(
@@ -749,15 +800,62 @@ public partial class MainWindow : Window
         _interviewSessionActive = true;
         InterviewTopBarPanel.Visibility = Visibility.Visible;
         UpdateSessionModeButtonUi(_interview.ModePrompts.SessionMode, animate: false);
+        _ = EnsurePipelineInjectedAsync();
     }
 
     private void LeaveMainInterviewMode()
     {
         if (!_interviewSessionActive)
             return;
-        _interview.Stop();
+        _interview.ResetSessionArtifacts();
         _interviewSessionActive = false;
+        CaptionFeed.Clear();
         InterviewTopBarPanel.Visibility = Visibility.Collapsed;
+    }
+
+    private void RestartWizardButton_OnClick(object sender, RoutedEventArgs e) =>
+        RestartWizardToStep1();
+
+    private void RestartWizardToStep1()
+    {
+        if (_step == WizardStep.Step1ResumeJd)
+            return;
+
+        CancelPendingWizardOperations();
+        _settingsViewActive = false;
+        InterviewSettingsPanel.Visibility = Visibility.Collapsed;
+        LeaveMainInterviewMode();
+        _interview.ResetSessionArtifacts();
+        CaptionFeed.Clear();
+        _latestGptAnswer = "";
+        _interview.ModePrompts.SessionMode = "read";
+        _step = WizardStep.Step1ResumeJd;
+        ApplyWizardUi();
+        ToastService.Show(
+            "Back to Resume & Job Description. Your text is unchanged; ChatGPT stays open.",
+            ToastLevel.Info);
+    }
+
+    private void CancelPendingWizardOperations()
+    {
+        foreach (var kv in _prepSendCompletes)
+            kv.Value.TrySetCanceled();
+        _prepSendCompletes.Clear();
+        foreach (var kv in _attachCompletes)
+            kv.Value.TrySetCanceled();
+        _attachCompletes.Clear();
+        foreach (var kv in _pasteCompletes)
+            kv.Value.TrySetCanceled();
+        _pasteCompletes.Clear();
+        _sendInProgress = false;
+        _chunkSendInProgress = false;
+    }
+
+    private void UpdateRestartWizardButtonVisibility()
+    {
+        RestartWizardButton.Visibility = _step == WizardStep.Step1ResumeJd
+            ? Visibility.Collapsed
+            : Visibility.Visible;
     }
 
     private void ShowInterviewSettings(bool show)
@@ -858,7 +956,7 @@ public partial class MainWindow : Window
             return new GptSendResult { Ok = false, Error = "attach_missing" };
 
         GptWebView.Focus();
-        await Task.Delay(120).ConfigureAwait(true);
+        await Task.Delay(40).ConfigureAwait(true);
 
         var requestId = Guid.NewGuid().ToString("N");
         var tcs = new TaskCompletionSource<GptSendResult>(TaskCreationOptions.RunContinuationsAsynchronously);
@@ -873,7 +971,7 @@ public partial class MainWindow : Window
             });
             GptCore.PostWebMessageAsJson(payload);
 
-            var completed = await Task.WhenAny(tcs.Task, Task.Delay(TimeSpan.FromSeconds(60))).ConfigureAwait(true);
+            var completed = await Task.WhenAny(tcs.Task, Task.Delay(TimeSpan.FromSeconds(25))).ConfigureAwait(true);
             if (completed != tcs.Task)
                 return new GptSendResult { Ok = false, Error = "attach_timeout" };
 
@@ -1040,7 +1138,7 @@ public partial class MainWindow : Window
             return new GptSendResult { Ok = false, Error = "paste_missing" };
 
         GptWebView.Focus();
-        await Task.Delay(150).ConfigureAwait(true);
+        await Task.Delay(40).ConfigureAwait(true);
 
         var scriptResult = await PasteTextViaExecuteScriptAsync(text, append).ConfigureAwait(true);
         Trace.WriteLine(
@@ -1098,7 +1196,7 @@ public partial class MainWindow : Window
             });
             GptCore.PostWebMessageAsJson(payload);
 
-            var completed = await Task.WhenAny(tcs.Task, Task.Delay(TimeSpan.FromSeconds(20))).ConfigureAwait(true);
+            var completed = await Task.WhenAny(tcs.Task, Task.Delay(TimeSpan.FromSeconds(8))).ConfigureAwait(true);
             return completed != tcs.Task
                 ? new GptSendResult { Ok = false, Error = "paste_timeout" }
                 : await tcs.Task.ConfigureAwait(true);
@@ -1517,6 +1615,12 @@ public partial class MainWindow : Window
         if (!uri.Contains("chatgpt.com", StringComparison.OrdinalIgnoreCase))
             return;
         _pipelineInjected = false;
+        if (_step == WizardStep.Step2Login)
+        {
+            _loginPageReady = false;
+            ApplyLoginGateUi();
+        }
+
         try
         {
             await EnsurePipelineInjectedAsync().ConfigureAwait(true);
@@ -1524,6 +1628,8 @@ public partial class MainWindow : Window
             ScheduleCaptureStealthSync();
             if (_clickThroughEnabled)
                 ScheduleClickThroughHwndRefresh();
+            if (_step == WizardStep.Step2Login)
+                _ = RefreshLoginPageReadyAsync();
             }
             catch
             {
@@ -1582,15 +1688,16 @@ public partial class MainWindow : Window
                 LeaveMainInterviewMode();
                 Step1Panel.Visibility = Visibility.Visible;
                 GptWebViewOpacityHost.Visibility = Visibility.Collapsed;
-                WizardHeaderPanel.Visibility = Visibility.Collapsed;
+                WizardHeaderPanel.Visibility = Visibility.Visible;
                 WizardFooterPanel.Visibility = Visibility.Collapsed;
                 CaptionPanel.Visibility = Visibility.Collapsed;
-                CaptionRowDefinition.Height = new GridLength(0);
+                CaptionRowDefinition.Height = new GridLength(1, GridUnitType.Auto);
                 ContentMiddleRowDefinition.Height = new GridLength(1, GridUnitType.Star);
                 WizardFooterRowDefinition.Height = new GridLength(0);
                 Grid.SetRow(GptWebViewOpacityHost, 1);
                 Grid.SetRowSpan(GptWebViewOpacityHost, 1);
                 ApplyShellPrepChrome();
+                SetWizardTitleAnimated(WizardStep1Title);
                 break;
 
             case WizardStep.Step2Login:
@@ -1617,23 +1724,24 @@ public partial class MainWindow : Window
                 switch (_step)
                 {
                     case WizardStep.Step2Login:
-                        WizardTitleText.Text = "Log In and Open Chat";
+                        _loginPageReady = false;
+                        SetWizardTitleAnimated("Log In and Open Chat");
                         WizardPrimaryButton.Content = "Continue";
-                        WizardPrimaryButton.IsEnabled = false;
+                        ApplyLoginGateUi();
                         _loginPollTimer.Start();
                         break;
                     case WizardStep.Step3ResumeSummary:
-                        WizardTitleText.Text = "Send Resume";
+                        SetWizardTitleAnimated("Send Resume");
                         WizardPrimaryButton.Content = "Send";
                         ApplyWizardSendStepButtonsEnabled();
                         break;
                     case WizardStep.Step4JdSummary:
-                        WizardTitleText.Text = "Send Job Description";
+                        SetWizardTitleAnimated("Send Job Description");
                         WizardPrimaryButton.Content = "Send";
                         ApplyWizardSendStepButtonsEnabled();
                         break;
                     case WizardStep.Step5Interview:
-                        WizardTitleText.Text = "Prepare for Interview";
+                        SetWizardTitleAnimated("Prepare for Interview");
                         WizardPrimaryButton.Content = "Send";
                         ApplyWizardSendStepButtonsEnabled();
                         break;
@@ -1657,9 +1765,212 @@ public partial class MainWindow : Window
                 break;
         }
 
+        if (_step != WizardStep.Step2Login)
+            WizardGptLoginBlocker.Visibility = Visibility.Collapsed;
+
         UpdateGptSideToolsVisibility();
+        UpdateRestartWizardButtonVisibility();
         if (_webViewInitialized && GptWebViewOpacityHost.Visibility == Visibility.Visible)
             _ = PushChatGptDomOpacityAsync();
+    }
+
+    private void SetWizardTitleAnimated(string newTitle)
+    {
+        var current = WizardTitleText.Text ?? "";
+        if (string.IsNullOrEmpty(current) || string.Equals(current, newTitle, StringComparison.Ordinal))
+        {
+            _wizardTitleStoryboard?.Stop();
+            _wizardTitleStoryboard = null;
+            WizardTitleOutgoing.Visibility = Visibility.Collapsed;
+            WizardTitleText.Text = newTitle;
+            ScheduleWizardTitlePlacement(WizardTitleText, WizardTitleSlot.Center, 1);
+            WizardTitleOutgoing.Opacity = 1;
+            return;
+        }
+
+        _wizardTitleStoryboard?.Stop();
+        WizardTitleOutgoing.Text = current;
+        WizardTitleText.Text = newTitle;
+        WizardTitleOutgoing.Visibility = Visibility.Visible;
+
+        void BeginTransition()
+        {
+            if (!TryGetWizardTitleViewportWidth(out var viewportW))
+            {
+                void OnSized(object? s, SizeChangedEventArgs e)
+                {
+                    if (!TryGetWizardTitleViewportWidth(out _))
+                        return;
+                    WizardTitleViewport.SizeChanged -= OnSized;
+                    BeginTransition();
+                }
+
+                WizardTitleViewport.SizeChanged += OnSized;
+                return;
+            }
+
+            SyncWizardTitleHostWidth(viewportW);
+            var outCenter = GetWizardTitleLeft(WizardTitleOutgoing, WizardTitleSlot.Center, viewportW);
+            var outLeft = GetWizardTitleLeft(WizardTitleOutgoing, WizardTitleSlot.Left, viewportW);
+            var inRight = GetWizardTitleLeft(WizardTitleText, WizardTitleSlot.Right, viewportW);
+            var inCenter = GetWizardTitleLeft(WizardTitleText, WizardTitleSlot.Center, viewportW);
+
+            // Start: old center @1, new right @0
+            Canvas.SetLeft(WizardTitleOutgoing, outCenter);
+            WizardTitleOutgoing.Opacity = 1;
+            Canvas.SetLeft(WizardTitleText, inRight);
+            WizardTitleText.Opacity = 0;
+
+            var outMove = new DoubleAnimation(outCenter, outLeft, WizardTitleAnimDuration);
+            var inMove = new DoubleAnimation(inRight, inCenter, WizardTitleAnimDuration);
+            var outFade = new DoubleAnimation(1, 0, WizardTitleAnimDuration);
+            var inFade = new DoubleAnimation(0, 1, WizardTitleAnimDuration);
+
+            Storyboard.SetTarget(outMove, WizardTitleOutgoing);
+            Storyboard.SetTargetProperty(outMove, new PropertyPath(Canvas.LeftProperty));
+            Storyboard.SetTarget(inMove, WizardTitleText);
+            Storyboard.SetTargetProperty(inMove, new PropertyPath(Canvas.LeftProperty));
+            Storyboard.SetTarget(outFade, WizardTitleOutgoing);
+            Storyboard.SetTargetProperty(outFade, new PropertyPath(UIElement.OpacityProperty));
+            Storyboard.SetTarget(inFade, WizardTitleText);
+            Storyboard.SetTargetProperty(inFade, new PropertyPath(UIElement.OpacityProperty));
+
+            var sb = new Storyboard { FillBehavior = FillBehavior.HoldEnd };
+            sb.Children.Add(outMove);
+            sb.Children.Add(inMove);
+            sb.Children.Add(outFade);
+            sb.Children.Add(inFade);
+            sb.Completed += (_, _) =>
+            {
+                _wizardTitleStoryboard = null;
+                WizardTitleOutgoing.Visibility = Visibility.Collapsed;
+                PlaceWizardTitle(WizardTitleText, WizardTitleSlot.Center, 1, viewportW);
+                WizardTitleOutgoing.Opacity = 1;
+            };
+            _wizardTitleStoryboard = sb;
+            sb.Begin();
+        }
+
+        Dispatcher.BeginInvoke(DispatcherPriority.Loaded, BeginTransition);
+    }
+
+    private enum WizardTitleSlot
+    {
+        Left,
+        Center,
+        Right,
+    }
+
+    private static double MeasureWizardTitleWidth(TextBlock title)
+    {
+        title.Measure(new Size(double.PositiveInfinity, double.PositiveInfinity));
+        return Math.Max(1, title.DesiredSize.Width);
+    }
+
+    private static double GetWizardTitleLeft(TextBlock title, WizardTitleSlot slot, double viewportW)
+    {
+        var w = MeasureWizardTitleWidth(title);
+        return slot switch
+        {
+            WizardTitleSlot.Left => 0,
+            WizardTitleSlot.Center => Math.Max(0, (viewportW - w) / 2),
+            WizardTitleSlot.Right => Math.Max(0, viewportW - w),
+            _ => 0,
+        };
+    }
+
+    private static void PlaceWizardTitle(TextBlock title, WizardTitleSlot slot, double opacity, double viewportW)
+    {
+        Canvas.SetLeft(title, GetWizardTitleLeft(title, slot, viewportW));
+        title.Opacity = opacity;
+    }
+
+    private bool TryGetWizardTitleViewportWidth(out double viewportW)
+    {
+        WizardHeaderPanel.UpdateLayout();
+        WizardTitleViewport.UpdateLayout();
+        viewportW = WizardTitleViewport.ActualWidth;
+        if (viewportW < 8)
+        {
+            viewportW = 0;
+            return false;
+        }
+
+        return true;
+    }
+
+    private void SyncWizardTitleHostWidth(double viewportW) =>
+        WizardTitleHost.Width = viewportW;
+
+    private void ScheduleWizardTitlePlacement(TextBlock title, WizardTitleSlot slot, double opacity)
+    {
+        void Place()
+        {
+            if (!TryGetWizardTitleViewportWidth(out var viewportW))
+                return;
+            SyncWizardTitleHostWidth(viewportW);
+            PlaceWizardTitle(title, slot, opacity, viewportW);
+        }
+
+        Place();
+        if (WizardTitleViewport.ActualWidth >= 8)
+            return;
+
+        void OnSized(object? s, SizeChangedEventArgs e)
+        {
+            if (!TryGetWizardTitleViewportWidth(out _))
+                return;
+            WizardTitleViewport.SizeChanged -= OnSized;
+            Place();
+        }
+
+        WizardTitleViewport.SizeChanged += OnSized;
+        Dispatcher.BeginInvoke(DispatcherPriority.Loaded, Place);
+    }
+
+    private void ApplyLoginGateUi()
+    {
+        var block = _step == WizardStep.Step2Login && !_loginPageReady;
+        WizardGptLoginBlocker.Visibility = block ? Visibility.Visible : Visibility.Collapsed;
+        if (GptWebView is not null)
+            GptWebView.IsHitTestVisible = !block;
+
+        if (_step == WizardStep.Step2Login)
+            WizardPrimaryButton.IsEnabled = _loginPageReady && !_sendInProgress;
+    }
+
+    private async Task<bool> QueryLoginChatReadyAsync()
+    {
+        if (!_webViewInitialized || GptCore is null)
+            return false;
+        if (!_pipelineInjected)
+            await EnsurePipelineInjectedAsync().ConfigureAwait(true);
+        if (!_pipelineInjected)
+            return false;
+        var raw = await ExecuteWebViewScriptAsync(LoginChatReadyScript).ConfigureAwait(true);
+        return string.Equals(raw.Trim(), "true", StringComparison.OrdinalIgnoreCase);
+    }
+
+    private async Task RefreshLoginPageReadyAsync()
+    {
+        if (_step != WizardStep.Step2Login)
+            return;
+        try
+        {
+            var ready = await QueryLoginChatReadyAsync().ConfigureAwait(true);
+            if (ready == _loginPageReady)
+                return;
+            _loginPageReady = ready;
+            await Dispatcher.InvokeAsync(ApplyLoginGateUi);
+        }
+        catch
+        {
+            if (_loginPageReady)
+            {
+                _loginPageReady = false;
+                await Dispatcher.InvokeAsync(ApplyLoginGateUi);
+            }
+        }
     }
 
     private void UpdateGptSideToolsVisibility() =>
@@ -1670,8 +1981,41 @@ public partial class MainWindow : Window
     private async void GptImageButton_OnClick(object sender, RoutedEventArgs e) =>
         await RunSnipThenAsync(attachImage: true).ConfigureAwait(true);
 
-    private async void GptTextButton_OnClick(object sender, RoutedEventArgs e) =>
+    private async void GptTextButton_OnClick(object sender, RoutedEventArgs e)
+    {
+        if (Keyboard.Modifiers.HasFlag(ModifierKeys.Shift)
+            && _interviewSessionActive
+            && _step == WizardStep.Main)
+        {
+            await PasteCurrentDraftToComposerAsync().ConfigureAwait(true);
+            return;
+        }
+
         await RunSnipThenAsync(attachImage: false).ConfigureAwait(true);
+    }
+
+    private async Task PasteCurrentDraftToComposerAsync()
+    {
+        if (!_webViewInitialized || GptCore is null)
+        {
+            ToastService.Show("ChatGPT panel is not ready yet.", ToastLevel.Warning);
+            return;
+        }
+
+        var draft = (_interview.GetDraftTail() ?? "").Trim();
+        if (string.IsNullOrWhiteSpace(draft))
+        {
+            ToastService.Show("No live caption draft to paste.", ToastLevel.Warning);
+            return;
+        }
+
+        var payload = ToastMessages.FormatCapturedTextForPaste(draft);
+        var result = await PasteTextToComposerAsync(payload).ConfigureAwait(true);
+        if (result?.Ok == true)
+            ToastService.Show("Live caption pasted into prompt.", ToastLevel.Success);
+        else
+            ToastService.Show(ToastMessageForTextPaste(result), ToastLevel.Warning);
+    }
 
     private async Task RunSnipThenAsync(bool attachImage)
     {
@@ -1693,9 +2037,11 @@ public partial class MainWindow : Window
         GptImageButton.IsEnabled = false;
         GptTextButton.IsEnabled = false;
         var wasTopmost = Topmost;
+        var pipelineWarm = EnsurePipelineInjectedAsync();
         try
         {
             var png = await CaptureScreenSnipAsync(forTextOcr: !attachImage, snipCt).ConfigureAwait(true);
+            await pipelineWarm.ConfigureAwait(true);
             if (png is null || png.Length == 0)
             {
                 ToastService.Show("Snip cancelled.", ToastLevel.Warning);
@@ -1741,8 +2087,6 @@ public partial class MainWindow : Window
             }
 
             var pastePayload = ToastMessages.FormatCapturedTextForPaste(text);
-            ToastService.Show(ToastMessages.ForSnipRecognizedToast(text), ToastLevel.Info);
-
             var pasteResult = await PasteTextToComposerAsync(pastePayload).ConfigureAwait(true);
             if (pasteResult?.Ok == true)
                 ToastService.Show("Text pasted into prompt.", ToastLevel.Success);
@@ -1986,27 +2330,8 @@ public partial class MainWindow : Window
         }
     }
 
-    private async void LoginPollTimer_OnTick(object? sender, EventArgs e)
-    {
-        if (_step != WizardStep.Step2Login || !_webViewInitialized || GptCore is null)
-            return;
-        try
-        {
-            if (!_pipelineInjected)
-                await EnsurePipelineInjectedAsync().ConfigureAwait(true);
-            if (!_pipelineInjected)
-                return;
-            var raw = await ExecuteWebViewScriptAsync(
-                    "(() => { try { return !!__iaFindComposer(); } catch(_e) { return false; } })()")
-                .ConfigureAwait(true);
-            var ready = string.Equals(raw.Trim(), "true", StringComparison.OrdinalIgnoreCase);
-            WizardPrimaryButton.IsEnabled = ready;
-        }
-        catch
-        {
-            WizardPrimaryButton.IsEnabled = false;
-        }
-    }
+    private async void LoginPollTimer_OnTick(object? sender, EventArgs e) =>
+        await RefreshLoginPageReadyAsync().ConfigureAwait(true);
 
     private async void Step1Continue_OnClick(object sender, RoutedEventArgs e)
     {
@@ -2023,6 +2348,14 @@ public partial class MainWindow : Window
         switch (_step)
         {
             case WizardStep.Step2Login:
+                if (!_loginPageReady)
+                {
+                    ToastService.Show(
+                        "Wait for ChatGPT to finish loading, then log in and open a chat.",
+                        ToastLevel.Info);
+                    return;
+                }
+
                 _loginPollTimer.Stop();
                 _step = WizardStep.Step3ResumeSummary;
                 ApplyWizardUi();
@@ -2074,6 +2407,14 @@ public partial class MainWindow : Window
     {
         if (_sendInProgress || !_webViewInitialized || GptCore is null)
             return;
+        if (_step == WizardStep.Step2Login && !await QueryLoginChatReadyAsync().ConfigureAwait(true))
+        {
+            ToastService.Show(
+                "ChatGPT is still loading. Log in and open a chat before continuing.",
+                ToastLevel.Info);
+            return;
+        }
+
         _sendInProgress = true;
         SetWizardFooterButtonsEnabled(false);
         await Dispatcher.Yield(DispatcherPriority.Render);

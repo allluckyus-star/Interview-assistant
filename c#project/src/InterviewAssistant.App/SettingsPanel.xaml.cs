@@ -31,7 +31,9 @@ public partial class SettingsPanel : UserControl
         ["initial_interview"] = "Initial interview",
         ["read"] = "Read",
         ["type"] = "Type",
+        ["error"] = "Error / debug",
         ["behavioral"] = "Behavioral",
+        ["closing"] = "Closing questions",
     };
 
     public event EventHandler? BackRequested;
@@ -44,7 +46,9 @@ public partial class SettingsPanel : UserControl
         _navButtons["initial_interview"] = NavInitialInterview;
         _navButtons["read"] = NavRead;
         _navButtons["type"] = NavType;
+        _navButtons["error"] = NavError;
         _navButtons["behavioral"] = NavBehavioral;
+        _navButtons["closing"] = NavClosing;
     }
 
     public void Bind(ModePromptStore modes)

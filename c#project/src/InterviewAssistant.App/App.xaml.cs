@@ -24,6 +24,7 @@ public partial class App : Application
     {
         try
         {
+            CaptionDiagnostics.Install();
             StartupDiagnostics.Log("Application_Startup: begin");
 
             if (!OperatingSystem.IsWindows())

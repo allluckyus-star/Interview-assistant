@@ -14,7 +14,7 @@ public sealed class ModePromptStore
 
 {
 
-    private static readonly string[] ModeKeys = ["read", "type", "behavioral"];
+    private static readonly string[] ModeKeys = ["read", "type", "error", "behavioral", "closing"];
 
 
 
@@ -62,7 +62,9 @@ public sealed class ModePromptStore
         mode?.Trim().ToLowerInvariant() switch
         {
             "type" => "type",
+            "error" => "error",
             "behavioral" => "behavioral",
+            "closing" => "closing",
             _ => "read",
         };
 
@@ -80,7 +82,11 @@ public sealed class ModePromptStore
 
             "type" => _templates["type"],
 
+            "error" => _templates["error"],
+
             "behavioral" => _templates["behavioral"],
+
+            "closing" => _templates["closing"],
 
             _ => _templates["read"],
 
@@ -130,7 +136,11 @@ public sealed class ModePromptStore
 
             ["type"] = _templates["type"],
 
+            ["error"] = _templates["error"],
+
             ["behavioral"] = _templates["behavioral"],
+
+            ["closing"] = _templates["closing"],
 
         };
 
@@ -241,6 +251,10 @@ public sealed class ModePromptStore
             "type" => text.Contains("Output everything inside one fenced code block.", StringComparison.Ordinal)
 
                 && !text.Contains("[SAY-n]", StringComparison.Ordinal),
+
+            "error" => text.Contains("ERROR MODE", StringComparison.Ordinal)
+
+                && !text.Contains("FULL CORRECTED CODE", StringComparison.Ordinal),
 
             "behavioral" => text.Contains("Output SHORT ANSWER and STORY ANSWER sections.", StringComparison.Ordinal),
 

@@ -12,6 +12,14 @@ public static class TopBarIcons
     public const string CyanHover = "#80deea";
     public const string CloseHover = "#ff8a80";
 
+    public static ShapesPath CreateEndpointNudgeIcon(double size = 14, string color = "#455a64") =>
+        PathFromSvg(
+            size,
+            "M15 18l-6-6 6-6",
+            color,
+            "0 0 24 24",
+            stroke: true);
+
     public static ShapesPath CreateCopyGlyphIcon(double size = 14, string color = "#455a64") =>
         PathFromSvg(
             size,
@@ -137,6 +145,14 @@ public static class TopBarIcons
             "0 0 24 24");
     }
 
+    public static ShapesPath CreateErrorModeIcon(double size = 16, string color = "#222222") =>
+        PathFromSvg(
+            size,
+            "M12 9v4m0 4h.01M10.29 3.86L1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z",
+            color,
+            "0 0 24 24",
+            stroke: true);
+
     public static ShapesPath CreateTypeModeIcon(double size = 16, string color = "#222222")
     {
         return PathFromSvg(
@@ -154,6 +170,15 @@ public static class TopBarIcons
             color,
             "0 0 24 24");
     }
+
+    /// <summary>Question mark in circle — closing / Q&amp;A segment.</summary>
+    public static ShapesPath CreateClosingModeIcon(double size = 16, string color = "#222222") =>
+        PathFromSvg(
+            size,
+            "M9.09 9a3 3 0 0 1 5.83 1c0 2-3 3-3 3m.08 4h.01M21 12a9 9 0 1 1-18 0 9 9 0 0 1 18 0z",
+            color,
+            "0 0 24 24",
+            stroke: true);
 
     public static ShapesPath CreateInfoModeIcon(double size = 16, string color = "#222222")
     {

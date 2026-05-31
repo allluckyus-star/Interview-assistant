@@ -55,7 +55,9 @@
             <Button x:Name="NavInitialInterview" Tag="initial_interview" Style="{StaticResource SettingsNavButtonStyle}" Click="ModeNav_OnClick" Content="Initial interview" />
             <Button x:Name="NavRead" Tag="read" Style="{StaticResource SettingsNavButtonStyle}" Click="ModeNav_OnClick" Content="Read" />
             <Button x:Name="NavType" Tag="type" Style="{StaticResource SettingsNavButtonStyle}" Click="ModeNav_OnClick" Content="Type" />
+            <Button x:Name="NavError" Tag="error" Style="{StaticResource SettingsNavButtonStyle}" Click="ModeNav_OnClick" Content="Error / debug" />
             <Button x:Name="NavBehavioral" Tag="behavioral" Style="{StaticResource SettingsNavButtonStyle}" Click="ModeNav_OnClick" Content="Behavioral" />
+            <Button x:Name="NavClosing" Tag="closing" Style="{StaticResource SettingsNavButtonStyle}" Click="ModeNav_OnClick" Content="Closing questions" />
           </StackPanel>
         </ScrollViewer>
       </DockPanel>

@@ -90,6 +90,16 @@
                     Orientation="Horizontal"
                     VerticalAlignment="Center"
                     shell:WindowChrome.IsHitTestVisibleInChrome="True">
+          <Button x:Name="RestartWizardButton"
+                  Style="{StaticResource WizardSkipButtonStyle}"
+                  Height="28"
+                  MinWidth="64"
+                  Padding="10,4"
+                  Margin="0,0,6,0"
+                  Visibility="Collapsed"
+                  Content="Restart"
+                  ToolTip="Return to Resume &amp; Job Description. Keeps your text; ChatGPT tab stays open."
+                  Click="RestartWizardButton_OnClick" />
           <StackPanel x:Name="InterviewTopBarPanel"
                       Orientation="Horizontal"
                       Margin="0,0,6,0"
@@ -173,6 +183,40 @@
                     </Border>
                   </StackPanel>
                 </Button>
+                <Button x:Name="SessionModeErrorButton"
+                        Style="{StaticResource TopBarSessionSegmentButtonStyle}"
+                        Tag="error"
+                        Click="SessionModeSegment_OnClick"
+                        ToolTip="Error mode: where it broke, fix, full code + what to say"
+                        Width="28"
+                        Height="28"
+                        MinWidth="28">
+                  <StackPanel Orientation="Horizontal"
+                              HorizontalAlignment="Center">
+                    <Viewbox x:Name="SessionModeErrorIconHost"
+                             Width="14"
+                             Height="14"
+                             VerticalAlignment="Center"
+                             RenderTransformOrigin="0.5,0.5">
+                      <Viewbox.RenderTransform>
+                        <ScaleTransform ScaleX="1" ScaleY="1" />
+                      </Viewbox.RenderTransform>
+                    </Viewbox>
+                    <Border x:Name="SessionModeErrorTextClip"
+                            VerticalAlignment="Center"
+                            Margin="5,0,2,0"
+                            ClipToBounds="True"
+                            MaxWidth="0">
+                      <TextBlock x:Name="SessionModeErrorLabel"
+                                 FontSize="11"
+                                 FontWeight="Bold"
+                                 Foreground="#222222"
+                                 TextTrimming="CharacterEllipsis"
+                                 TextWrapping="NoWrap"
+                                 Text="Error" />
+                    </Border>
+                  </StackPanel>
+                </Button>
                 <Button x:Name="SessionModeBehavioralButton"
                         Style="{StaticResource TopBarSessionSegmentButtonStyle}"
                         Tag="behavioral"
@@ -204,6 +248,40 @@
                                  TextTrimming="CharacterEllipsis"
                                  TextWrapping="NoWrap"
                                  Text="Behavioral" />
+                    </Border>
+                  </StackPanel>
+                </Button>
+                <Button x:Name="SessionModeClosingButton"
+                        Style="{StaticResource TopBarSessionSegmentButtonStyle}"
+                        Tag="closing"
+                        Click="SessionModeSegment_OnClick"
+                        ToolTip="Closing questions (End sends full session transcript)"
+                        Width="28"
+                        Height="28"
+                        MinWidth="28">
+                  <StackPanel Orientation="Horizontal"
+                              HorizontalAlignment="Center">
+                    <Viewbox x:Name="SessionModeClosingIconHost"
+                             Width="14"
+                             Height="14"
+                             VerticalAlignment="Center"
+                             RenderTransformOrigin="0.5,0.5">
+                      <Viewbox.RenderTransform>
+                        <ScaleTransform ScaleX="1" ScaleY="1" />
+                      </Viewbox.RenderTransform>
+                    </Viewbox>
+                    <Border x:Name="SessionModeClosingTextClip"
+                            VerticalAlignment="Center"
+                            Margin="5,0,2,0"
+                            ClipToBounds="True"
+                            MaxWidth="0">
+                      <TextBlock x:Name="SessionModeClosingLabel"
+                                 FontSize="11"
+                                 FontWeight="Bold"
+                                 Foreground="#222222"
+                                 TextTrimming="CharacterEllipsis"
+                                 TextWrapping="NoWrap"
+                                 Text="Closing" />
                     </Border>
                   </StackPanel>
                 </Button>
@@ -269,8 +347,33 @@
               <ColumnDefinition Width="*" />
               <ColumnDefinition Width="Auto" />
             </Grid.ColumnDefinitions>
-            <Grid x:Name="GptWebViewHost"
-                  Grid.Column="0" />
+            <Grid Grid.Column="0">
+              <Grid x:Name="GptWebViewHost" />
+              <Border x:Name="WizardGptLoginBlocker"
+                      Panel.ZIndex="20"
+                      Background="#E6FFFFFF"
+                      Visibility="Collapsed"
+                      IsHitTestVisible="True"
+                      shell:WindowChrome.IsHitTestVisibleInChrome="True">
+                <StackPanel VerticalAlignment="Center"
+                            HorizontalAlignment="Center"
+                            Margin="24">
+                  <TextBlock Text="Loading ChatGPT…"
+                             FontSize="17"
+                             FontWeight="SemiBold"
+                             Foreground="#37474F"
+                             TextAlignment="Center" />
+                  <TextBlock x:Name="WizardGptLoginBlockerHint"
+                             Text="Log in and open a chat. You can continue once the page is ready."
+                             FontSize="14"
+                             Foreground="#546E7A"
+                             TextAlignment="Center"
+                             TextWrapping="Wrap"
+                             MaxWidth="340"
+                             Margin="0,10,0,0" />
+                </StackPanel>
+              </Border>
+            </Grid>
             <StackPanel x:Name="GptSideToolStack"
                         Grid.Column="1"
                         VerticalAlignment="Top"
@@ -305,7 +408,7 @@
                       Height="28"
                       Margin="0,0,0,4"
                       shell:WindowChrome.IsHitTestVisibleInChrome="True"
-                      ToolTip="Snip screen → OCR text into ChatGPT prompt (Ctrl+Home; does not send)"
+                      ToolTip="Snip screen → OCR text into ChatGPT prompt (Ctrl+Home). Shift+click = paste live caption draft (does not send)"
                       Click="GptTextButton_OnClick">
                 <Viewbox x:Name="GptTextIconHost" Width="14" Height="14" />
               </Button>
@@ -325,8 +428,8 @@
 
         <!-- Step 1: Resume + JD (no WebView) -->
         <Grid x:Name="Step1Panel"
-              Grid.Row="0"
-              Grid.RowSpan="3"
+              Grid.Row="1"
+              Grid.RowSpan="1"
               Background="Transparent"
               Visibility="Visible"
               PreviewMouseLeftButtonDown="Step1Panel_PreviewMouseLeftButtonDown">
@@ -345,7 +448,9 @@
                          FontSize="15"
                          FontWeight="SemiBold"
                          Foreground="#0F172A"
-                         Text="Resume" />
+                         Text="Resume"
+                         TextAlignment="Center"
+                         HorizontalAlignment="Stretch" />
               <TextBox x:Name="ResumeTextBox"
                        AcceptsReturn="True"
                        AcceptsTab="True"
@@ -370,7 +475,9 @@
                          FontSize="15"
                          FontWeight="SemiBold"
                          Foreground="#0F172A"
-                         Text="Job Description" />
+                         Text="Job Description"
+                         TextAlignment="Center"
+                         HorizontalAlignment="Stretch" />
               <TextBox x:Name="JdTextBox"
                        AcceptsReturn="True"
                        AcceptsTab="True"
@@ -399,18 +506,38 @@
                   Content="Continue" />
         </Grid>
 
-        <!-- Steps 2–5: title row, WebView middle, footer buttons (no bordered chrome) -->
+        <!-- Steps 1–5: animated title row -->
         <Grid x:Name="WizardHeaderPanel"
               Grid.Row="0"
               Margin="0,0,0,6"
               Visibility="Collapsed"
+              MinHeight="36"
               shell:WindowChrome.IsHitTestVisibleInChrome="True">
-          <TextBlock x:Name="WizardTitleText"
-                     FontSize="18"
-                     FontWeight="SemiBold"
-                     Foreground="#0F172A"
-                     TextAlignment="Center"
-                     TextWrapping="Wrap" />
+          <Border x:Name="WizardTitleViewport"
+                  Height="36"
+                  Margin="16,0"
+                  ClipToBounds="True"
+                  HorizontalAlignment="Stretch"
+                  VerticalAlignment="Center">
+            <Canvas x:Name="WizardTitleHost"
+                    Height="36"
+                    Width="{Binding ActualWidth, ElementName=WizardTitleViewport}">
+              <TextBlock x:Name="WizardTitleText"
+                         FontSize="18"
+                         FontWeight="SemiBold"
+                         Foreground="#0F172A"
+                         TextWrapping="NoWrap"
+                         TextAlignment="Center"
+                         Canvas.Top="6" />
+              <TextBlock x:Name="WizardTitleOutgoing"
+                         FontSize="18"
+                         FontWeight="SemiBold"
+                         Foreground="#0F172A"
+                         TextWrapping="NoWrap"
+                         Visibility="Collapsed"
+                         Canvas.Top="6" />
+            </Canvas>
+          </Border>
         </Grid>
 
         <Grid x:Name="WizardFooterPanel"

@@ -79,6 +79,11 @@ public sealed class InterviewSessionCoordinator : IDisposable
             IsRunning = true;
             StatusMessage?.Invoke("Live captions listening. End = send chunk, Delete = skip.");
             Trace.WriteLine("[InterviewAssistant] Interview session started");
+            if (CaptionDiagnostics.IsEnabled)
+            {
+                CaptionDiagnostics.Log("session-start", 0, 0, "", 0, 0,
+                    "(waiting for Live Captions text — finish wizard / main interview)");
+            }
         }
         catch (Exception ex)
         {
@@ -97,6 +102,16 @@ public sealed class InterviewSessionCoordinator : IDisposable
         _capture.Stop();
     }
 
+    /// <summary>Stop capture/polling and clear caption/history without starting a new session.</summary>
+    public void ResetSessionArtifacts()
+    {
+        Stop();
+        _captionState.ResetForNewSession();
+        _history.Clear();
+        _pendingRequestId = "";
+        _lastAnswerRequestId = "";
+    }
+
     private void OnDraftUpdated(string draft) => DraftCaptionChanged?.Invoke(draft);
 
     private void OnEndPressed()
@@ -106,18 +121,20 @@ public sealed class InterviewSessionCoordinator : IDisposable
         if (string.IsNullOrWhiteSpace(chunk))
         {
             StatusMessage?.Invoke("No caption yet.");
-            DraftCaptionChanged?.Invoke("");
+            DraftCaptionChanged?.Invoke(_captionState.GetDraftTail());
             return;
         }
 
         _history.AppendInterviewer(chunk, "sent_gpt");
         InterviewerChunkCaptured?.Invoke(chunk, "sent_gpt");
 
-        var (_, finalPrompt) = ChunkPromptBuilder.Build(chunk, _modePrompts.GetActiveTemplate());
+        var (_, finalPrompt) = ChunkPromptBuilder.Build(
+            ResolveInterviewerIntentForPrompt(chunk),
+            _modePrompts.GetActiveTemplate());
         if (!string.IsNullOrWhiteSpace(finalPrompt))
             SendChunkToGptRequested?.Invoke(finalPrompt);
 
-        DraftCaptionChanged?.Invoke("");
+        DraftCaptionChanged?.Invoke(_captionState.GetDraftTail());
     }
 
     private void OnDeletePressed()
@@ -132,6 +149,32 @@ public sealed class InterviewSessionCoordinator : IDisposable
 
         DraftCaptionChanged?.Invoke(_captionState.GetDraftTail());
         StatusMessage?.Invoke(string.IsNullOrWhiteSpace(skipped) ? "Nothing to skip." : "Skipped pending caption.");
+    }
+
+    /// <summary>Double-click on live draft row — same as Delete: skip pending, keep one draft catching new speech.</summary>
+    public void SkipDraftLikeDelete()
+    {
+        var skipped = _captionState.SkipPendingWithoutGpt();
+        if (!string.IsNullOrWhiteSpace(skipped))
+        {
+            _history.AppendInterviewer(skipped, "delete_skip");
+            InterviewerChunkCaptured?.Invoke(skipped, "delete_skip");
+        }
+
+        DraftCaptionChanged?.Invoke(_captionState.GetDraftTail());
+        StatusMessage?.Invoke(string.IsNullOrWhiteSpace(skipped) ? "Nothing to skip." : "Skipped pending caption.");
+    }
+
+    /// <summary>Lock pending draft text for inline edit; advance boundary so a new draft can catch live speech.</summary>
+    public string CaptureDraftForInlineEdit(string fallbackLabel)
+    {
+        var chunk = _captionState.SnapshotChunkSinceLastEnd().Trim();
+        var text = !string.IsNullOrWhiteSpace(chunk)
+            ? chunk
+            : (fallbackLabel ?? "").Trim();
+        if (!string.IsNullOrWhiteSpace(text))
+            _history.AppendInterviewer(text, "draft_edit_capture");
+        return text;
     }
 
     public void FinishBubbleEdit(bool reject, string editedText, string? finalPrompt = null)
@@ -154,7 +197,9 @@ public sealed class InterviewSessionCoordinator : IDisposable
         _history.AppendInterviewer(body, "bubble_edit");
         var prompt = finalPrompt;
         if (string.IsNullOrWhiteSpace(prompt))
-            (_, prompt) = ChunkPromptBuilder.Build(body, _modePrompts.GetActiveTemplate());
+            (_, prompt) = ChunkPromptBuilder.Build(
+                ResolveInterviewerIntentForPrompt(body),
+                _modePrompts.GetActiveTemplate());
 
         if (!string.IsNullOrWhiteSpace(prompt))
             SendChunkToGptRequested?.Invoke(prompt);
@@ -209,6 +254,29 @@ public sealed class InterviewSessionCoordinator : IDisposable
                 break;
             }
         }
+    }
+
+    /// <summary>
+    /// Closing mode uses the full session transcript in <c>{cleaned_interviewer_intent}</c>;
+    /// other modes use the current chunk only.
+    /// </summary>
+    public string ResolveInterviewerIntentForPrompt(string chunk) =>
+        string.Equals(_modePrompts.SessionMode, "closing", StringComparison.OrdinalIgnoreCase)
+            ? _captionState.GetFullSessionCaption().Trim()
+            : (chunk ?? "").Trim();
+
+    public string GetDraftTail() => _captionState.GetDraftTail();
+
+    public IReadOnlyList<EndpointWordOption> GetEndpointWordChoices(int wordCount) =>
+        _captionState.GetWordsBeforeEndpoint(wordCount);
+
+    public bool SetDraftEndpointAt(int startIndexInFull)
+    {
+        if (!_captionState.SetEndpointAtCharacterIndex(startIndexInFull))
+            return false;
+
+        DraftCaptionChanged?.Invoke(_captionState.GetDraftTail());
+        return true;
     }
 
     public void Dispose()

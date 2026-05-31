@@ -28,6 +28,8 @@ internal static class ModePromptSeed
                     }
                     if (loaded.Count >= 3)
                     {
+                        MergeAssetPromptFromFile(loaded, "closing", "closing_mode_prompt.txt");
+                        MergeAssetPromptFromFile(loaded, "error", "error_mode_prompt.txt");
                         _cache = loaded;
                         return _cache;
                     }
@@ -44,7 +46,28 @@ internal static class ModePromptSeed
             ["read"] = "",
             ["type"] = "",
             ["behavioral"] = "",
+            ["closing"] = "",
+            ["error"] = "",
         };
+        MergeAssetPromptFromFile(_cache, "closing", "closing_mode_prompt.txt");
+        MergeAssetPromptFromFile(_cache, "error", "error_mode_prompt.txt");
         return _cache;
+    }
+
+    private static void MergeAssetPromptFromFile(Dictionary<string, string> loaded, string key, string fileName)
+    {
+        var path = Path.Combine(AppContext.BaseDirectory, "Assets", fileName);
+        if (!File.Exists(path))
+            return;
+        try
+        {
+            var text = File.ReadAllText(path);
+            if (!string.IsNullOrWhiteSpace(text))
+                loaded[key] = text;
+        }
+        catch
+        {
+            // ignore
+        }
     }
 }
