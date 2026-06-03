@@ -1,0 +1,95 @@
+{
+
+  "manifest_version": 3,
+
+  "name": "Interview Assistant",
+
+  "version": "0.2.32",
+
+  "description": "Live captions + interview modes alongside ChatGPT (requires Companion tray app).",
+
+  "permissions": ["storage", "activeTab"],
+
+  "host_permissions": [
+
+    "https://chatgpt.com/*",
+
+    "https://chat.openai.com/*",
+
+    "http://127.0.0.1:1212/*"
+
+  ],
+
+  "background": {
+
+    "service_worker": "background.js"
+
+  },
+
+  "content_scripts": [
+
+    {
+
+      "matches": ["https://chatgpt.com/*", "https://chat.openai.com/*"],
+
+      "js": ["content/layout-early.js"],
+
+      "css": ["content/layout.css"],
+
+      "run_at": "document_start"
+
+    },
+
+    {
+
+      "matches": ["https://chatgpt.com/*", "https://chat.openai.com/*"],
+
+      "js": [
+
+        "content/gpt-send.js",
+
+        "content/toast.js",
+
+        "content/api.js",
+
+        "content/caption-sentences.js",
+
+        "content/icons.js",
+
+        "content/file-import.js",
+
+        "content/panel-styles.js",
+
+        "content/panel.js",
+
+        "content/layout.js"
+
+      ],
+
+      "run_at": "document_idle"
+
+    }
+
+  ],
+
+  "web_accessible_resources": [
+
+    {
+
+      "resources": ["content/panel.css"],
+
+      "matches": ["https://chatgpt.com/*", "https://chat.openai.com/*"]
+
+    }
+
+  ],
+
+  "action": {
+
+    "default_title": "Interview Assistant"
+
+  }
+
+}
+
+

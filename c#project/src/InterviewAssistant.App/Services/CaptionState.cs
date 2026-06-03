@@ -38,6 +38,13 @@ public sealed class CaptionState
             return _refinedFullCaption;
     }
 
+    /// <summary>Character index in <see cref="GetFullSessionCaption"/> where pending (green) draft begins.</summary>
+    public int GetPendingStartIndex()
+    {
+        lock (_lock)
+            return Math.Min(_nextChunkStartIndex, _refinedFullCaption.Length);
+    }
+
     public string SnapshotChunkSinceLastEnd()
     {
         lock (_lock)

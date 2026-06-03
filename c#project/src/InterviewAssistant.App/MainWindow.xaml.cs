@@ -140,8 +140,8 @@ public partial class MainWindow : Window
         StartupDiagnostics.Log("MainWindow: before InitializeComponent");
         ApplyOpaqueWindowFallbackIfRequested();
         try
-        {
-            InitializeComponent();
+    {
+        InitializeComponent();
         }
         catch (Exception ex)
         {

@@ -6,6 +6,8 @@
 *.suo
 *.cache
 publish/
+companion/**/bin/
+companion/**/obj/
 
 # Logs and runtime
 *.log

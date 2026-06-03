@@ -1,0 +1,221 @@
+/*
+ * Side-by-side layout — how it works:
+ *
+ * 1. body gets width: 70vw + transform: translateZ(0).
+ *    The transform makes body the containing-block for all position:fixed
+ *    descendants (CSS spec), so ChatGPT's fixed nav/modals stay inside 70vw.
+ *
+ * 2. ChatGPT uses Tailwind `w-screen` (= 100vw) on its root shell and several
+ *    nested wrappers. 100vw always means full viewport regardless of parent
+ *    width, so we must override those elements explicitly to `width: 100%`
+ *    (which cascades from body's 70vw).
+ *
+ * 3. The panel host is a child of <html> (NOT body), so position:fixed on it
+ *    is relative to the viewport — it correctly occupies the right 30vw column.
+ */
+
+html.ia-docked {
+  --ia-panel-w: 30vw;
+}
+
+html.ia-docked.ia-panel-collapsed {
+  --ia-panel-w: 0px;
+}
+
+/* ── Expanded: body = left 70vw column ──────────────────────────────────── */
+
+html.ia-docked:not(.ia-panel-collapsed) body {
+  width: calc(100vw - var(--ia-panel-w)) !important;
+  max-width: calc(100vw - var(--ia-panel-w)) !important;
+  min-width: 0 !important;
+  margin: 0 !important;
+  overflow-x: hidden !important;
+  /* Makes body the containing-block for all position:fixed children */
+  transform: translateZ(0);
+  position: relative;
+}
+
+/*
+ * Override every descendant that uses Tailwind w-screen / h-svh so they
+ * fill body's width (70vw) instead of the full viewport (100vw).
+ * Exclude the panel host and its children.
+ */
+html.ia-docked:not(.ia-panel-collapsed) body > div,
+html.ia-docked:not(.ia-panel-collapsed) body > div > div,
+html.ia-docked:not(.ia-panel-collapsed) body [class*="w-screen"]:not(#ia-interview-panel-host):not(#ia-interview-panel-host *) {
+  width: 100% !important;
+  max-width: 100% !important;
+  min-width: 0 !important;
+}
+
+/* ── Collapsed: full-width, no transform ────────────────────────────────── */
+
+html.ia-docked.ia-panel-collapsed body {
+  width: 100vw !important;
+  max-width: 100vw !important;
+  margin: 0 !important;
+  overflow-x: auto !important;
+  transform: none !important;
+  position: static !important;
+}
+
+/* ── Panel host (child of <html>, not body) ─────────────────────────────── */
+
+html.ia-docked:not(.ia-panel-collapsed) #ia-interview-panel-host {
+  position: fixed;
+  top: 0;
+  right: 0;
+  left: auto;
+  width: var(--ia-panel-w);
+  height: 100vh;
+  z-index: 2147483645;
+  font-family: "Segoe UI", "Segoe UI Variable Text", system-ui, sans-serif;
+  font-size: 13px;
+  color: #111;
+  box-sizing: border-box;
+  background: #f3f4f6;
+  border-left: 1px solid #cbd5e1;
+  box-shadow: -8px 0 24px rgba(15, 23, 42, 0.12);
+  pointer-events: auto;
+  transition: width 0.28s ease;
+}
+
+/* Collapsed — transparent, zero-size host; only edge tab is visible */
+html.ia-docked.ia-panel-collapsed #ia-interview-panel-host {
+  position: fixed;
+  top: 0;
+  right: 0;
+  width: 0;
+  height: 0;
+  overflow: visible;
+  background: transparent !important;
+  border: none !important;
+  box-shadow: none !important;
+  pointer-events: none;
+}
+
+html.ia-docked.ia-panel-collapsed #ia-interview-panel-host .ia-panel-inner {
+  display: none !important;
+}
+
+html.ia-docked:not(.ia-panel-collapsed) #ia-interview-panel-host .ia-panel-inner {
+  width: 100%;
+  height: 100%;
+}
+
+#ia-interview-panel-host *,
+#ia-interview-panel-host *::before,
+#ia-interview-panel-host *::after {
+  box-sizing: border-box;
+}
+
+/* ── Expand edge tab (shown only when collapsed) ────────────────────────── */
+
+#ia-panel-edge-tab {
+  display: none;
+  align-items: center;
+  justify-content: center;
+  width: 40px;
+  height: 72px;
+  padding: 0;
+  border: 1px solid #e2e8f0;
+  border-right: none;
+  border-radius: 10px 0 0 10px;
+  background: #ffffff;
+  color: #4f46e5;
+  cursor: pointer;
+  box-shadow: -4px 0 16px rgba(15, 23, 42, 0.1);
+}
+
+#ia-panel-edge-tab:hover {
+  background: #f8fafc;
+}
+
+#ia-panel-edge-tab svg {
+  width: 18px;
+  height: 18px;
+  stroke: currentColor;
+  fill: none;
+  stroke-width: 2;
+}
+
+html.ia-docked.ia-panel-collapsed #ia-panel-edge-tab {
+  display: flex;
+  position: fixed;
+  top: 50%;
+  right: 0;
+  transform: translateY(-50%);
+  z-index: 2147483646;
+  pointer-events: auto;
+}
+
+html.ia-docked:not(.ia-panel-collapsed) #ia-panel-edge-tab {
+  display: none;
+}
+
+/* —— Centered toasts (page level, like WPF ToastOverlay) —— */
+#ia-toast-host {
+  position: fixed;
+  top: 14px;
+  left: 50%;
+  transform: translateX(-50%);
+  z-index: 2147483647;
+  pointer-events: none;
+  width: max-content;
+  max-width: calc(100vw - 32px);
+}
+
+.ia-toast-stack {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 8px;
+  width: max-content;
+  max-width: calc(100vw - 32px);
+}
+
+.ia-toast {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  width: fit-content;
+  max-width: min(420px, calc(100vw - 32px));
+  padding: 10px 14px 10px 12px;
+  border-radius: 12px;
+  border: 1px solid var(--ia-toast-border, #a7f3d0);
+  background: var(--ia-toast-bg, #ecfdf5);
+  color: var(--ia-toast-text, #065f46);
+  font-family: "Segoe UI", system-ui, -apple-system, BlinkMacSystemFont, sans-serif;
+  font-size: 12px;
+  line-height: 1.35;
+  box-shadow: 0 4px 16px rgba(0, 0, 0, 0.12);
+  opacity: 0;
+  transform: translateY(-6px);
+  transition: opacity 0.18s ease, transform 0.18s ease;
+}
+
+.ia-toast--visible {
+  opacity: 1;
+  transform: translateY(0);
+}
+
+.ia-toast-icon {
+  flex-shrink: 0;
+  width: 20px;
+  height: 20px;
+  border-radius: 50%;
+  background: var(--ia-toast-icon, #059669);
+  color: #fff;
+  font-size: 12px;
+  font-weight: 700;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  line-height: 1;
+}
+
+.ia-toast-text {
+  flex: 0 1 auto;
+  min-width: 0;
+  word-break: break-word;
+}
