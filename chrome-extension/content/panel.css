@@ -282,39 +282,67 @@ button {
   box-shadow: 0 1px 4px rgba(0, 0, 0, 0.12);
 }
 
-/* —— Toolbar card —— */
-.ia-toolbar-card {
-  margin: 12px 12px 0;
-  padding: 12px;
+/* —— Toolbar card (caption tab) —— */
+.ia-caption-view .ia-toolbar-card {
+  margin: 1px 1px 0;
+  padding: 1px;
   background: var(--ia-bg);
   border: 1px solid var(--ia-border);
   border-radius: var(--ia-radius);
 }
 
-.ia-toolbar {
+.ia-caption-view .ia-toolbar {
   display: flex;
   flex-wrap: wrap;
   align-items: center;
-  gap: 8px;
+  gap: 2px;
 }
 
-.ia-prep-seg {
+.ia-caption-view .ia-prep-seg {
   display: inline-flex;
   align-items: center;
-  gap: 4px;
+  gap: 1px;
   flex-shrink: 0;
 }
 
-.ia-prep-seg .ia-icon-btn svg {
-  width: 16px;
-  height: 16px;
-  fill: currentColor;
-  stroke: none;
+/* Caption toolbar: 30×30 buttons, icon/graphic ≈40% (12px) */
+.ia-caption-view .ia-icon-btn,
+.ia-caption-view .ia-mode-btn,
+.ia-caption-view .ia-lang-btn {
+  width: 30px;
+  height: 30px;
+  min-width: 30px;
+  min-height: 30px;
+  padding: 0;
+  box-sizing: border-box;
+  flex-shrink: 0;
 }
 
-.ia-icon-btn {
-  width: 40px;
-  height: 40px;
+.ia-caption-view .ia-mode-seg,
+.ia-caption-view .ia-lang-seg {
+  padding: 2px;
+  border-radius: 16px;
+  gap: 2px;
+}
+
+.ia-caption-view .ia-mode-btn,
+.ia-caption-view .ia-lang-btn {
+  border-radius: 15px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.ia-caption-view .ia-lang-btn {
+  width: auto;
+  min-width: 30px;
+  padding: 0 4px;
+  font-size: 12px;
+  line-height: 1;
+  font-weight: 600;
+}
+
+.ia-caption-view .ia-icon-btn {
   border-radius: var(--ia-radius-pill);
   background: var(--ia-bg);
   border: 1px solid var(--ia-border);
@@ -325,34 +353,47 @@ button {
   transition: transform 0.12s ease, background 0.15s ease, box-shadow 0.15s ease;
 }
 
-.ia-icon-btn:hover {
+.ia-caption-view .ia-icon-btn:hover {
   background: #e5e7eb;
   transform: translateY(-1px);
 }
 
-.ia-icon-btn svg {
-  width: 18px;
-  height: 18px;
+.ia-caption-view .ia-icon-btn svg,
+.ia-caption-view .ia-mode-btn svg,
+.ia-caption-view .ia-prep-seg .ia-icon-btn svg {
+  width: 40%;
+  height: 40%;
+  max-width: 12px;
+  max-height: 12px;
+  flex-shrink: 0;
+}
+
+.ia-caption-view .ia-prep-seg .ia-icon-btn svg {
+  fill: currentColor;
+  stroke: none;
+}
+
+.ia-caption-view .ia-icon-btn svg {
   stroke: currentColor;
   fill: none;
-  stroke-width: 2;
+  stroke-width: 1.5;
   stroke-linecap: round;
   stroke-linejoin: round;
 }
 
-.ia-icon-btn.primary {
+.ia-caption-view .ia-icon-btn.primary {
   background: var(--ia-accent);
   border-color: transparent;
   color: var(--ia-accent-ink);
   font-weight: 700;
-  box-shadow: 0 2px 8px rgba(158, 240, 26, 0.35);
+  box-shadow: 0 1px 4px rgba(158, 240, 26, 0.35);
 }
 
-.ia-icon-btn.primary:hover {
+.ia-caption-view .ia-icon-btn.primary:hover {
   background: var(--ia-accent-hover);
 }
 
-.ia-icon-btn.ghost {
+.ia-caption-view .ia-icon-btn.ghost {
   background: var(--ia-surface);
 }
 
