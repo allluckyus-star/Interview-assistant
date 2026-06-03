@@ -61,11 +61,15 @@ window.IaPanel = (function () {
 
     lastRenderedPendingStart: -1,
 
+    /** User drag selection: sentence indices in getCaptionItems(). */
+    selection: null,
+
   };
 
 
 
   let els = {};
+  let dragSelect = null;
   let disconnectEvents = null;
   let healthPollId = null;
   let companionBootstrapped = false;
@@ -106,6 +110,9 @@ window.IaPanel = (function () {
     if (data.draft !== undefined) state.draft = data.draft || "";
     if (data.full !== undefined) state.fullCaption = data.full || "";
     else if (!state.fullCaption && state.draft) state.fullCaption = state.draft;
+    if (typeof data.pending_start === "number" && data.pending_start >= 0) {
+      state.endpoint = data.pending_start;
+    }
     state.pendingStart = computePendingStart(getFeedCaption());
     prunePendingEdits();
   }
@@ -117,9 +124,217 @@ window.IaPanel = (function () {
     return fallback;
   }
 
-  /** Green zone starts after both last send and last skip. */
+  /** Character index: text at or before this is sent/skipped (gray); after is pending (green). */
   function getGreenStart() {
     return Math.max(state.endpoint || 0, state.skipThrough || 0);
+  }
+
+  /** Unsent in caption model (endpoint boundary). */
+  function isSentencePending(item) {
+    if (!item) return false;
+    return item.end > getGreenStart();
+  }
+
+  /** Default (no drag): unsent sentences green. After drag: green = selected range only. */
+  function isGreenSendTarget(index, item) {
+    if (state.selection) return isSentenceSelected(index);
+    return isSentencePending(item);
+  }
+
+  /** Drag uses selection as-is; otherwise all unsent sentences. */
+  function getPendingSendRange() {
+    const items = getCaptionItems();
+    if (!items.length) return null;
+
+    const sel = getSelectionRange();
+    if (sel) return sel;
+
+    let first = -1;
+    let last = -1;
+    for (let i = 0; i < items.length; i++) {
+      if (!isSentencePending(items[i])) continue;
+      if (first < 0) first = i;
+      last = i;
+    }
+    if (first < 0) return null;
+    return { anchorIdx: first, endIdx: last };
+  }
+
+  async function setEndpointToNow() {
+    const now = getFeedCaption().length;
+    state.endpoint = now;
+    await IaApi.post("/endpoint", { start_index: now });
+  }
+
+  function getSelectionRange() {
+    if (!state.selection) return null;
+    const items = getCaptionItems();
+    if (!items.length) return null;
+    let a = state.selection.anchorIdx;
+    let e = state.selection.endIdx;
+    if (state.selection.anchoredToLive) e = items.length - 1;
+    else e = Math.min(e, items.length - 1);
+    a = Math.max(0, Math.min(a, items.length - 1));
+    if (a > e) return null;
+    return { anchorIdx: a, endIdx: e };
+  }
+
+  function isSentenceSelected(index) {
+    const r = getSelectionRange();
+    if (!r || index < 0) return false;
+    return index >= r.anchorIdx && index <= r.endIdx;
+  }
+
+  function itemKeyForItem(item) {
+    const pendingStart = state.pendingStart || 0;
+    return item.end > pendingStart ? `l-${item.start}` : `s-${item.start}`;
+  }
+
+  function sentenceBoxProps(items, index) {
+    const item = items[index];
+    const key = itemKeyForItem(item);
+    return {
+      key,
+      text: sentenceText(key, item.text),
+      pending: isGreenSendTarget(index, item),
+      selected: !!state.selection && isSentenceSelected(index),
+      live:
+        isSentenceSelected(index) &&
+        !!state.selection?.anchoredToLive &&
+        index === items.length - 1,
+      index,
+    };
+  }
+
+  function sentenceIndexFromEl(el) {
+    const box = el?.closest?.(".ia-sentence");
+    if (!box) return -1;
+    const idx = parseInt(box.dataset.sentenceIndex, 10);
+    return Number.isNaN(idx) ? -1 : idx;
+  }
+
+  /** Hit-test in shadow feed — document mousemove target does not reach shadow children. */
+  function sentenceIndexAtClient(clientX, clientY) {
+    if (!els.feed) return -1;
+    const feedR = els.feed.getBoundingClientRect();
+    if (clientX < feedR.left || clientX > feedR.right || clientY < feedR.top || clientY > feedR.bottom) {
+      return -1;
+    }
+
+    const boxes = els.feed.querySelectorAll(".ia-sentence[data-sentence-index]");
+    let bestIdx = -1;
+    let bestDist = Infinity;
+
+    for (const box of boxes) {
+      const r = box.getBoundingClientRect();
+      if (clientX >= r.left && clientX <= r.right && clientY >= r.top && clientY <= r.bottom) {
+        const idx = parseInt(box.dataset.sentenceIndex, 10);
+        return Number.isNaN(idx) ? -1 : idx;
+      }
+      const cx = Math.max(r.left, Math.min(clientX, r.right));
+      const cy = Math.max(r.top, Math.min(clientY, r.bottom));
+      const d = (clientX - cx) ** 2 + (clientY - cy) ** 2;
+      if (d < bestDist) {
+        const idx = parseInt(box.dataset.sentenceIndex, 10);
+        if (!Number.isNaN(idx)) {
+          bestDist = d;
+          bestIdx = idx;
+        }
+      }
+    }
+
+    return bestIdx;
+  }
+
+  function sentenceIndexFromEvent(e) {
+    if (e.composedPath) {
+      for (const el of e.composedPath()) {
+        if (el instanceof Element) {
+          const idx = sentenceIndexFromEl(el);
+          if (idx >= 0) return idx;
+        }
+      }
+    }
+    return sentenceIndexAtClient(e.clientX, e.clientY);
+  }
+
+  function commitSelection(anchorIdx, endIdx) {
+    const items = getCaptionItems();
+    if (!items.length) return;
+    const a = Math.max(0, Math.min(anchorIdx, endIdx));
+    const e = Math.max(0, Math.min(Math.max(anchorIdx, endIdx), items.length - 1));
+    state.selection = {
+      anchorIdx: a,
+      endIdx: e,
+      anchoredToLive: e === items.length - 1,
+    };
+    applySelectionStyles();
+  }
+
+  function applySelectionStyles() {
+    const items = getCaptionItems();
+    els.feed?.querySelectorAll(".ia-sentence[data-sentence-index]").forEach((el) => {
+      const idx = sentenceIndexFromEl(el);
+      if (idx < 0 || !items[idx]) return;
+      const p = sentenceBoxProps(items, idx);
+      updateSentenceBox(el, p);
+    });
+  }
+
+  function finishDragSelect(e) {
+    if (!dragSelect) return;
+    const items = getCaptionItems();
+    if (state.selection && items.length) {
+      state.selection.anchoredToLive = state.selection.endIdx === items.length - 1;
+    }
+    dragSelect = null;
+    els.feed.removeEventListener("pointermove", onFeedSelectMove);
+    els.feed.removeEventListener("pointerup", onFeedSelectEnd);
+    els.feed.removeEventListener("pointercancel", onFeedSelectEnd);
+    try {
+      if (e?.pointerId != null) els.feed.releasePointerCapture(e.pointerId);
+    } catch (_) {
+      /* ignore */
+    }
+    applySelectionStyles();
+  }
+
+  function onFeedSelectStart(e) {
+    if (state.editingKey) return;
+    if (e.button !== 0) return;
+    const idx = sentenceIndexFromEvent(e);
+    if (idx < 0) return;
+    e.preventDefault();
+    /* New drag replaces prior green send range; selection ignores endpoint. */
+    state.selection = null;
+    applySelectionStyles();
+    dragSelect = { anchorIdx: idx };
+    try {
+      els.feed.setPointerCapture(e.pointerId);
+    } catch (_) {
+      /* ignore */
+    }
+    commitSelection(idx, idx);
+    els.feed.addEventListener("pointermove", onFeedSelectMove);
+    els.feed.addEventListener("pointerup", onFeedSelectEnd);
+    els.feed.addEventListener("pointercancel", onFeedSelectEnd);
+  }
+
+  function onFeedSelectMove(e) {
+    if (!dragSelect) return;
+    const idx = sentenceIndexFromEvent(e);
+    if (idx < 0) return;
+    commitSelection(dragSelect.anchorIdx, idx);
+  }
+
+  function onFeedSelectEnd(e) {
+    finishDragSelect(e);
+  }
+
+  function setupFeedSelection() {
+    els.feed.addEventListener("pointerdown", onFeedSelectStart);
+    els.feed.style.userSelect = "none";
+    els.feed.style.touchAction = "none";
   }
 
   function gptNotReadyMessage(status) {
@@ -247,14 +462,26 @@ window.IaPanel = (function () {
         window.IaToast?.warning("Send failed. Initial interview template is empty.");
         return;
       }
-      await sendPromptToGpt(template, false);
+      const result = await sendPromptToGpt(template, false);
+      if (result?.ok) {
+        await setEndpointToNow();
+        state.selection = null;
+        renderFeed();
+      }
     }
   }
 
   function buildPendingChunk() {
-    const greenStart = getGreenStart();
-    const items = getCaptionItems().filter((it) => it.end > greenStart);
-    return joinSentences(items.map((it) => sentenceText(`l-${it.start}`, it.text)));
+    const range = getPendingSendRange();
+    if (!range) return "";
+    const items = getCaptionItems();
+    const texts = [];
+    for (let i = range.anchorIdx; i <= range.endIdx; i++) {
+      const item = items[i];
+      if (!item) continue;
+      texts.push(sentenceText(itemKeyForItem(item), item.text));
+    }
+    return joinSentences(texts);
   }
 
   function clearPendingSentenceEdits() {
@@ -384,6 +611,8 @@ window.IaPanel = (function () {
 
     setupFeedAutoscroll();
 
+    setupFeedSelection();
+
   }
 
 
@@ -492,8 +721,6 @@ window.IaPanel = (function () {
                 </div>
 
               </div>
-
-              <p class="ia-hint">Double-click to edit · green = since last send</p>
 
               <div class="ia-body" id="ia-feed"></div>
 
@@ -725,6 +952,8 @@ window.IaPanel = (function () {
     state.endpoint = 0;
 
     state.skipThrough = 0;
+
+    state.selection = null;
 
     state.lastRenderedPendingStart = -1;
 
@@ -982,6 +1211,8 @@ window.IaPanel = (function () {
 
     updateFixedZoneStyles();
 
+    applySelectionStyles();
+
     if (!els.feed.querySelector(".ia-sentence")) {
       rebuildFeedFromCaption();
     }
@@ -994,7 +1225,6 @@ window.IaPanel = (function () {
 
   /** Fallback when incremental zones fail to paint any boxes. */
   function rebuildFeedFromCaption() {
-    const greenStart = getGreenStart();
     const pendingStart = state.pendingStart || 0;
     const items = getCaptionItems();
     els.feed.innerHTML = "";
@@ -1002,17 +1232,11 @@ window.IaPanel = (function () {
     els.feedLive = null;
     state.lastRenderedPendingStart = -1;
     ensureFeedZones();
-    for (const item of items) {
+    items.forEach((item, i) => {
       const inLive = item.end > pendingStart;
-      const key = `${inLive ? "l" : "s"}-${item.start}`;
-      const box = renderSentenceBox({
-        key,
-        text: sentenceText(key, item.text),
-        pending: item.end > greenStart,
-        live: item.end > greenStart && item === items[items.length - 1],
-      });
+      const box = renderSentenceBox(sentenceBoxProps(items, i));
       (inLive ? els.feedLive : els.feedFixed).appendChild(box);
-    }
+    });
     state.lastRenderedPendingStart = state.pendingStart;
   }
 
@@ -1022,31 +1246,19 @@ window.IaPanel = (function () {
 
     const pendingStart = state.pendingStart || 0;
 
-    for (const item of getCaptionItems()) {
+    const items = getCaptionItems();
 
-      if (item.end > pendingStart) continue;
+    items.forEach((item, i) => {
+
+      if (item.end > pendingStart) return;
 
       const key = `s-${item.start}`;
 
-      if (els.feedFixed.querySelector(`.ia-sentence[data-sentence-key="${CSS.escape(key)}"]`)) continue;
+      if (els.feedFixed.querySelector(`.ia-sentence[data-sentence-key="${CSS.escape(key)}"]`)) return;
 
-      els.feedFixed.appendChild(
+      els.feedFixed.appendChild(renderSentenceBox(sentenceBoxProps(items, i)));
 
-        renderSentenceBox({
-
-          key,
-
-          text: sentenceText(key, item.text),
-
-          pending: item.end > getGreenStart(),
-
-          live: false,
-
-        })
-
-      );
-
-    }
+    });
 
   }
 
@@ -1056,21 +1268,17 @@ window.IaPanel = (function () {
 
     const pendingStart = state.pendingStart || 0;
 
-    const greenStart = getGreenStart();
+    const items = getCaptionItems();
 
-    const liveItems = getCaptionItems().filter((it) => it.end > pendingStart);
+    const desired = [];
 
-    const desired = liveItems.map((item, i) => ({
+    items.forEach((item, i) => {
 
-      key: `l-${item.start}`,
+      if (item.end <= pendingStart) return;
 
-      text: sentenceText(`l-${item.start}`, item.text),
+      desired.push(sentenceBoxProps(items, i));
 
-      pending: item.end > greenStart,
-
-      live: item.end > greenStart && i === liveItems.length - 1,
-
-    }));
+    });
 
     syncSentenceList(els.feedLive, desired);
 
@@ -1084,25 +1292,15 @@ window.IaPanel = (function () {
 
     if (!els.feedFixed) return;
 
-    const greenStart = getGreenStart();
+    const items = getCaptionItems();
 
-    const byKey = new Map(getCaptionItems().map((it) => [`s-${it.start}`, it]));
+    els.feedFixed.querySelectorAll(".ia-sentence[data-sentence-index]").forEach((el) => {
 
-    els.feedFixed.querySelectorAll(".ia-sentence[data-sentence-key]").forEach((el) => {
+      const idx = sentenceIndexFromEl(el);
 
-      const item = byKey.get(el.dataset.sentenceKey);
+      if (idx < 0 || !items[idx]) return;
 
-      if (!item) return;
-
-      updateSentenceBox(el, {
-
-        text: sentenceText(el.dataset.sentenceKey, item.text),
-
-        pending: item.end > greenStart,
-
-        live: false,
-
-      });
+      updateSentenceBox(el, sentenceBoxProps(items, idx));
 
     });
 
@@ -1180,15 +1378,14 @@ window.IaPanel = (function () {
 
 
 
-  function updateSentenceBox(el, { text, pending, live }) {
+  function updateSentenceBox(el, { text, pending, selected, live, index }) {
+    let cls = "ia-sentence";
+    if (pending || selected) cls += pending ? " ia-sentence--pending" : " ia-sentence--selected";
+    else if (getGreenStart() > 0) cls += " ia-sentence--sent";
+    if (live) cls += " ia-sentence--live";
+    el.className = cls;
 
-    el.className =
-
-      "ia-sentence" +
-
-      (pending ? " ia-sentence--pending" : "") +
-
-      (live ? " ia-sentence--live" : "");
+    if (index !== undefined && index >= 0) el.dataset.sentenceIndex = String(index);
 
     const label = el.querySelector(".ia-sentence-text");
 
@@ -1198,13 +1395,17 @@ window.IaPanel = (function () {
 
 
 
-  function renderSentenceBox({ key, text, pending, live }) {
-
+  function renderSentenceBox({ key, text, pending, selected, live, index }) {
     const div = document.createElement("div");
-
-    div.className = "ia-sentence" + (pending ? " ia-sentence--pending" : "") + (live ? " ia-sentence--live" : "");
+    let cls = "ia-sentence";
+    if (pending || selected) cls += pending ? " ia-sentence--pending" : " ia-sentence--selected";
+    else if (getGreenStart() > 0) cls += " ia-sentence--sent";
+    if (live) cls += " ia-sentence--live";
+    div.className = cls;
 
     div.dataset.sentenceKey = key;
+
+    if (index !== undefined && index >= 0) div.dataset.sentenceIndex = String(index);
 
     const label = document.createElement("div");
 
@@ -1275,10 +1476,21 @@ window.IaPanel = (function () {
 
 
   async function onSend() {
-
+    const range = getPendingSendRange();
     const chunkOverride = buildPendingChunk();
 
-    const body = chunkOverride ? { chunk: chunkOverride } : undefined;
+    if (!range || !chunkOverride.trim()) {
+      window.IaToast?.warning("Nothing to send — green sentences are sent.");
+      return;
+    }
+
+    const items = getCaptionItems();
+
+    const startChar = items[range.anchorIdx] ? items[range.anchorIdx].start : 0;
+
+    await IaApi.post("/endpoint", { start_index: startChar });
+
+    const body = { chunk: chunkOverride };
 
     const r = await IaApi.post("/end", body);
 
@@ -1302,8 +1514,9 @@ window.IaPanel = (function () {
 
     applyCaptionSnapshot(data);
 
-    /* Endpoint = "now" at send time (end of full caption). */
-    state.endpoint = (state.fullCaption || "").length;
+    await setEndpointToNow();
+
+    state.selection = null;
 
     clearPendingSentenceEdits();
 
@@ -1318,20 +1531,19 @@ window.IaPanel = (function () {
 
 
   async function onReject() {
-
-    const greenStart = getGreenStart();
-
+    const range = getPendingSendRange();
     const chunk = buildPendingChunk();
 
-    if (!chunk.trim()) {
-
-      window.IaToast?.warning("Nothing to skip.");
-
+    if (!range || !chunk.trim()) {
+      window.IaToast?.warning("Nothing to skip — green sentences are skipped.");
       return;
-
     }
 
-    await IaApi.post("/endpoint", { start_index: greenStart });
+    const items = getCaptionItems();
+
+    const startChar = items[range.anchorIdx] ? items[range.anchorIdx].start : 0;
+
+    await IaApi.post("/endpoint", { start_index: startChar });
 
     const r = await IaApi.post("/delete");
 
@@ -1357,6 +1569,8 @@ window.IaPanel = (function () {
 
     /* Skip grays pending text but does not move send endpoint. */
     state.skipThrough = (state.fullCaption || "").length;
+
+    state.selection = null;
 
     clearPendingSentenceEdits();
 

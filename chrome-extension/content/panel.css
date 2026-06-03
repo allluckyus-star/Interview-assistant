@@ -380,14 +380,26 @@ button {
   margin: 0;
   box-shadow: none;
   cursor: default;
+  user-select: none;
 }
 
+.ia-sentence--sent {
+  background: #f3f4f6;
+  border-color: #e5e7eb;
+}
+
+.ia-sentence--sent .ia-sentence-text {
+  color: var(--ia-muted);
+}
+
+.ia-sentence--selected,
 .ia-sentence--pending {
   border: 2px solid #22c55e;
   background: linear-gradient(180deg, #ffffff 0%, #f0fdf4 100%);
   box-shadow: none;
 }
 
+.ia-sentence--live.ia-sentence--selected,
 .ia-sentence--live.ia-sentence--pending {
   border-color: #16a34a;
 }
