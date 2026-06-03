@@ -12,6 +12,14 @@ window.IaPanel = (function () {
 
   ];
 
+  const LANGUAGES = [
+
+    { id: "english", label: "English", short: "EN" },
+
+    { id: "chinese", label: "中文", short: "中" },
+
+  ];
+
 
 
   const PROMPT_KEYS = [
@@ -21,6 +29,10 @@ window.IaPanel = (function () {
     { id: "jd_summary", label: "JD summary" },
 
     { id: "initial_interview", label: "Initial interview" },
+
+    { id: "english", label: "Language: English" },
+
+    { id: "chinese", label: "Language: 中文" },
 
     { id: "read", label: "Read" },
 
@@ -37,6 +49,8 @@ window.IaPanel = (function () {
     tab: "caption",
 
     mode: "read",
+
+    language: "english",
 
     promptKey: "read",
 
@@ -78,6 +92,7 @@ window.IaPanel = (function () {
   let suppressFeedScroll = false;
 
   let sendInProgress = false;
+  let copyGptInProgress = false;
 
   /** Live-sync tail size — fixed captions older than this do not need re-upload. */
   const LIVE_SYNC_SENTENCES = 20;
@@ -112,6 +127,9 @@ window.IaPanel = (function () {
     else if (!state.fullCaption && state.draft) state.fullCaption = state.draft;
     if (typeof data.pending_start === "number" && data.pending_start >= 0) {
       state.endpoint = data.pending_start;
+    }
+    if (data.language) {
+      state.language = normalizeLanguage(data.language);
     }
     state.pendingStart = computePendingStart(getFeedCaption());
     prunePendingEdits();
@@ -363,6 +381,68 @@ window.IaPanel = (function () {
     return "Send failed. Not confirmed.";
   }
 
+  function resolveLatestGptResultText() {
+    try {
+      if (typeof window.__iaExtensionGetLatestAssistantText === "function") {
+        return (window.__iaExtensionGetLatestAssistantText() || "").trim();
+      }
+      if (typeof window.__iaRefreshLatestAnswer === "function") {
+        return (window.__iaRefreshLatestAnswer("", 1) || "").trim();
+      }
+    } catch (_) {
+      /* ignore */
+    }
+    return "";
+  }
+
+  async function copyTextToClipboard(text) {
+    const payload = String(text || "");
+    if (!payload) return false;
+    try {
+      if (navigator.clipboard?.writeText) {
+        await navigator.clipboard.writeText(payload);
+        return true;
+      }
+    } catch (_) {
+      /* fallback */
+    }
+    try {
+      const ta = document.createElement("textarea");
+      ta.value = payload;
+      ta.setAttribute("readonly", "");
+      ta.style.position = "fixed";
+      ta.style.left = "-9999px";
+      document.body.appendChild(ta);
+      ta.select();
+      const ok = document.execCommand("copy");
+      ta.remove();
+      return ok;
+    } catch (_) {
+      return false;
+    }
+  }
+
+  async function onCopyGptResult() {
+    if (copyGptInProgress) return;
+    copyGptInProgress = true;
+    try {
+      const text = resolveLatestGptResultText();
+      if (!text) {
+        window.IaToast?.warning("No GPT reply to copy yet.");
+        return;
+      }
+      if (await copyTextToClipboard(text)) {
+        window.IaToast?.success("Copied.");
+      } else {
+        window.IaToast?.warning("Copy failed. Clipboard busy — try again.");
+      }
+    } catch (e) {
+      window.IaToast?.error(`Failed. ${String(e.message || e)}`);
+    } finally {
+      copyGptInProgress = false;
+    }
+  }
+
   async function sendPromptToGpt(prompt, append) {
     if (sendInProgress) {
       window.IaToast?.warning("Send failed. Busy.");
@@ -543,6 +623,8 @@ window.IaPanel = (function () {
 
       modeSeg: root.getElementById("ia-mode-seg"),
 
+      langSeg: root.getElementById("ia-lang-seg"),
+
       btnResumeSend: root.getElementById("ia-btn-resume-send"),
 
       btnJdSend: root.getElementById("ia-btn-jd-send"),
@@ -552,6 +634,8 @@ window.IaPanel = (function () {
       btnSave: root.getElementById("ia-btn-save"),
 
       btnSend: root.getElementById("ia-btn-send"),
+
+      btnCopyGpt: root.getElementById("ia-btn-copy-gpt"),
 
       btnReject: root.getElementById("ia-btn-reject"),
 
@@ -574,6 +658,8 @@ window.IaPanel = (function () {
     });
 
     els.btnSend.addEventListener("click", onSend);
+
+    els.btnCopyGpt?.addEventListener("click", onCopyGptResult);
 
     els.btnReject.addEventListener("click", onReject);
 
@@ -626,6 +712,8 @@ window.IaPanel = (function () {
     bindElements(root);
 
     renderModeButtons();
+
+    renderLanguageButtons();
 
     renderPromptNav();
 
@@ -708,9 +796,13 @@ window.IaPanel = (function () {
 
                   <div class="ia-mode-seg" id="ia-mode-seg" role="group" aria-label="Session mode"></div>
 
+                  <div class="ia-lang-seg" id="ia-lang-seg" role="group" aria-label="Output language"></div>
+
                   <button type="button" class="ia-icon-btn ghost" id="ia-btn-save" title="Save edit" style="display:none">${I.check || "✓"}</button>
 
                   <button type="button" class="ia-icon-btn primary" id="ia-btn-send" title="Send to ChatGPT">${I.send || "→"}</button>
+
+                  <button type="button" class="ia-icon-btn" id="ia-btn-copy-gpt" title="Copy latest ChatGPT reply">${I.copy || "⧉"}</button>
 
                   <button type="button" class="ia-icon-btn" id="ia-btn-reject" title="Skip draft">${I.close || "×"}</button>
 
@@ -788,6 +880,8 @@ window.IaPanel = (function () {
 
     renderModeButtons();
 
+    renderLanguageButtons();
+
     renderPromptNav();
 
     init();
@@ -849,6 +943,31 @@ window.IaPanel = (function () {
 
     updateModeButtons();
 
+  }
+
+  function renderLanguageButtons() {
+    if (!els.langSeg) return;
+    els.langSeg.innerHTML = "";
+    LANGUAGES.forEach((lang) => {
+      const btn = document.createElement("button");
+      btn.type = "button";
+      btn.className = "ia-lang-btn";
+      btn.dataset.language = lang.id;
+      btn.textContent = lang.short;
+      btn.title = lang.label;
+      btn.setAttribute("aria-label", lang.label);
+      btn.addEventListener("click", () => setLanguage(lang.id));
+      els.langSeg.appendChild(btn);
+    });
+    updateLanguageButtons();
+  }
+
+  function updateLanguageButtons() {
+    els.langSeg?.querySelectorAll(".ia-lang-btn").forEach((btn) => {
+      const on = btn.dataset.language === state.language;
+      btn.classList.toggle("active", on);
+      btn.setAttribute("aria-pressed", on ? "true" : "false");
+    });
   }
 
 
@@ -971,6 +1090,14 @@ window.IaPanel = (function () {
 
       }
 
+      if (draft.data.language) {
+
+        state.language = normalizeLanguage(draft.data.language);
+
+        updateLanguageButtons();
+
+      }
+
     }
 
     const modes = await IaApi.get("/modes");
@@ -980,6 +1107,16 @@ window.IaPanel = (function () {
       state.mode = normalizeMode(modes.data.active);
 
       updateModeButtons();
+
+    }
+
+    const languages = await IaApi.get("/languages");
+
+    if (languages.ok && languages.data?.active) {
+
+      state.language = normalizeLanguage(languages.data.active);
+
+      updateLanguageButtons();
 
     }
 
@@ -1065,6 +1202,14 @@ window.IaPanel = (function () {
     const m = MODES.find((x) => x.id === id);
 
     return m ? m.id : "read";
+
+  }
+
+  function normalizeLanguage(id) {
+
+    const lang = LANGUAGES.find((x) => x.id === id);
+
+    return lang ? lang.id : "english";
 
   }
 
@@ -1577,6 +1722,26 @@ window.IaPanel = (function () {
     renderFeed();
 
     window.IaToast?.info("Skipped.");
+
+  }
+
+
+
+  async function setLanguage(id) {
+
+    const language = normalizeLanguage(id);
+
+    state.language = language;
+
+    updateLanguageButtons();
+
+    await IaApi.post("/language", { language });
+
+    if (state.tab === "settings" && PROMPT_KEYS.some((p) => p.id === language)) {
+
+      setPromptKey(language);
+
+    }
 
   }
 

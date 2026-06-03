@@ -158,6 +158,16 @@ public sealed class CompanionApiServer : IDisposable
                     return;
                 }
 
+                if (path == "/languages")
+                {
+                    WriteJson(ctx, new
+                    {
+                        active = _session.LanguagePrompts.SessionLanguage,
+                        languages = new[] { "english", "chinese" },
+                    });
+                    return;
+                }
+
                 if (path == "/endpoint-words")
                 {
                     var count = int.TryParse(ctx.Request.QueryString["count"], out var c) ? c : 20;
@@ -257,6 +267,15 @@ public sealed class CompanionApiServer : IDisposable
                     if (body.TryGetProperty("mode", out var m))
                         _session.ModePrompts.SessionMode = m.GetString() ?? "read";
                     WriteJson(ctx, new { ok = true, active = _session.ModePrompts.SessionMode });
+                    return;
+                }
+
+                if (path == "/language")
+                {
+                    var body = ReadJsonBody(ctx);
+                    if (body.TryGetProperty("language", out var lang))
+                        _session.LanguagePrompts.SessionLanguage = lang.GetString() ?? "english";
+                    WriteJson(ctx, new { ok = true, active = _session.LanguagePrompts.SessionLanguage });
                     return;
                 }
 
@@ -433,6 +452,8 @@ public sealed class CompanionApiServer : IDisposable
         var map = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
         foreach (var kv in _session.ModePrompts.All)
             map[kv.Key] = kv.Value;
+        foreach (var kv in _session.LanguagePrompts.All)
+            map[kv.Key] = kv.Value;
         map["resume_summary"] = PromptTemplateResolver.TryReadResumeTemplate();
         map["jd_summary"] = PromptTemplateResolver.TryReadJdTemplate();
         map["initial_interview"] = PromptTemplateResolver.TryReadInitialInterviewTemplate();
@@ -445,8 +466,18 @@ public sealed class CompanionApiServer : IDisposable
         "jd_summary" => PromptTemplateResolver.TryReadJdTemplate(),
         "initial_interview" => PromptTemplateResolver.TryReadInitialInterviewTemplate(),
         "read" or "type" or "error" or "behavioral" or "closing" => GetModeTemplate(key),
+        "english" or "chinese" => GetLanguageTemplate(key),
         _ => "",
     };
+
+    private string GetLanguageTemplate(string key)
+    {
+        var prev = _session.LanguagePrompts.SessionLanguage;
+        _session.LanguagePrompts.SessionLanguage = key;
+        var t = _session.LanguagePrompts.GetActiveTemplate() ?? "";
+        _session.LanguagePrompts.SessionLanguage = prev;
+        return t;
+    }
 
     private string GetModeTemplate(string key)
     {
@@ -477,6 +508,11 @@ public sealed class CompanionApiServer : IDisposable
             case "closing":
                 _session.ModePrompts.SetTemplate(key, text);
                 _session.ModePrompts.SaveToDisk();
+                break;
+            case "english":
+            case "chinese":
+                _session.LanguagePrompts.SetTemplate(key, text);
+                _session.LanguagePrompts.SaveToDisk();
                 break;
         }
     }

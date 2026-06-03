@@ -181,7 +181,10 @@ public partial class MainWindow : Window
         CaptionFeed.CopyPromptBuilder = text =>
         {
             var intent = _interview.ResolveInterviewerIntentForPrompt(text);
-            var (_, finalPrompt) = ChunkPromptBuilder.Build(intent, _interview.ModePrompts.GetActiveTemplate());
+            var (_, finalPrompt) = ChunkPromptBuilder.Build(
+                intent,
+                _interview.ModePrompts.GetActiveTemplate(),
+                _interview.LanguagePrompts.GetActiveTemplate());
             return string.IsNullOrWhiteSpace(finalPrompt) ? null : finalPrompt;
         };
         CaptionFeed.GetEndpointWordChoices = count =>
@@ -293,7 +296,10 @@ public partial class MainWindow : Window
                 if (string.Equals(source, "sent_gpt", StringComparison.OrdinalIgnoreCase))
                 {
                     var intent = _interview.ResolveInterviewerIntentForPrompt(text);
-                    var (_, clip) = ChunkPromptBuilder.Build(intent, _interview.ModePrompts.GetActiveTemplate());
+                    var (_, clip) = ChunkPromptBuilder.Build(
+                        intent,
+                        _interview.ModePrompts.GetActiveTemplate(),
+                        _interview.LanguagePrompts.GetActiveTemplate());
                     CaptionFeed.FinalizeDraft(text, clip);
                 }
                 else

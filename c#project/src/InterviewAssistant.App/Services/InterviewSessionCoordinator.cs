@@ -11,6 +11,7 @@ public sealed class InterviewSessionCoordinator : IDisposable
 {
     private readonly PromptStore _promptStore;
     private readonly ModePromptStore _modePrompts;
+    private readonly LanguagePromptStore _languagePrompts;
     private readonly CaptionState _captionState = new();
     private readonly InterviewHistory _history = new();
     private readonly LiveCaptionsCaptureService _capture;
@@ -27,6 +28,7 @@ public sealed class InterviewSessionCoordinator : IDisposable
     {
         _promptStore = promptStore;
         _modePrompts = new ModePromptStore();
+        _languagePrompts = new LanguagePromptStore();
         _hotkeys = hotkeys;
         _bridgeBase = $"http://{bridgeHost}:{bridgePort}";
         _uiDispatcher = System.Windows.Application.Current?.Dispatcher;
@@ -48,6 +50,7 @@ public sealed class InterviewSessionCoordinator : IDisposable
     }
 
     public ModePromptStore ModePrompts => _modePrompts;
+    public LanguagePromptStore LanguagePrompts => _languagePrompts;
     public InterviewHistory History => _history;
 
     public event Action<string>? DraftCaptionChanged;
@@ -130,7 +133,8 @@ public sealed class InterviewSessionCoordinator : IDisposable
 
         var (_, finalPrompt) = ChunkPromptBuilder.Build(
             ResolveInterviewerIntentForPrompt(chunk),
-            _modePrompts.GetActiveTemplate());
+            _modePrompts.GetActiveTemplate(),
+            _languagePrompts.GetActiveTemplate());
         if (!string.IsNullOrWhiteSpace(finalPrompt))
             SendChunkToGptRequested?.Invoke(finalPrompt);
 
@@ -199,7 +203,8 @@ public sealed class InterviewSessionCoordinator : IDisposable
         if (string.IsNullOrWhiteSpace(prompt))
             (_, prompt) = ChunkPromptBuilder.Build(
                 ResolveInterviewerIntentForPrompt(body),
-                _modePrompts.GetActiveTemplate());
+                _modePrompts.GetActiveTemplate(),
+                _languagePrompts.GetActiveTemplate());
 
         if (!string.IsNullOrWhiteSpace(prompt))
             SendChunkToGptRequested?.Invoke(prompt);

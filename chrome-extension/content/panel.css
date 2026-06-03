@@ -227,8 +227,9 @@ button {
   border-top: 1px solid var(--ia-border);
 }
 
-/* —— Session mode segment (WPF cyan host) —— */
-.ia-mode-seg {
+/* —— Session mode + language segments (WPF cyan host) —— */
+.ia-mode-seg,
+.ia-lang-seg {
   display: inline-flex;
   align-items: center;
   gap: 2px;
@@ -239,7 +240,8 @@ button {
   flex-shrink: 0;
 }
 
-.ia-mode-btn {
+.ia-mode-btn,
+.ia-lang-btn {
   width: 28px;
   height: 28px;
   min-width: 28px;
@@ -251,6 +253,16 @@ button {
   align-items: center;
   justify-content: center;
   transition: background 0.15s ease, box-shadow 0.15s ease;
+  border: none;
+  font-size: 11px;
+  font-weight: 600;
+  cursor: pointer;
+}
+
+.ia-lang-btn {
+  min-width: 32px;
+  width: auto;
+  padding: 0 6px;
 }
 
 .ia-mode-btn svg {
@@ -259,11 +271,13 @@ button {
   flex-shrink: 0;
 }
 
-.ia-mode-btn:hover {
+.ia-mode-btn:hover,
+.ia-lang-btn:hover {
   background: rgba(255, 255, 255, 0.35);
 }
 
-.ia-mode-btn.active {
+.ia-mode-btn.active,
+.ia-lang-btn.active {
   background: #ffffff;
   box-shadow: 0 1px 4px rgba(0, 0, 0, 0.12);
 }

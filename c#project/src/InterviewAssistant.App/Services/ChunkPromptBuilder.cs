@@ -2,15 +2,30 @@ namespace InterviewAssistant.App.Services;
 
 public static class ChunkPromptBuilder
 {
-    public static (string CleanedIntent, string FinalPrompt) Build(string rawChunk, string? templateOverride)
+    /// <summary>Mode template only (legacy).</summary>
+    public static (string CleanedIntent, string FinalPrompt) Build(string rawChunk, string? modeTemplate) =>
+        Build(rawChunk, modeTemplate, null);
+
+    /// <summary>Language wrapper + mode template + interviewer intent.</summary>
+    public static (string CleanedIntent, string FinalPrompt) Build(
+        string rawChunk,
+        string? modeTemplate,
+        string? languageTemplate)
     {
         var cleaned = (rawChunk ?? "").Trim();
-        if (templateOverride is null)
-            return (cleaned, cleaned);
-        var template = templateOverride.Trim();
-        if (template.Length == 0)
-            return (cleaned, cleaned);
-        var final = template.Replace("{cleaned_interviewer_intent}", cleaned, StringComparison.Ordinal);
+
+        string modeSection;
+        if (string.IsNullOrWhiteSpace(modeTemplate))
+            modeSection = cleaned;
+        else
+            modeSection = modeTemplate.Trim().Replace("{cleaned_interviewer_intent}", cleaned, StringComparison.Ordinal);
+
+        if (string.IsNullOrWhiteSpace(languageTemplate))
+            return (cleaned, modeSection);
+
+        var final = languageTemplate.Trim()
+            .Replace("{mode_prompt}", modeSection, StringComparison.Ordinal)
+            .Replace("{cleaned_interviewer_intent}", cleaned, StringComparison.Ordinal);
         return (cleaned, final);
     }
 }

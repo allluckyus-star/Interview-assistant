@@ -682,6 +682,19 @@ async function __iaWpfRunSendAndWaitUiIdle(userPrompt, requestId, appendToExisti
   }
 }
 
+/** Latest assistant turn for copy — includes partial text while GPT is still streaming. */
+function __iaGetLatestAssistantTextForCopy() {
+  var nodes = document.querySelectorAll("[data-message-author-role='assistant']");
+  for (var i = nodes.length - 1; i >= 0; i--) {
+    var el = nodes[i];
+    if (!(el instanceof HTMLElement)) continue;
+    if (!__iaIsElementVisible(el)) continue;
+    var text = __iaSanitizeAssistantText(__iaExtractAssistantTurnText(el)).trim();
+    if (text.length > 0) return text;
+  }
+  return "";
+}
+
 /** WPF: read the latest visible assistant turn from the ChatGPT page. */
 window.__iaWpfGetLatestAssistantText = function () {
   try {
@@ -1126,7 +1139,13 @@ window.__iaExtensionSendPrompt = function (userPrompt, appendToExisting) {
   return __iaWpfSendOnly(userPrompt, appendToExisting === true);
 };
 window.__iaExtensionGetLatestAssistantText = function () {
-  return window.__iaWpfGetLatestAssistantText ? window.__iaWpfGetLatestAssistantText() : "";
+  try {
+    var partial = __iaGetLatestAssistantTextForCopy();
+    if (partial) return partial;
+    return window.__iaWpfGetLatestAssistantText ? window.__iaWpfGetLatestAssistantText() : "";
+  } catch (_e) {
+    return "";
+  }
 };
 window.__iaExtensionPasteDraft = function (text, append) {
   if (window.__iaWpfPasteTextToComposer) {

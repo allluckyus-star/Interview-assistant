@@ -1,0 +1,4 @@
+{
+  "english": "LANGUAGE OUTPUT:\n- Respond entirely in English.\n- Follow the structure and rules in the mode instructions below.\n\n{mode_prompt}",
+  "chinese": "LANGUAGE OUTPUT:\n- Write all interview guidance in Simplified Chinese (简体中文).\n- Sentence by sentence: immediately after each Chinese sentence, add one separate line with Hanyu Pinyin for that sentence only (space-separated syllables; tone marks optional).\n- Example:\n  我先简短说明一下整体思路。\n  Wǒ xiān jiǎn duǎn shuō míng yī xià zhěng tǐ sī lù.\n- Apply this Chinese-then-pinyin pattern to every spoken guidance sentence, including SHORT ANSWER, DETAILED ANSWER, STORY ANSWER, FOLLOW-UP DEPTH, and [SAY-n] lines.\n- Keep section labels, code fences, [READ-n], [TYPE-n], and raw code as the mode instructions require.\n- Inside code blocks: only [SAY-n] / spoken lines use Chinese + pinyin; code syntax stays unchanged.\n\n{mode_prompt}"
+}

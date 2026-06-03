@@ -11,6 +11,7 @@ public sealed class CompanionSessionService : IDisposable
     private readonly InterviewHistory _history = new();
     private readonly List<HistoryEventDto> _apiHistory = [];
     private readonly ModePromptStore _modePrompts = new();
+    private readonly LanguagePromptStore _languagePrompts = new();
     private readonly LiveCaptionsCaptureService _capture;
     private readonly InterviewHotkeyService _hotkeys = new();
 
@@ -23,6 +24,7 @@ public sealed class CompanionSessionService : IDisposable
     }
 
     public ModePromptStore ModePrompts => _modePrompts;
+    public LanguagePromptStore LanguagePrompts => _languagePrompts;
     public InterviewHistory History => _history;
     public bool IsRunning { get; private set; }
 
@@ -77,6 +79,7 @@ public sealed class CompanionSessionService : IDisposable
         pending_start = GetPendingStartIndex(),
         running = IsRunning,
         mode = ModePrompts.SessionMode,
+        language = LanguagePrompts.SessionLanguage,
     };
 
     public IReadOnlyList<HistoryEventDto> GetHistorySnapshot() => _apiHistory.ToList();
@@ -97,7 +100,10 @@ public sealed class CompanionSessionService : IDisposable
         _history.AppendInterviewer(chunk, "sent_gpt");
         _apiHistory.Add(new HistoryEventDto("interviewer", chunk, "sent_gpt"));
         var intent = ResolveIntent(chunk);
-        var (_, finalPrompt) = ChunkPromptBuilder.Build(intent, _modePrompts.GetActiveTemplate());
+        var (_, finalPrompt) = ChunkPromptBuilder.Build(
+            intent,
+            _modePrompts.GetActiveTemplate(),
+            _languagePrompts.GetActiveTemplate());
         HistoryAdded?.Invoke(_apiHistory[^1]);
         DraftChanged?.Invoke(_captionState.GetDraftTail());
         return new EndResult(true, chunk, finalPrompt ?? "", _captionState.GetDraftTail(), null);

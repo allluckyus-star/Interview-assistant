@@ -39,5 +39,7 @@ API: `http://127.0.0.1:1212/` (CORS enabled for the extension)
 | POST | `/endpoint` | `{ "start_index": N }` |
 | GET/POST | `/context`, `/context/resume`, `/context/jd` | Resume/JD |
 | GET/POST | `/prompts/{key}` | Mode + prep templates |
+| GET | `/languages` | Active language (`english` / `chinese`) |
+| POST | `/language` | `{ "language": "chinese" }` |
 | POST | `/mode` | `{ "mode": "read" }` |
 | POST | `/gpt-answer` | Extension reports GPT reply text |

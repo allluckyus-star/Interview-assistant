@@ -5,6 +5,8 @@ window.IaIcons = {
   send: '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M22 2L11 13"/><path d="M22 2l-7 20-4-9-9-4 20-7z"/></svg>',
   close: '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M18 6L6 18M6 6l12 12"/></svg>',
   check: '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M20 6L9 17l-5-5"/></svg>',
+  copy:
+    '<svg viewBox="0 0 24 24" aria-hidden="true"><path fill="none" stroke="currentColor" stroke-width="2" d="M8.5 8.5H19.5A1.5 1.5 0 0 1 21 10v11a1.5 1.5 0 0 1-1.5 1.5H8.5A1.5 1.5 0 0 1 7 21V10a1.5 1.5 0 0 1 1.5-1.5z"/><path fill="none" stroke="currentColor" stroke-width="2" d="M4 15H3A1.5 1.5 0 0 1 1.5 13.5V4A1.5 1.5 0 0 1 3 2.5h9A1.5 1.5 0 0 1 13.5 4V5"/></svg>',
   image: '<svg viewBox="0 0 24 24" aria-hidden="true"><rect x="3" y="3" width="18" height="18" rx="2"/><circle cx="8.5" cy="8.5" r="1.5"/><path d="M21 15l-5-5L5 21"/></svg>',
   text: '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 7V4h16v3M9 20h6M12 4v16"/></svg>',
   layers: '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 2L2 7l10 5 10-5-10-5zM2 17l10 5 10-5M2 12l10 5 10-5"/></svg>',
@@ -27,6 +29,8 @@ window.IaIcons.forPromptKey = function (key) {
     resume_summary: "folder",
     jd_summary: "briefcase",
     initial_interview: "info",
+    english: "info",
+    chinese: "info",
     read: "modeRead",
     type: "modeType",
     behavioral: "modeBehavioral",
