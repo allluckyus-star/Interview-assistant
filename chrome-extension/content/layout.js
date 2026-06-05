@@ -47,8 +47,51 @@
     return next;
   }
 
+  function isOverlayPortal(el) {
+    if (!el || el.nodeType !== 1) return true;
+    if (el.id === "ia-toast-host") return true;
+    if (el.hasAttribute("data-radix-portal")) return true;
+    if (el.hasAttribute("data-radix-popper-content-wrapper")) return true;
+    const role = el.getAttribute("role");
+    if (role === "tooltip" || role === "menu" || role === "dialog" || role === "listbox") return true;
+    const style = window.getComputedStyle(el);
+    if (style.position === "fixed" && el.childElementCount <= 1) {
+      const inner = el.firstElementChild;
+      if (inner?.hasAttribute?.("data-radix-popper-content-wrapper")) return true;
+      const innerRole = inner?.getAttribute?.("role");
+      if (innerRole === "menu" || innerRole === "tooltip" || innerRole === "dialog") return true;
+    }
+    return false;
+  }
+
+  function findGptShell() {
+    const candidates = [...document.body.children].filter(
+      (el) => el.tagName === "DIV" && !isOverlayPortal(el)
+    );
+    if (!candidates.length) return null;
+    candidates.sort((a, b) => {
+      const score = (node) =>
+        node.querySelectorAll("[class*='w-screen']").length * 10 +
+        node.querySelectorAll("[data-composer-surface]").length * 20 +
+        node.childElementCount;
+      return score(b) - score(a);
+    });
+    return candidates[0];
+  }
+
+  function ensureGptShellMarker() {
+    const shell = findGptShell();
+    if (!shell) return null;
+    for (const marked of document.querySelectorAll(".ia-gpt-shell")) {
+      if (marked !== shell) marked.classList.remove("ia-gpt-shell");
+    }
+    shell.classList.add("ia-gpt-shell");
+    return shell;
+  }
+
   function teardown() {
     document.documentElement.classList.remove("ia-docked", "ia-panel-collapsed");
+    document.querySelectorAll(".ia-gpt-shell").forEach((el) => el.classList.remove("ia-gpt-shell"));
     document.getElementById(PANEL_ID)?.remove();
   }
 
@@ -107,6 +150,7 @@
   async function applyLayout() {
     if (!isChatGptPage()) { teardown(); return; }
     document.documentElement.classList.add("ia-docked");
+    ensureGptShellMarker();
     ensurePanelHost();
     const collapsed = await loadCollapsed();
     setCollapsed(collapsed);
@@ -129,9 +173,21 @@
   let retries = 0;
   const retryId = setInterval(() => {
     if (!isChatGptPage()) { clearInterval(retryId); return; }
+    ensureGptShellMarker();
     ensurePanelHost();
     if (++retries >= 10) clearInterval(retryId);
   }, 500);
+
+  let shellMarkTimer = null;
+  const shellObserver = new MutationObserver(() => {
+    if (!isChatGptPage()) return;
+    if (shellMarkTimer) clearTimeout(shellMarkTimer);
+    shellMarkTimer = setTimeout(() => {
+      shellMarkTimer = null;
+      ensureGptShellMarker();
+    }, 120);
+  });
+  shellObserver.observe(document.documentElement, { childList: true, subtree: true });
 
   chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
     if (msg?.type === "ia_toggle_panel") {

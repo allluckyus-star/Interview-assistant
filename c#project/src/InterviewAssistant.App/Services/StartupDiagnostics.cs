@@ -3,7 +3,9 @@ using System.IO;
 using System.Reflection;
 using System.Runtime.InteropServices;
 using System.Text;
+#if !COMPANION
 using System.Windows;
+#endif
 
 namespace InterviewAssistant.App.Services;
 
@@ -106,7 +108,11 @@ public static class StartupDiagnostics
                 "Common fixes: use the exe from publish\\win-x64 (self-contained), "
                 + "Windows 10 version 2004 or newer, 64-bit Windows for win-x64 build, "
                 + "install WebView2 Runtime, unblock the exe in Windows Security.");
-            MessageBox.Show(body.ToString(), title, MessageBoxButton.OK, MessageBoxImage.Error);
+#if COMPANION
+            System.Windows.Forms.MessageBox.Show(body.ToString(), title, MessageBoxButtons.OK, MessageBoxIcon.Error);
+#else
+            System.Windows.MessageBox.Show(body.ToString(), title, MessageBoxButton.OK, MessageBoxImage.Error);
+#endif
         }
         catch
         {

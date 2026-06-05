@@ -101,6 +101,30 @@ button {
   color: var(--ia-muted);
 }
 
+.ia-status-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+  margin-top: 2px;
+}
+
+.ia-link-btn {
+  border: none;
+  background: none;
+  padding: 0;
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--ia-indigo);
+  cursor: pointer;
+  text-decoration: underline;
+  text-underline-offset: 2px;
+}
+
+.ia-link-btn:hover {
+  color: #4338ca;
+}
+
 .ia-status-dot {
   width: 8px;
   height: 8px;
@@ -617,6 +641,15 @@ button {
   color: #212121;
 }
 
+.ia-prompt-nav-btn--text {
+  width: auto;
+  min-width: 36px;
+  padding: 0 10px;
+  font-size: 12px;
+  font-weight: 600;
+  line-height: 1;
+}
+
 .ia-settings-card label {
   display: block;
   font-size: 13px;
@@ -625,13 +658,102 @@ button {
   margin-bottom: 8px;
 }
 
-.ia-settings-card--compact textarea {
-  min-height: 400px;
+.ia-context-name {
+  width: 100%;
+  padding: 10px 14px;
+  border: 1px solid var(--ia-border);
+  border-radius: var(--ia-radius);
+  font-size: 14px;
+  color: var(--ia-ink);
+  background: var(--ia-surface);
+  margin-bottom: 10px;
+  box-sizing: border-box;
+}
+
+.ia-context-name:focus {
+  outline: none;
+  border-color: #86efac;
+  box-shadow: 0 0 0 3px rgba(158, 240, 26, 0.25);
+}
+
+.ia-context-history {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  margin-top: 10px;
+  max-height: 140px;
+  overflow-y: auto;
+}
+
+.ia-context-history-empty {
+  margin: 0;
+  font-size: 12px;
+  color: var(--ia-muted);
+}
+
+.ia-context-history-item {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+}
+
+.ia-context-history-item--active .ia-context-history-select {
+  border-color: var(--ia-accent);
+  background: rgba(158, 240, 26, 0.2);
+  color: var(--ia-accent-ink);
+  font-weight: 700;
+}
+
+.ia-context-history-select {
+  flex: 1;
+  min-width: 0;
+  text-align: left;
+  padding: 8px 12px;
+  border-radius: var(--ia-radius-pill);
+  border: 1px solid var(--ia-border);
+  background: var(--ia-surface);
+  color: var(--ia-ink);
+  font-size: 13px;
+  font-weight: 600;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  transition: background 0.15s ease, border-color 0.15s ease;
+}
+
+.ia-context-history-select:hover {
+  background: #e5e7eb;
+}
+
+.ia-context-history-delete {
+  flex-shrink: 0;
+  width: 32px;
+  height: 32px;
+  padding: 0;
+  border-radius: var(--ia-radius-pill);
+  border: 1px solid var(--ia-border);
+  background: var(--ia-surface);
+  color: var(--ia-muted);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  transition: background 0.15s ease, color 0.15s ease;
+}
+
+.ia-context-history-delete svg {
+  width: 14px;
+  height: 14px;
+}
+
+.ia-context-history-delete:hover {
+  background: #fee2e2;
+  border-color: #fecaca;
+  color: #b91c1c;
 }
 
 .ia-settings-card textarea {
   width: 100%;
-  min-height: 96px;
   padding: 12px 14px;
   border: 1px solid var(--ia-border);
   border-radius: var(--ia-radius);
@@ -641,10 +763,18 @@ button {
   background: var(--ia-surface);
   resize: vertical;
   margin-bottom: 12px;
+  box-sizing: border-box;
+}
+
+/* Resume, JD, and prompt editor — same height */
+.ia-settings #ia-resume,
+.ia-settings #ia-jd,
+.ia-settings #ia-prompt-editor {
+  min-height: 400px;
+  height: 400px;
 }
 
 .ia-settings-card--prompt .ia-prompt-editor-wrap textarea {
-  min-height: 400px;
   margin-bottom: 0;
 }
 
@@ -716,7 +846,8 @@ button {
 }
 
 .ia-caption-view,
-.ia-settings {
+.ia-settings,
+.ia-history-tab {
   flex: 1;
   min-height: 0;
 }
@@ -739,4 +870,320 @@ button {
   font-size: 14px;
   resize: vertical;
   background: #fff;
+}
+
+/* ── Record button ─────────────────────────────────────────────────────────── */
+
+.ia-btn-record {
+  margin-left: 4px;
+}
+
+.ia-btn-record.ia-record-active {
+  background: #fee2e2 !important;
+  border-color: #fca5a5 !important;
+  color: #b91c1c !important;
+  animation: ia-record-pulse 1.4s ease-in-out infinite;
+}
+
+@keyframes ia-record-pulse {
+  0%, 100% { box-shadow: 0 0 0 0 rgba(220,38,38,0.35); }
+  50%       { box-shadow: 0 0 0 5px rgba(220,38,38,0); }
+}
+
+/* ── History tab ───────────────────────────────────────────────────────────── */
+
+.ia-history-tab {
+  display: none;
+  flex: 1;
+  min-height: 0;
+  overflow: hidden;
+}
+
+.ia-history-tab.visible {
+  display: flex;
+  flex-direction: column;
+}
+
+.ia-history-split {
+  display: flex;
+  flex-direction: row;
+  flex: 1;
+  min-height: 0;
+  overflow: hidden;
+}
+
+/* Each side transitions smoothly */
+.ia-history-content,
+.ia-history-list-panel {
+  transition: flex 0.35s cubic-bezier(0.4, 0, 0.2, 1);
+  overflow: hidden;
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+}
+
+.ia-history-content {
+  border-right: 1px solid var(--ia-border);
+}
+
+/* Collapsed side shows only chevron button */
+.ia-history-panel--collapsed {
+  overflow: hidden;
+  align-items: center;
+  justify-content: center;
+  min-width: 44px;
+  flex-shrink: 0;
+}
+
+.ia-history-expand-btn {
+  width: 32px;
+  height: 32px;
+  border: 1px solid var(--ia-border);
+  border-radius: var(--ia-radius-pill);
+  background: var(--ia-surface);
+  color: var(--ia-indigo);
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 18px;
+  line-height: 1;
+  flex-shrink: 0;
+  pointer-events: auto;
+  position: relative;
+  z-index: 2;
+  transition: background 0.15s, border-color 0.15s;
+}
+
+.ia-history-content-placeholder {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 8px 4px;
+  flex-shrink: 0;
+  width: 100%;
+  pointer-events: auto;
+}
+
+.ia-history-expand-btn svg {
+  width: 16px;
+  height: 16px;
+  flex-shrink: 0;
+}
+
+.ia-history-expand-btn:hover {
+  background: #e0e7ff;
+  border-color: #a5b4fc;
+}
+
+.ia-history-list-panel {
+  overflow: hidden;
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+}
+
+.ia-history-files {
+  flex: 1;
+  overflow-y: auto;
+  padding: 8px 6px;
+  min-width: 0;
+}
+
+/* Wrap for the < collapse button on the right side (shown only in detail mode) */
+.ia-history-list-collapse-btn-wrap {
+  display: none; /* toggled by JS */
+  align-items: center;
+  justify-content: center;
+  padding: 8px 4px;
+  flex-shrink: 0;
+  min-width: 36px;
+}
+
+/* In detail mode, left > should only be visible when content exists */
+.ia-history-content:not(.ia-history-panel--collapsed) .ia-history-content-placeholder {
+  display: none;
+}
+
+/* Hide full pairs list when content side is collapsed */
+.ia-history-panel--collapsed .ia-history-pairs {
+  display: none;
+}
+
+.ia-history-pairs {
+  flex: 1;
+  overflow-y: auto;
+  padding: 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+}
+
+/* ── File list items ─────────────────────────────────────────────────────── */
+
+.ia-hist-file-item {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 10px 12px;
+  border-radius: var(--ia-radius);
+  cursor: pointer;
+  border: 1px solid transparent;
+  transition: background 0.14s, border-color 0.14s;
+}
+
+.ia-hist-file-item:hover {
+  background: var(--ia-bg);
+  border-color: var(--ia-border);
+}
+
+.ia-hist-file-meta {
+  flex: 1;
+  min-width: 0;
+}
+
+.ia-hist-file-name {
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--ia-ink);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.ia-hist-file-time {
+  font-size: 11px;
+  color: var(--ia-subtle);
+  margin-top: 2px;
+}
+
+.ia-hist-file-actions {
+  display: flex;
+  gap: 4px;
+  flex-shrink: 0;
+  opacity: 0;
+  transition: opacity 0.15s;
+}
+
+.ia-hist-file-item:hover .ia-hist-file-actions {
+  opacity: 1;
+}
+
+.ia-hist-dots-btn,
+.ia-hist-del-btn {
+  width: 28px;
+  height: 28px;
+  border-radius: var(--ia-radius-pill);
+  border: 1px solid var(--ia-border);
+  background: var(--ia-surface);
+  color: var(--ia-muted);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  transition: background 0.13s, color 0.13s;
+}
+
+.ia-hist-dots-btn svg,
+.ia-hist-del-btn svg {
+  width: 13px;
+  height: 13px;
+}
+
+.ia-hist-dots-btn:hover {
+  background: #e0e7ff;
+  color: var(--ia-indigo);
+}
+
+.ia-hist-del-btn:hover {
+  background: #fee2e2;
+  color: #b91c1c;
+  border-color: #fca5a5;
+}
+
+.ia-hist-rename-input {
+  width: 100%;
+  padding: 4px 8px;
+  border: 1.5px solid var(--ia-accent);
+  border-radius: 6px;
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--ia-ink);
+  background: var(--ia-surface);
+  outline: none;
+}
+
+/* ── Q+A pair boxes ──────────────────────────────────────────────────────── */
+
+.ia-hist-pair {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.ia-hist-pair-caption,
+.ia-hist-pair-result {
+  padding: 10px 14px;
+  border-radius: var(--ia-radius);
+  border-left: 4px solid;
+  background: var(--ia-surface);
+  border: 1px solid var(--ia-border);
+  position: relative;
+}
+
+.ia-hist-pair-caption {
+  border-left: 4px solid var(--ia-indigo);
+}
+
+.ia-hist-pair-result {
+  border-left: 4px solid var(--ia-accent);
+}
+
+.ia-hist-pair-label {
+  display: block;
+  font-size: 10px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  color: var(--ia-subtle);
+  margin-bottom: 4px;
+}
+
+.ia-hist-pair-text {
+  margin: 0;
+  font-size: 13px;
+  line-height: 1.5;
+  color: var(--ia-ink);
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+/* collapsed list panel: hide file list, show < button centered */
+.ia-history-list-panel.ia-history-panel--collapsed {
+  overflow: hidden;
+  align-items: center;
+  justify-content: center;
+}
+
+.ia-history-list-panel.ia-history-panel--collapsed .ia-history-files {
+  display: none;
+}
+
+.ia-history-list-panel.ia-history-panel--collapsed .ia-history-list-collapse-btn-wrap {
+  display: flex !important;
+  flex: 1;
+  align-items: center;
+  justify-content: center;
+}
+
+/* dblclick cursor hint on file items */
+.ia-hist-file-item {
+  cursor: default;
+}
+
+.ia-hist-file-meta {
+  cursor: pointer;
+}
+
+.ia-hist-file-item:hover .ia-hist-file-name {
+  color: var(--ia-indigo);
 }

@@ -1,56 +1,79 @@
-using System.Diagnostics;
-using System.Windows.Threading;
+using InterviewAssistant.App.Services;
 
 namespace InterviewAssistant.Companion;
 
 internal static class Program
 {
+    private const string SingleInstanceMutexName = "InterviewAssistant.Companion.SingleInstance";
+
     [STAThread]
     private static void Main()
     {
-        ApplicationConfiguration.Initialize();
-        StartWpfDispatcherThread();
-        using var session = new CompanionSessionService();
-        using var api = new CompanionApiServer(session);
-        try
+        StartupDiagnostics.Install();
+        StartupDiagnostics.Log("Companion: Main entry");
+
+        using var instanceMutex = new Mutex(false, SingleInstanceMutexName, out _);
+        if (!instanceMutex.WaitOne(0, false))
         {
-            api.Start();
-            session.Start();
-        }
-        catch (Exception ex)
-        {
+            StartupDiagnostics.Log("Companion: another instance is already running");
             MessageBox.Show(
-                $"Failed to start companion API:\n{ex.Message}\n\nPort 1212 may be in use.",
+                "Interview Assistant Companion is already running.\nCheck the notification area (system tray).",
                 "Interview Assistant Companion",
                 MessageBoxButtons.OK,
-                MessageBoxIcon.Error);
+                MessageBoxIcon.Information);
             return;
         }
 
-        Application.Run(new TrayApplicationContext(session, api));
-    }
-
-    private static void StartWpfDispatcherThread()
-    {
-        var ready = new ManualResetEventSlim(false);
-        var thread = new Thread(() =>
+        try
         {
-            var app = new System.Windows.Application { ShutdownMode = System.Windows.ShutdownMode.OnExplicitShutdown };
-            WpfDispatcherHolder.Dispatcher = Dispatcher.CurrentDispatcher;
-            ready.Set();
-            Dispatcher.Run();
-        })
-        {
-            IsBackground = true,
-            Name = "CompanionWpfDispatcher",
-        };
-        thread.SetApartmentState(ApartmentState.STA);
-        thread.Start();
-        ready.Wait();
-    }
-}
+            ApplicationConfiguration.Initialize();
+            StartupDiagnostics.Log("Companion: WinForms initialized");
 
-internal static class WpfDispatcherHolder
-{
-    public static Dispatcher? Dispatcher { get; set; }
+            using var session = new CompanionSessionService();
+            StartupDiagnostics.Log("Companion: session created");
+
+            using var api = new CompanionApiServer(session);
+            StartupDiagnostics.Log("Companion: API object created");
+
+            try
+            {
+                api.Start();
+                StartupDiagnostics.Log("Companion: API listening on http://127.0.0.1:1212/");
+            }
+            catch (Exception ex)
+            {
+                StartupDiagnostics.Log($"Companion: API start failed: {ex}");
+                StartupDiagnostics.ShowFatalDialog(
+                    "Companion could not start the API (port 1212 may be in use or blocked).",
+                    ex);
+                return;
+            }
+
+            try
+            {
+                session.Start();
+                StartupDiagnostics.Log("Companion: Live Captions session started");
+            }
+            catch (Exception ex)
+            {
+                StartupDiagnostics.Log($"Companion: Live Captions start failed (API still running): {ex}");
+                MessageBox.Show(
+                    $"Live Captions could not start:\n{ex.Message}\n\n"
+                    + "The tray app and API are still running. Enable Live Captions in "
+                    + "Settings → Accessibility, then use tray → Restart captions.",
+                    "Interview Assistant Companion",
+                    MessageBoxButtons.OK,
+                    MessageBoxIcon.Warning);
+            }
+
+            StartupDiagnostics.Log("Companion: entering tray message loop");
+            Application.Run(new TrayApplicationContext(session, api));
+            StartupDiagnostics.Log("Companion: tray loop ended — shutting down");
+        }
+        catch (Exception ex)
+        {
+            StartupDiagnostics.Log($"Companion: fatal startup: {ex}");
+            StartupDiagnostics.ShowFatalDialog("Interview Assistant Companion could not start.", ex);
+        }
+    }
 }

@@ -4,9 +4,23 @@ window.IaIcons = {
   chevronLeft: '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M15 6l-6 6 6 6"/></svg>',
   send: '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M22 2L11 13"/><path d="M22 2l-7 20-4-9-9-4 20-7z"/></svg>',
   close: '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M18 6L6 18M6 6l12 12"/></svg>',
+  trash:
+    '<svg viewBox="0 0 24 24" aria-hidden="true"><path fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" d="M3 6h18M8 6V4h8v2M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6"/><path fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" d="M10 11v6M14 11v6"/></svg>',
+  play:
+    '<svg viewBox="0 0 24 24" aria-hidden="true"><polygon fill="currentColor" points="5,3 19,12 5,21"/></svg>',
+  stop:
+    '<svg viewBox="0 0 24 24" aria-hidden="true"><rect fill="currentColor" x="4" y="4" width="16" height="16" rx="2"/></svg>',
+  historyTab:
+    '<svg viewBox="0 0 24 24" aria-hidden="true"><path fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" d="M12 8v4l3 3M3.05 11a9 9 0 1 1 .5 4"/><path fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" d="M3 16v-5h5"/></svg>',
+  fileIcon:
+    '<svg viewBox="0 0 24 24" aria-hidden="true"><path fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline fill="none" stroke="currentColor" stroke-width="2" points="14 2 14 8 20 8"/></svg>',
+  dotsH:
+    '<svg viewBox="0 0 24 24" aria-hidden="true"><circle fill="currentColor" cx="5" cy="12" r="1.5"/><circle fill="currentColor" cx="12" cy="12" r="1.5"/><circle fill="currentColor" cx="19" cy="12" r="1.5"/></svg>',
   check: '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M20 6L9 17l-5-5"/></svg>',
   copy:
     '<svg viewBox="0 0 24 24" aria-hidden="true"><path fill="none" stroke="currentColor" stroke-width="2" d="M8.5 8.5H19.5A1.5 1.5 0 0 1 21 10v11a1.5 1.5 0 0 1-1.5 1.5H8.5A1.5 1.5 0 0 1 7 21V10a1.5 1.5 0 0 1 1.5-1.5z"/><path fill="none" stroke="currentColor" stroke-width="2" d="M4 15H3A1.5 1.5 0 0 1 1.5 13.5V4A1.5 1.5 0 0 1 3 2.5h9A1.5 1.5 0 0 1 13.5 4V5"/></svg>',
+  quote:
+    '<svg viewBox="0 0 24 24" aria-hidden="true"><path fill="currentColor" d="M7 7.5A3.5 3.5 0 0 1 3.5 4 3.5 3.5 0 0 1 7 .5h1.2A3.3 3.3 0 0 1 11.5 3.8V5H10a2 2 0 0 0-2 2v1.5H7zm10 0A3.5 3.5 0 0 1 13.5 4 3.5 3.5 0 0 1 17 .5h1.2a3.3 3.3 0 0 1 3.3 3.3V5H19a2 2 0 0 0-2 2v1.5h-2z"/></svg>',
   image: '<svg viewBox="0 0 24 24" aria-hidden="true"><rect x="3" y="3" width="18" height="18" rx="2"/><circle cx="8.5" cy="8.5" r="1.5"/><path d="M21 15l-5-5L5 21"/></svg>',
   text: '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 7V4h16v3M9 20h6M12 4v16"/></svg>',
   layers: '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 2L2 7l10 5 10-5-10-5zM2 17l10 5 10-5M2 12l10 5 10-5"/></svg>',
@@ -29,8 +43,6 @@ window.IaIcons.forPromptKey = function (key) {
     resume_summary: "folder",
     jd_summary: "briefcase",
     initial_interview: "info",
-    english: "info",
-    chinese: "info",
     read: "modeRead",
     type: "modeType",
     behavioral: "modeBehavioral",

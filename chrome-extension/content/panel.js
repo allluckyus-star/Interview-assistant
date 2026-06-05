@@ -64,16 +64,37 @@ window.IaPanel = (function () {
     /** Skip boundary — set on Skip (not Send); grays skipped draft without moving endpoint. */
     skipThrough: 0,
 
-    /** Sync efficiency: only live-sync sentences after this index (~20 before edge). Not green. */
-    pendingStart: 0,
-
     connected: false,
+
+    contextResumes: [],
+
+    contextJds: [],
+
+    activeResumeName: "",
+
+    activeJdName: "",
+
+    /** Highlighted history row + source for resume/JD summary prompts. */
+    selectedResumeName: "",
+
+    selectedJdName: "",
+
+    /** Interview recording state */
+    recording: false,
+    recordingPairs: [],        // [{caption, result, ts_utc}]
+    recordingCreatedUtc: null,
+
+    /** History tab */
+    historyMode: "list",       // "list" | "detail"
+    historyFiles: [],          // [{name, created_utc, pair_count}]
+    historySelectedFile: null, // loaded session data
+    historySelectedFileName: "",
+    /** Filename currently being renamed inline (blocks list re-render). */
+    historyEditingName: null,
 
     sentenceEdits: {},
 
     editingKey: null,
-
-    lastRenderedPendingStart: -1,
 
     /** User drag selection: sentence indices in getCaptionItems(). */
     selection: null,
@@ -93,12 +114,15 @@ window.IaPanel = (function () {
 
   let sendInProgress = false;
   let copyGptInProgress = false;
-
-  /** Live-sync tail size — fixed captions older than this do not need re-upload. */
-  const LIVE_SYNC_SENTENCES = 20;
+  let quoteSendInProgress = false;
+  let companionSessionGeneration = -1;
 
   const AUTOSCROLL_RESUME_MS = 2000;
   const HEALTH_POLL_MS = 3000;
+  const DRAFT_POLL_MS = 60;
+  let draftPollId = null;
+  let renderFeedScheduled = false;
+  let lastRenderedCaption = "";
 
   function splitSentences(text) {
     return window.IaCaptionSentences?.splitIntoSentences(text) || [(text || "").trim()].filter(Boolean);
@@ -116,12 +140,16 @@ window.IaPanel = (function () {
     return window.IaCaptionSentences?.joinSentences(sentences) || (sentences || []).join(" ");
   }
 
-  function computePendingStart(full) {
-    return window.IaCaptionSentences?.pendingStartIndex(full, LIVE_SYNC_SENTENCES) ?? 0;
-  }
-
   function applyCaptionSnapshot(data) {
     if (!data) return;
+    if (typeof data.session_generation === "number" && data.session_generation !== companionSessionGeneration) {
+      companionSessionGeneration = data.session_generation;
+      state.endpoint = 0;
+      state.skipThrough = 0;
+      state.selection = null;
+      state.sentenceEdits = {};
+      lastRenderedCaption = "";
+    }
     if (data.draft !== undefined) state.draft = data.draft || "";
     if (data.full !== undefined) state.fullCaption = data.full || "";
     else if (!state.fullCaption && state.draft) state.fullCaption = state.draft;
@@ -131,7 +159,6 @@ window.IaPanel = (function () {
     if (data.language) {
       state.language = normalizeLanguage(data.language);
     }
-    state.pendingStart = computePendingStart(getFeedCaption());
     prunePendingEdits();
   }
 
@@ -204,8 +231,7 @@ window.IaPanel = (function () {
   }
 
   function itemKeyForItem(item) {
-    const pendingStart = state.pendingStart || 0;
-    return item.end > pendingStart ? `l-${item.start}` : `s-${item.start}`;
+    return `s-${item.start}`;
   }
 
   function sentenceBoxProps(items, index) {
@@ -443,6 +469,27 @@ window.IaPanel = (function () {
     }
   }
 
+  async function pasteTextToComposer(text, append) {
+    const t = String(text || "").trim();
+    if (!t) {
+      window.IaToast?.warning("Nothing to paste.");
+      return { ok: false };
+    }
+    const ready = window.__iaExtensionGetGptReady?.();
+    if (!ready?.ok) {
+      window.IaToast?.warning(gptNotReadyMessage(ready));
+      return { ok: false };
+    }
+    if (!window.__iaExtensionPasteDraft) {
+      window.IaToast?.warning("Paste failed. Pipeline missing.");
+      return { ok: false };
+    }
+    const result = await window.__iaExtensionPasteDraft(t, append !== false);
+    if (result?.ok) return result;
+    window.IaToast?.warning(sendFailureMessage(result));
+    return result || { ok: false };
+  }
+
   async function sendPromptToGpt(prompt, append) {
     if (sendInProgress) {
       window.IaToast?.warning("Send failed. Busy.");
@@ -480,14 +527,38 @@ window.IaPanel = (function () {
     }
   }
 
+  function contextNamesEqual(a, b) {
+    return String(a || "").trim().toLowerCase() === String(b || "").trim().toLowerCase();
+  }
+
+  function findContextEntry(kind, name) {
+    const items = kind === "resume" ? state.contextResumes : state.contextJds;
+    return items.find((e) => contextNamesEqual(e.name, name));
+  }
+
+  function getContextTextForKind(kind) {
+    const isResume = kind === "resume";
+    const selected = isResume ? state.selectedResumeName : state.selectedJdName;
+    const textarea = isResume ? els.resume : els.jd;
+    const editor = (textarea?.value || "").trim();
+
+    if (selected) {
+      const item = findContextEntry(kind, selected);
+      if (item) return editor || (item.text || "").trim();
+    }
+    return editor;
+  }
+
   async function getContextTexts() {
+    let resume = getContextTextForKind("resume");
+    let jd = getContextTextForKind("jd");
+    if (resume && jd) return { resume, jd };
+
     const ctx = await IaApi.get("/context");
-    const savedResume = ctx.ok ? (ctx.data?.resume || "").trim() : "";
-    const savedJd = ctx.ok ? (ctx.data?.job_description || "").trim() : "";
-    return {
-      resume: (els.resume?.value || "").trim() || savedResume,
-      jd: (els.jd?.value || "").trim() || savedJd,
-    };
+    if (!ctx.ok) return { resume, jd };
+    if (!resume) resume = (ctx.data?.resume || "").trim();
+    if (!jd) jd = (ctx.data?.job_description || "").trim();
+    return { resume, jd };
   }
 
   async function buildPrepPrompt(kind) {
@@ -551,6 +622,11 @@ window.IaPanel = (function () {
     }
   }
 
+  function formatInterviewerQuote(text) {
+    const inner = (text || "").trim().replace(/\\/g, "\\\\").replace(/"/g, '\\"');
+    return `Interviewer said "${inner}"`;
+  }
+
   function buildPendingChunk() {
     const range = getPendingSendRange();
     if (!range) return "";
@@ -571,14 +647,9 @@ window.IaPanel = (function () {
   }
 
   function prunePendingEdits() {
-    const pendingStart = state.pendingStart || 0;
+    const valid = new Set(getCaptionItems().map((item) => `s-${item.start}`));
     Object.keys(state.sentenceEdits).forEach((k) => {
-      if (!k.startsWith("l-")) {
-        delete state.sentenceEdits[k];
-        return;
-      }
-      const start = parseInt(k.slice(2), 10);
-      if (Number.isNaN(start) || start < pendingStart) delete state.sentenceEdits[k];
+      if (!valid.has(k)) delete state.sentenceEdits[k];
     });
   }
 
@@ -605,17 +676,21 @@ window.IaPanel = (function () {
 
       feed: root.getElementById("ia-feed"),
 
-      feedFixed: null,
-
-      feedLive: null,
-
       captionView: root.getElementById("ia-caption-view"),
 
       settings: root.getElementById("ia-settings"),
 
       resume: root.getElementById("ia-resume"),
 
+      resumeName: root.getElementById("ia-resume-name"),
+
+      resumeHistory: root.getElementById("ia-resume-history"),
+
       jd: root.getElementById("ia-jd"),
+
+      jdName: root.getElementById("ia-jd-name"),
+
+      jdHistory: root.getElementById("ia-jd-history"),
 
       promptNav: root.getElementById("ia-prompt-nav"),
 
@@ -635,6 +710,8 @@ window.IaPanel = (function () {
 
       btnSend: root.getElementById("ia-btn-send"),
 
+      btnQuoteCaption: root.getElementById("ia-btn-quote-caption"),
+
       btnCopyGpt: root.getElementById("ia-btn-copy-gpt"),
 
       btnReject: root.getElementById("ia-btn-reject"),
@@ -642,6 +719,18 @@ window.IaPanel = (function () {
       btnImage: root.getElementById("ia-btn-image"),
 
       btnText: root.getElementById("ia-btn-text"),
+
+      btnReconnect: root.getElementById("ia-btn-reconnect"),
+
+      btnRecord: root.getElementById("ia-btn-record"),
+
+      historyTab: root.getElementById("ia-history-tab"),
+      historyContent: root.getElementById("ia-history-content"),
+      historyListPanel: root.getElementById("ia-history-list-panel"),
+      historyFiles: root.getElementById("ia-history-files"),
+      historyPairs: root.getElementById("ia-history-pairs"),
+      historyExpandBtn: root.getElementById("ia-history-expand-btn"),
+      historyListCollapseBtn: root.getElementById("ia-history-list-collapse-btn"),
 
     };
 
@@ -659,6 +748,8 @@ window.IaPanel = (function () {
 
     els.btnSend.addEventListener("click", onSend);
 
+    els.btnQuoteCaption?.addEventListener("click", onQuoteCaption);
+
     els.btnCopyGpt?.addEventListener("click", onCopyGptResult);
 
     els.btnReject.addEventListener("click", onReject);
@@ -675,13 +766,34 @@ window.IaPanel = (function () {
 
     els.btnImage.addEventListener("click", () => onPasteDraft(false));
 
+    els.btnReconnect?.addEventListener("click", () => void reconnectCompanion());
+
+    els.btnRecord?.addEventListener("click", () => void onToggleRecord());
+
+    // Left > : 1:9 → 9:1
+    els.historyExpandBtn?.addEventListener("click", (e) => {
+      e.stopPropagation();
+      void expandHistoryPanel();
+    });
+    // Right < : 9:1 → 1:9
+    els.historyListCollapseBtn?.addEventListener("click", (e) => {
+      e.stopPropagation();
+      collapseHistoryPanel();
+    });
+
     root.getElementById("ia-save-resume").addEventListener("click", saveResume);
 
     root.getElementById("ia-save-jd").addEventListener("click", saveJd);
 
-    setupFileUpload("ia-upload-resume", "ia-resume-file", () => els.resume, saveResume);
+    setupFileUpload("ia-upload-resume", "ia-resume-file", {
+      getTextarea: () => els.resume,
+      getNameInput: () => els.resumeName,
+    });
 
-    setupFileUpload("ia-upload-jd", "ia-jd-file", () => els.jd, saveJd);
+    setupFileUpload("ia-upload-jd", "ia-jd-file", {
+      getTextarea: () => els.jd,
+      getNameInput: () => els.jdName,
+    });
 
     root.getElementById("ia-save-prompt").addEventListener("click", savePrompt);
 
@@ -753,9 +865,12 @@ window.IaPanel = (function () {
 
               <div class="ia-title">Interview</div>
 
-              <div class="ia-status connecting" id="ia-status" aria-live="polite">
-                <span class="ia-status-dot" aria-hidden="true"></span>
-                <span class="ia-status-label">Connecting…</span>
+              <div class="ia-status-row">
+                <div class="ia-status connecting" id="ia-status" aria-live="polite">
+                  <span class="ia-status-dot" aria-hidden="true"></span>
+                  <span class="ia-status-label">Connecting…</span>
+                </div>
+                <button type="button" class="ia-link-btn" id="ia-btn-reconnect" title="Reconnect after starting or restarting the companion">Reconnect</button>
               </div>
 
             </div>
@@ -773,6 +888,8 @@ window.IaPanel = (function () {
             <button type="button" class="ia-tab active" data-tab="caption">Caption</button>
 
             <button type="button" class="ia-tab" data-tab="settings">Settings</button>
+
+            <button type="button" class="ia-tab" data-tab="history">History</button>
 
           </nav>
 
@@ -800,7 +917,9 @@ window.IaPanel = (function () {
 
                   <button type="button" class="ia-icon-btn ghost" id="ia-btn-save" title="Save edit" style="display:none">${I.check || "✓"}</button>
 
-                  <button type="button" class="ia-icon-btn primary" id="ia-btn-send" title="Send to ChatGPT">${I.send || "→"}</button>
+                  <button type="button" class="ia-icon-btn primary" id="ia-btn-send" title="Send to ChatGPT (mode prompt)">${I.send || "→"}</button>
+
+                  <button type="button" class="ia-icon-btn" id="ia-btn-quote-caption" title="Paste selected caption as: Interviewer said &quot;…&quot; (does not send)">${I.quote || '"'} </button>
 
                   <button type="button" class="ia-icon-btn" id="ia-btn-copy-gpt" title="Copy latest ChatGPT reply">${I.copy || "⧉"}</button>
 
@@ -809,6 +928,8 @@ window.IaPanel = (function () {
                   <button type="button" class="ia-icon-btn" id="ia-btn-image" title="Paste draft">${I.image || "▣"}</button>
 
                   <button type="button" class="ia-icon-btn" id="ia-btn-text" title="Paste draft to composer">${I.text || "T"}</button>
+
+                  <button type="button" class="ia-icon-btn ia-btn-record" id="ia-btn-record" title="Start recording interview Q+A pairs">${I.play || "▶"}</button>
 
                 </div>
 
@@ -824,6 +945,8 @@ window.IaPanel = (function () {
 
                 <label>Resume</label>
 
+                <input type="text" id="ia-resume-name" class="ia-context-name" placeholder="Name (required to save)" autocomplete="off" />
+
                 <textarea id="ia-resume" placeholder="Paste or type resume…"></textarea>
 
                 <div class="ia-settings-actions">
@@ -832,11 +955,15 @@ window.IaPanel = (function () {
                   <button type="button" class="ia-btn-save" id="ia-save-resume">Save resume</button>
                 </div>
 
+                <div class="ia-context-history" id="ia-resume-history" aria-label="Saved resumes"></div>
+
               </div>
 
               <div class="ia-settings-card ia-settings-card--compact">
 
                 <label>Job description</label>
+
+                <input type="text" id="ia-jd-name" class="ia-context-name" placeholder="Name (required to save)" autocomplete="off" />
 
                 <textarea id="ia-jd" placeholder="Paste or type JD…"></textarea>
 
@@ -845,6 +972,8 @@ window.IaPanel = (function () {
                   <button type="button" class="ia-btn-upload" id="ia-upload-jd">${I.upload || "↑"} Upload</button>
                   <button type="button" class="ia-btn-save" id="ia-save-jd">Save JD</button>
                 </div>
+
+                <div class="ia-context-history" id="ia-jd-history" aria-label="Saved job descriptions"></div>
 
               </div>
 
@@ -859,6 +988,28 @@ window.IaPanel = (function () {
                 </div>
 
                 <button type="button" class="ia-btn-save" id="ia-save-prompt">Save prompt</button>
+
+              </div>
+
+            </div>
+
+            <div class="ia-history-tab" id="ia-history-tab">
+
+              <div class="ia-history-split">
+
+                <div class="ia-history-content ia-history-panel--collapsed" id="ia-history-content" style="flex:1">
+                  <div class="ia-history-content-placeholder">
+                    <button type="button" class="ia-history-expand-btn" id="ia-history-expand-btn" title="Expand content">${I.chevronRight || "›"}</button>
+                  </div>
+                  <div class="ia-history-pairs" id="ia-history-pairs"></div>
+                </div>
+
+                <div class="ia-history-list-panel" id="ia-history-list-panel" style="flex:9">
+                  <div class="ia-history-files" id="ia-history-files"></div>
+                  <div class="ia-history-list-collapse-btn-wrap" id="ia-history-list-collapse-wrap">
+                    <button type="button" class="ia-history-expand-btn" id="ia-history-list-collapse-btn" title="Back to file list">${I.chevronLeft || "‹"}</button>
+                  </div>
+                </div>
 
               </div>
 
@@ -972,6 +1123,11 @@ window.IaPanel = (function () {
 
 
 
+  const PROMPT_NAV_TEXT = {
+    english: "En",
+    chinese: "中",
+  };
+
   function renderPromptNav() {
 
     els.promptNav.innerHTML = "";
@@ -982,11 +1138,13 @@ window.IaPanel = (function () {
 
       btn.type = "button";
 
-      btn.className = "ia-prompt-nav-btn";
+      const navText = PROMPT_NAV_TEXT[p.id];
+
+      btn.className = "ia-prompt-nav-btn" + (navText ? " ia-prompt-nav-btn--text" : "");
 
       btn.dataset.key = p.id;
 
-      btn.innerHTML = (window.IaIcons && window.IaIcons.forPromptKey(p.id)) || "";
+      btn.innerHTML = navText || (window.IaIcons && window.IaIcons.forPromptKey(p.id)) || "";
 
       btn.title = p.label;
 
@@ -1044,6 +1202,360 @@ window.IaPanel = (function () {
 
 
 
+  // ── Recording ──────────────────────────────────────────────────────────────
+
+  async function onToggleRecord() {
+    if (!state.recording) {
+      state.recording = true;
+      state.recordingPairs = [];
+      state.recordingCreatedUtc = new Date().toISOString();
+      updateRecordBadge();
+      window.IaToast?.info("Recording started — Send captions to capture Q+A pairs.");
+    } else {
+      state.recording = false;
+      updateRecordBadge();
+      if (!state.recordingPairs.length) {
+        window.IaToast?.warning("Recording stopped — no pairs captured.");
+        return;
+      }
+      const r = await IaApi.post("/interview-history", {
+        created_utc: state.recordingCreatedUtc,
+        pairs: state.recordingPairs,
+      });
+      state.recordingPairs = [];
+      state.recordingCreatedUtc = null;
+      if (r.ok) {
+        window.IaToast?.success(`Interview saved as "${r.data?.name || "file"}".`);
+        if (state.tab === "history") void loadHistoryFileList();
+      } else {
+        window.IaToast?.error("Could not save interview history.");
+      }
+    }
+  }
+
+  function updateRecordBadge() {
+    const btn = els.btnRecord;
+    if (!btn) return;
+    const I = window.IaIcons || {};
+    if (state.recording) {
+      btn.innerHTML = I.stop || "■";
+      btn.title = `Stop recording (${state.recordingPairs.length} pair${state.recordingPairs.length === 1 ? "" : "s"} captured)`;
+      btn.classList.add("ia-record-active");
+    } else {
+      btn.innerHTML = I.play || "▶";
+      btn.title = "Start recording interview Q+A pairs";
+      btn.classList.remove("ia-record-active");
+    }
+  }
+
+  // ── History tab ─────────────────────────────────────────────────────────────
+
+  async function loadHistoryFileList() {
+    if (state.historyEditingName) return;
+    const r = await IaApi.get("/interview-history");
+    if (!r.ok) return;
+    state.historyFiles = Array.isArray(r.data?.files) ? r.data.files : [];
+    renderHistoryFileList();
+  }
+
+  function setHistoryMode(mode) {
+    state.historyMode = mode;
+    const content = els.historyContent;
+    const listPanel = els.historyListPanel;
+    if (!content || !listPanel) return;
+
+    if (mode === "detail") {
+      content.style.flex = "9";
+      listPanel.style.flex = "1";
+      listPanel.classList.add("ia-history-panel--collapsed");
+      content.classList.remove("ia-history-panel--collapsed");
+    } else {
+      content.style.flex = "1";
+      listPanel.style.flex = "9";
+      content.classList.add("ia-history-panel--collapsed");
+      listPanel.classList.remove("ia-history-panel--collapsed");
+    }
+  }
+
+  async function expandHistoryPanel() {
+    if (state.historySelectedFile) {
+      setHistoryMode("detail");
+      return;
+    }
+    if (state.historySelectedFileName) {
+      await openHistoryFile(state.historySelectedFileName);
+      return;
+    }
+    if (state.historyFiles.length > 0) {
+      await openHistoryFile(state.historyFiles[0].name);
+      return;
+    }
+    window.IaToast?.warning("No saved interviews yet.");
+  }
+
+  function collapseHistoryPanel() {
+    setHistoryMode("list");
+  }
+
+  function renderHistoryFileList() {
+    if (state.historyEditingName) return;
+    const list = els.historyFiles;
+    if (!list) return;
+
+    list.replaceChildren();
+
+    if (!state.historyFiles.length) {
+      const empty = document.createElement("p");
+      empty.className = "ia-hint";
+      empty.style.padding = "16px";
+      empty.textContent = "No saved interviews yet. Use the record button to capture one.";
+      list.appendChild(empty);
+      return;
+    }
+
+    const I = window.IaIcons || {};
+    for (const file of state.historyFiles) {
+      const item = document.createElement("div");
+      item.className = "ia-hist-file-item";
+      item.dataset.name = file.name;
+
+      const nameDisplay = document.createElement("div");
+      nameDisplay.className = "ia-hist-file-name";
+      nameDisplay.textContent = fileDisplayName(file.name);
+
+      const timeEl = document.createElement("div");
+      timeEl.className = "ia-hist-file-time";
+      timeEl.textContent = formatHistoryDate(file.created_utc) +
+        (file.pair_count ? ` · ${file.pair_count} Q&A` : "");
+
+      const actions = document.createElement("div");
+      actions.className = "ia-hist-file-actions";
+
+      const dotsBtn = document.createElement("button");
+      dotsBtn.type = "button";
+      dotsBtn.className = "ia-hist-dots-btn";
+      dotsBtn.title = "Rename";
+      dotsBtn.setAttribute("aria-label", "Rename");
+      dotsBtn.innerHTML = I.dotsH || "…";
+      dotsBtn.addEventListener("click", (e) => {
+        e.stopPropagation();
+        startInlineRename(item, file);
+      });
+
+      const delBtn = document.createElement("button");
+      delBtn.type = "button";
+      delBtn.className = "ia-hist-del-btn";
+      delBtn.title = "Delete";
+      delBtn.setAttribute("aria-label", "Delete");
+      delBtn.innerHTML = I.trash || "×";
+      delBtn.addEventListener("click", async (e) => {
+        e.stopPropagation();
+        const r = await IaApi.del(`/interview-history/${encodeURIComponent(file.name)}`);
+        if (r.ok) {
+          window.IaToast?.success("Deleted.");
+          void loadHistoryFileList();
+        } else {
+          window.IaToast?.error("Could not delete.");
+        }
+      });
+
+      actions.appendChild(dotsBtn);
+      actions.appendChild(delBtn);
+
+      const meta = document.createElement("div");
+      meta.className = "ia-hist-file-meta";
+      meta.appendChild(nameDisplay);
+      meta.appendChild(timeEl);
+
+      item.appendChild(meta);
+      item.appendChild(actions);
+
+      item.addEventListener("dblclick", (e) => {
+        // Don't open when rename input is focused inside this item
+        if (item.querySelector(".ia-hist-rename-input")) return;
+        void openHistoryFile(file.name);
+      });
+      list.appendChild(item);
+    }
+  }
+
+  function startInlineRename(itemEl, file) {
+    if (state.historyEditingName) return;
+    const meta = itemEl.querySelector(".ia-hist-file-meta");
+    if (!meta) return;
+    const nameEl = itemEl.querySelector(".ia-hist-file-name");
+    if (!nameEl) return;
+
+    state.historyEditingName = file.name;
+
+    const input = document.createElement("input");
+    input.type = "text";
+    input.className = "ia-hist-rename-input";
+    input.value = fileDisplayName(file.name);
+    input.title = "Press Enter to save, Escape to cancel";
+
+    nameEl.replaceWith(input);
+    input.focus();
+    input.select();
+
+    input.addEventListener("click", (e) => e.stopPropagation());
+    input.addEventListener("dblclick", (e) => e.stopPropagation());
+    input.addEventListener("mousedown", (e) => e.stopPropagation());
+
+    let finished = false;
+
+    const onDocMouseDown = (e) => {
+      if (itemEl.contains(e.target)) return;
+      cancel();
+    };
+
+    const detachOutsideListener = () => {
+      document.removeEventListener("mousedown", onDocMouseDown, true);
+    };
+
+    const endEdit = () => {
+      state.historyEditingName = null;
+      detachOutsideListener();
+    };
+
+    const cancel = () => {
+      if (finished) return;
+      finished = true;
+      endEdit();
+      if (input.isConnected) input.replaceWith(nameEl);
+    };
+
+    const save = async () => {
+      if (finished) return;
+      const newName = input.value.trim();
+      if (!newName || newName === fileDisplayName(file.name)) {
+        cancel();
+        return;
+      }
+      finished = true;
+      detachOutsideListener();
+      const r = await IaApi.patch(`/interview-history/${encodeURIComponent(file.name)}`, { new_name: newName });
+      endEdit();
+      if (r.ok) {
+        if (state.historySelectedFileName === file.name) {
+          state.historySelectedFileName = newName.endsWith(".json") ? newName : `${newName}.json`;
+        }
+        window.IaToast?.success("Renamed.");
+        void loadHistoryFileList();
+      } else {
+        window.IaToast?.error("Could not rename.");
+        if (input.isConnected) input.replaceWith(nameEl);
+      }
+    };
+
+    input.addEventListener("keydown", (e) => {
+      if (e.key === "Enter") {
+        e.preventDefault();
+        e.stopPropagation();
+        void save();
+      } else if (e.key === "Escape") {
+        e.preventDefault();
+        e.stopPropagation();
+        cancel();
+      }
+    });
+
+    setTimeout(() => {
+      document.addEventListener("mousedown", onDocMouseDown, true);
+    }, 0);
+  }
+
+  async function openHistoryFile(filename) {
+    const r = await IaApi.get(`/interview-history/${encodeURIComponent(filename)}`);
+    if (!r.ok) { window.IaToast?.error("Could not load file."); return; }
+    state.historySelectedFile = r.data;
+    state.historySelectedFileName = filename;
+    renderHistoryPairs();
+    setHistoryMode("detail");
+  }
+
+  function renderHistoryPairs() {
+    const container = els.historyPairs;
+    if (!container) return;
+    container.replaceChildren();
+
+    const session = state.historySelectedFile;
+    if (!session?.pairs?.length) {
+      const empty = document.createElement("p");
+      empty.className = "ia-hint";
+      empty.textContent = "No Q&A pairs in this session.";
+      container.appendChild(empty);
+      return;
+    }
+
+    for (const pair of session.pairs) {
+      const block = document.createElement("div");
+      block.className = "ia-hist-pair";
+
+      const qRow = document.createElement("div");
+      qRow.className = "ia-hist-pair-caption";
+      const qLabel = document.createElement("span");
+      qLabel.className = "ia-hist-pair-label";
+      qLabel.textContent = "Interviewer";
+      const qText = document.createElement("p");
+      qText.className = "ia-hist-pair-text";
+      qText.textContent = pair.caption || "";
+      qRow.appendChild(qLabel);
+      qRow.appendChild(qText);
+
+      const aRow = document.createElement("div");
+      aRow.className = "ia-hist-pair-result";
+      const aLabel = document.createElement("span");
+      aLabel.className = "ia-hist-pair-label";
+      aLabel.textContent = "GPT";
+      const aText = document.createElement("p");
+      aText.className = "ia-hist-pair-text";
+      aText.textContent = pair.result || "";
+      aRow.appendChild(aLabel);
+      aRow.appendChild(aText);
+
+      block.appendChild(qRow);
+      block.appendChild(aRow);
+      container.appendChild(block);
+    }
+  }
+
+  function fileDisplayName(filename) {
+    return (filename || "").replace(/\.json$/, "");
+  }
+
+  function formatHistoryDate(isoStr) {
+    try {
+      const d = new Date(isoStr);
+      return d.toLocaleString(undefined, {
+        month: "short", day: "numeric",
+        hour: "2-digit", minute: "2-digit",
+      });
+    } catch {
+      return isoStr || "";
+    }
+  }
+
+  async function reconnectCompanion() {
+    setConnectionState("connecting");
+    stopDraftPoll();
+    if (disconnectEvents) {
+      disconnectEvents();
+      disconnectEvents = null;
+    }
+    companionBootstrapped = false;
+    disconnectEvents = IaApi.connectEvents(onSseMessage);
+    const ok = await checkCompanionHealth();
+    startDraftPoll();
+    if (ok) {
+      window.IaToast?.success("Connected to companion.");
+    } else {
+      window.IaToast?.warning(
+        "Companion not reachable. Start the tray app (or run dotnet), then click Reconnect."
+      );
+    }
+  }
+
   async function init() {
 
     if (window.IaLayout && !window.IaLayout.isChatGptPage()) return;
@@ -1057,6 +1569,7 @@ window.IaPanel = (function () {
     disconnectEvents = IaApi.connectEvents(onSseMessage);
 
     startHealthPoll();
+    startDraftPoll();
 
     renderFeed();
 
@@ -1073,8 +1586,6 @@ window.IaPanel = (function () {
     state.skipThrough = 0;
 
     state.selection = null;
-
-    state.lastRenderedPendingStart = -1;
 
     const draft = await IaApi.get("/draft");
 
@@ -1123,11 +1634,7 @@ window.IaPanel = (function () {
     const ctx = await IaApi.get("/context");
 
     if (ctx.ok && ctx.data) {
-
-      els.resume.value = ctx.data.resume || "";
-
-      els.jd.value = ctx.data.job_description || "";
-
+      applyContextPayload(ctx.data);
     }
 
     if (PROMPT_KEYS.some((p) => p.id === state.mode)) {
@@ -1195,6 +1702,37 @@ window.IaPanel = (function () {
 
   }
 
+  function startDraftPoll() {
+    stopDraftPoll();
+    draftPollId = setInterval(() => void pollDraftFast(), DRAFT_POLL_MS);
+  }
+
+  function stopDraftPoll() {
+    if (draftPollId) {
+      clearInterval(draftPollId);
+      draftPollId = null;
+    }
+  }
+
+  async function pollDraftFast() {
+    if (!state.connected || state.tab !== "caption") return;
+    const draft = await IaApi.get("/draft");
+    if (!draft.ok || !draft.data) return;
+    const prevFull = state.fullCaption || "";
+    applyCaptionSnapshot(draft.data);
+    const nextFull = state.fullCaption || "";
+    if (nextFull !== prevFull) scheduleRenderFeed();
+  }
+
+  function scheduleRenderFeed() {
+    if (renderFeedScheduled) return;
+    renderFeedScheduled = true;
+    requestAnimationFrame(() => {
+      renderFeedScheduled = false;
+      renderFeed();
+    });
+  }
+
 
 
   function normalizeMode(id) {
@@ -1258,7 +1796,7 @@ window.IaPanel = (function () {
 
 
   function setTab(tab) {
-
+    const prevTab = state.tab;
     state.tab = tab;
 
     els.root.querySelectorAll(".ia-tab").forEach((b) => {
@@ -1271,12 +1809,21 @@ window.IaPanel = (function () {
 
     els.settings.classList.toggle("visible", tab === "settings");
 
+    if (els.historyTab) {
+      els.historyTab.classList.toggle("visible", tab === "history");
+    }
+
     if (tab === "settings") {
 
       if (PROMPT_KEYS.some((p) => p.id === state.mode)) setPromptKey(state.mode);
 
       else void loadPromptEditor();
 
+    }
+
+    if (tab === "history" && prevTab !== "history") {
+      setHistoryMode("list");
+      void loadHistoryFileList();
     }
 
   }
@@ -1291,7 +1838,7 @@ window.IaPanel = (function () {
 
       setConnectionState("connected");
 
-      renderFeed();
+      scheduleRenderFeed();
 
     }
 
@@ -1308,220 +1855,49 @@ window.IaPanel = (function () {
 
 
   function renderFeed() {
-
     if (state.editingKey) return;
 
     const items = getCaptionItems();
+    const captionKey = `${state.fullCaption}|${state.endpoint}|${state.skipThrough}|${state.selection ? state.selection.anchorIdx : ""}:${state.selection ? state.selection.endIdx : ""}`;
 
     if (!items.length) {
-
-      els.feed.innerHTML = "";
-
-      els.feedFixed = null;
-
-      els.feedLive = null;
-
-      state.lastRenderedPendingStart = -1;
-
-      if (state.connected) {
-        els.feed.innerHTML = '<p class="ia-hint ia-feed-empty">Listening for live captions…</p>';
-      }
-
+      lastRenderedCaption = "";
+      els.feed.innerHTML = state.connected
+        ? '<p class="ia-hint ia-feed-empty">Listening for live captions…</p>'
+        : "";
       return;
-
     }
 
-    if (els.feed.querySelector(".ia-feed-empty")) {
-      els.feed.innerHTML = "";
-      els.feedFixed = null;
-      els.feedLive = null;
-      state.lastRenderedPendingStart = -1;
-    }
-
-    ensureFeedZones();
-
-    /* Fixed: append only when pending_start slides (new sentence leaves live-sync tail). */
-
-    if (state.pendingStart !== state.lastRenderedPendingStart) {
-
-      appendNewFixedSentences();
-
-      state.lastRenderedPendingStart = state.pendingStart;
-
-    }
-
-    /* Live-sync tail (pending_start → now): gray if sent, green if after endpoint. */
-
-    syncLiveZone();
-
-    updateFixedZoneStyles();
-
-    applySelectionStyles();
-
-    if (!els.feed.querySelector(".ia-sentence")) {
-      rebuildFeedFromCaption();
-    }
-
-    scrollFeedToBottom();
-
-  }
-
-
-
-  /** Fallback when incremental zones fail to paint any boxes. */
-  function rebuildFeedFromCaption() {
-    const pendingStart = state.pendingStart || 0;
-    const items = getCaptionItems();
-    els.feed.innerHTML = "";
-    els.feedFixed = null;
-    els.feedLive = null;
-    state.lastRenderedPendingStart = -1;
-    ensureFeedZones();
-    items.forEach((item, i) => {
-      const inLive = item.end > pendingStart;
-      const box = renderSentenceBox(sentenceBoxProps(items, i));
-      (inLive ? els.feedLive : els.feedFixed).appendChild(box);
-    });
-    state.lastRenderedPendingStart = state.pendingStart;
-  }
-
-
-
-  function appendNewFixedSentences() {
-
-    const pendingStart = state.pendingStart || 0;
-
-    const items = getCaptionItems();
-
-    items.forEach((item, i) => {
-
-      if (item.end > pendingStart) return;
-
-      const key = `s-${item.start}`;
-
-      if (els.feedFixed.querySelector(`.ia-sentence[data-sentence-key="${CSS.escape(key)}"]`)) return;
-
-      els.feedFixed.appendChild(renderSentenceBox(sentenceBoxProps(items, i)));
-
-    });
-
-  }
-
-
-
-  function syncLiveZone() {
-
-    const pendingStart = state.pendingStart || 0;
-
-    const items = getCaptionItems();
-
-    const desired = [];
-
-    items.forEach((item, i) => {
-
-      if (item.end <= pendingStart) return;
-
-      desired.push(sentenceBoxProps(items, i));
-
-    });
-
-    syncSentenceList(els.feedLive, desired);
-
-  }
-
-
-
-  /** Fixed boxes are append-only; restyle green/gray when send/skip boundary moves. */
-
-  function updateFixedZoneStyles() {
-
-    if (!els.feedFixed) return;
-
-    const items = getCaptionItems();
-
-    els.feedFixed.querySelectorAll(".ia-sentence[data-sentence-index]").forEach((el) => {
-
-      const idx = sentenceIndexFromEl(el);
-
-      if (idx < 0 || !items[idx]) return;
-
-      updateSentenceBox(el, sentenceBoxProps(items, idx));
-
-    });
-
-  }
-
-
-
-  function ensureFeedZones() {
-
-    if (els.feedFixed?.isConnected) return;
-
-    els.feed.innerHTML = "";
-
-    els.feedFixed = document.createElement("div");
-
-    els.feedFixed.id = "ia-feed-fixed";
-
-    els.feedLive = document.createElement("div");
-
-    els.feedLive.id = "ia-feed-live";
-
-    els.feed.appendChild(els.feedFixed);
-
-    els.feed.appendChild(els.feedLive);
-
-    state.lastRenderedPendingStart = -1;
-
-  }
-
-
-
-  function syncSentenceList(container, desired) {
-
-    if (!container) return;
-
-    const existing = new Map();
-
-    container.querySelectorAll(".ia-sentence").forEach((el) => {
-
-      if (el.dataset.sentenceKey) existing.set(el.dataset.sentenceKey, el);
-
-    });
-
-    const desiredKeys = new Set(desired.map((d) => d.key));
-
-    existing.forEach((el, key) => {
-
-      if (!desiredKeys.has(key)) el.remove();
-
-    });
-
-    let prev = null;
-
-    for (const d of desired) {
-
-      let el = container.querySelector(`.ia-sentence[data-sentence-key="${CSS.escape(d.key)}"]`);
-
-      if (!el) el = renderSentenceBox(d);
-
-      else updateSentenceBox(el, d);
-
-      if (el.previousElementSibling !== prev) {
-
-        if (prev) prev.after(el);
-
-        else container.prepend(el);
-
+    const existing = els.feed.querySelectorAll(".ia-sentence");
+    const canPatch =
+      captionKey !== lastRenderedCaption &&
+      existing.length > 0 &&
+      items.length >= existing.length &&
+      items.length - existing.length <= 3;
+
+    if (canPatch) {
+      for (let i = 0; i < items.length; i++) {
+        const props = sentenceBoxProps(items, i);
+        if (i < existing.length) {
+          updateSentenceBox(existing[i], props);
+        } else {
+          els.feed.appendChild(renderSentenceBox(props));
+        }
       }
-
-      prev = el;
-
+      while (els.feed.children.length > items.length) {
+        els.feed.lastChild?.remove();
+      }
+    } else if (captionKey !== lastRenderedCaption || existing.length !== items.length) {
+      els.feed.innerHTML = "";
+      items.forEach((item, i) => {
+        els.feed.appendChild(renderSentenceBox(sentenceBoxProps(items, i)));
+      });
     }
 
+    lastRenderedCaption = captionKey;
+    applySelectionStyles();
+    scrollFeedToBottom();
   }
-
-
 
   function updateSentenceBox(el, { text, pending, selected, live, index }) {
     let cls = "ia-sentence";
@@ -1669,8 +2045,65 @@ window.IaPanel = (function () {
 
     if (!data.prompt) return;
 
-    await sendPromptToGpt(data.prompt, true);
+    const captionForRecord = chunkOverride.trim();
+    const sentResult = await sendPromptToGpt(data.prompt, true);
 
+    if (state.recording && sentResult?.ok && captionForRecord) {
+      // Wait a short moment then grab GPT result (generation already finished by sendPromptToGpt)
+      await new Promise((r) => setTimeout(r, 400));
+      const gptText = resolveLatestGptResultText();
+      if (gptText) {
+        state.recordingPairs.push({
+          caption: captionForRecord,
+          result: gptText,
+          ts_utc: new Date().toISOString(),
+        });
+        updateRecordBadge();
+      }
+    }
+
+  }
+
+  async function onQuoteCaption() {
+    if (quoteSendInProgress || sendInProgress) return;
+    const range = getPendingSendRange();
+    const chunk = buildPendingChunk();
+    if (!range || !chunk.trim()) {
+      window.IaToast?.warning("Nothing to quote — select green captions first.");
+      return;
+    }
+
+    quoteSendInProgress = true;
+    try {
+      const items = getCaptionItems();
+      const startChar = items[range.anchorIdx] ? items[range.anchorIdx].start : 0;
+      await IaApi.post("/endpoint", { start_index: startChar });
+      const r = await IaApi.post("/end", { chunk });
+      if (!r.ok) {
+        window.IaToast?.error(r.error || "Companion not running");
+        return;
+      }
+      const data = r.data;
+      if (!data?.ok) {
+        window.IaToast?.warning(data?.message || "Nothing to quote");
+        return;
+      }
+
+      applyCaptionSnapshot(data);
+      await refreshCaptionSnapshot();
+      await setEndpointToNow();
+      state.selection = null;
+      clearPendingSentenceEdits();
+      renderFeed();
+
+      const quote = formatInterviewerQuote(chunk);
+      const pasted = await pasteTextToComposer(quote, true);
+      if (pasted?.ok) {
+        window.IaToast?.success("Interviewer quote pasted into prompt (not sent).");
+      }
+    } finally {
+      quoteSendInProgress = false;
+    }
   }
 
 
@@ -1768,61 +2201,162 @@ window.IaPanel = (function () {
 
 
   async function onPasteDraft(append) {
-
     const text = buildPendingChunk() || (state.draft || "").trim();
-
-    if (!text) {
-      window.IaToast?.warning("No live caption draft to paste.");
-      return;
+    const result = await pasteTextToComposer(text, append !== false);
+    if (result?.ok) {
+      window.IaToast?.success("Live caption pasted into prompt (not sent).");
     }
-    const ready = window.__iaExtensionGetGptReady?.();
-    if (!ready?.ok) {
-      window.IaToast?.warning(gptNotReadyMessage(ready));
-      return;
-    }
-    if (window.__iaExtensionPasteDraft) {
-      const result = await window.__iaExtensionPasteDraft(text, append !== false);
-      if (result?.ok) window.IaToast?.success("Live caption pasted into prompt.");
-      else window.IaToast?.warning(sendFailureMessage(result));
-    }
-
   }
 
 
 
   async function saveResume() {
-
-    await IaApi.post("/context/resume", { text: els.resume.value });
-
+    const name = (els.resumeName?.value || "").trim();
+    const text = (els.resume?.value || "").trim();
+    if (!name || !text) {
+      window.IaToast?.warning("Name and content are both required to save a resume.");
+      return;
+    }
+    const r = await IaApi.post("/context/resume", { name, text });
+    if (r.ok) {
+      applyContextPayload(r.data?.context || r.data);
+      window.IaToast?.success("Resume saved.");
+    } else {
+      window.IaToast?.error(r.data?.error || "Could not save resume.");
+    }
   }
-
-
 
   async function saveJd() {
-
-    await IaApi.post("/context/jd", { text: els.jd.value });
-
+    const name = (els.jdName?.value || "").trim();
+    const text = (els.jd?.value || "").trim();
+    if (!name || !text) {
+      window.IaToast?.warning("Name and content are both required to save a JD.");
+      return;
+    }
+    const r = await IaApi.post("/context/jd", { name, text });
+    if (r.ok) {
+      applyContextPayload(r.data?.context || r.data);
+      window.IaToast?.success("Job description saved.");
+    } else {
+      window.IaToast?.error(r.data?.error || "Could not save JD.");
+    }
   }
 
+  function selectDocHistoryItem(kind, item) {
+    const isResume = kind === "resume";
+    if (isResume) {
+      state.selectedResumeName = item?.name || "";
+      if (els.resumeName) els.resumeName.value = item?.name || "";
+      if (els.resume) els.resume.value = item?.text || "";
+    } else {
+      state.selectedJdName = item?.name || "";
+      if (els.jdName) els.jdName.value = item?.name || "";
+      if (els.jd) els.jd.value = item?.text || "";
+    }
+    renderDocHistory(kind);
+  }
 
+  function applyContextPayload(data) {
+    if (!data) return;
+    state.contextResumes = Array.isArray(data.resumes) ? data.resumes : [];
+    state.contextJds = Array.isArray(data.jds) ? data.jds : [];
+    state.activeResumeName = data.active_resume || "";
+    state.activeJdName = data.active_jd || "";
+    state.selectedResumeName = state.activeResumeName;
+    state.selectedJdName = state.activeJdName;
+    if (els.resumeName) els.resumeName.value = state.activeResumeName;
+    if (els.resume) els.resume.value = data.resume || "";
+    if (els.jdName) els.jdName.value = state.activeJdName;
+    if (els.jd) els.jd.value = data.job_description || "";
+    renderDocHistory("resume");
+    renderDocHistory("jd");
+  }
 
-  function setupFileUpload(btnId, inputId, getTextarea, saveFn) {
+  function renderDocHistory(kind) {
+    const isResume = kind === "resume";
+    const listEl = isResume ? els.resumeHistory : els.jdHistory;
+    const items = isResume ? state.contextResumes : state.contextJds;
+    const selectedName = isResume ? state.selectedResumeName : state.selectedJdName;
+    if (!listEl) return;
+
+    listEl.replaceChildren();
+    if (!items.length) {
+      const empty = document.createElement("p");
+      empty.className = "ia-context-history-empty";
+      empty.textContent = "No saved items yet.";
+      listEl.appendChild(empty);
+      return;
+    }
+
+    const iconTrash = window.IaIcons?.trash || "";
+    for (const item of items) {
+      const row = document.createElement("div");
+      row.className = "ia-context-history-item";
+      if (item.name && contextNamesEqual(item.name, selectedName)) {
+        row.classList.add("ia-context-history-item--active");
+      }
+
+      const selectBtn = document.createElement("button");
+      selectBtn.type = "button";
+      selectBtn.className = "ia-context-history-select";
+      selectBtn.title = "Use for prompts";
+      selectBtn.textContent = item.name || "(unnamed)";
+      selectBtn.addEventListener("click", () => selectDocHistoryItem(kind, item));
+
+      const deleteBtn = document.createElement("button");
+      deleteBtn.type = "button";
+      deleteBtn.className = "ia-context-history-delete";
+      deleteBtn.title = "Delete from history";
+      deleteBtn.setAttribute("aria-label", `Delete ${item.name || "item"}`);
+      deleteBtn.innerHTML = iconTrash;
+      deleteBtn.addEventListener("click", async (e) => {
+        e.stopPropagation();
+        const path = isResume
+          ? `/context/resume/${encodeURIComponent(item.name)}`
+          : `/context/jd/${encodeURIComponent(item.name)}`;
+        const r = await IaApi.del(path);
+        if (r.ok) {
+          applyContextPayload(r.data);
+          window.IaToast?.success(isResume ? "Resume removed." : "JD removed.");
+        } else {
+          window.IaToast?.error("Could not delete.");
+        }
+      });
+
+      row.appendChild(selectBtn);
+      row.appendChild(deleteBtn);
+      listEl.appendChild(row);
+    }
+  }
+
+  function fileBaseName(file) {
+    const n = file?.name || "document";
+    const dot = n.lastIndexOf(".");
+    return dot > 0 ? n.slice(0, dot) : n;
+  }
+
+  function setupFileUpload(btnId, inputId, opts) {
     const btn = els.root.getElementById(btnId);
     const input = els.root.getElementById(inputId);
-    if (!btn || !input) return;
+    const getTextarea = opts?.getTextarea;
+    const getNameInput = opts?.getNameInput;
+    if (!btn || !input || !getTextarea) return;
 
     btn.addEventListener("click", () => input.click());
     input.addEventListener("change", async () => {
       const file = input.files?.[0];
       input.value = "";
       if (!file) return;
-      const label = btn.textContent;
       btn.disabled = true;
       btn.textContent = "Reading…";
       try {
         const text = await window.IaFileImport.extractText(file);
         getTextarea().value = text;
-        await saveFn();
+        if (getNameInput) getNameInput().value = fileBaseName(file);
+        if (btnId === "ia-upload-resume") state.selectedResumeName = "";
+        else state.selectedJdName = "";
+        renderDocHistory(btnId === "ia-upload-resume" ? "resume" : "jd");
+        window.IaToast?.success("File loaded — set the name if needed, then Save.");
       } catch (e) {
         window.IaToast?.error("Could not read file: " + (e.message || e));
       } finally {

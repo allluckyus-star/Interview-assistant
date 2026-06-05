@@ -28,6 +28,8 @@ public sealed class CompanionSessionService : IDisposable
     public InterviewHistory History => _history;
     public bool IsRunning { get; private set; }
 
+    public int SessionGeneration { get; private set; }
+
     public event Action<string>? DraftChanged;
     public event Action<string>? StatusMessage;
     public event Action<HistoryEventDto>? HistoryAdded;
@@ -39,6 +41,7 @@ public sealed class CompanionSessionService : IDisposable
         if (IsRunning)
             return;
 
+        SessionGeneration++;
         _captionState.ResetForNewSession();
         _history.Clear();
         _apiHistory.Clear();
@@ -49,7 +52,7 @@ public sealed class CompanionSessionService : IDisposable
             _hotkeys.Start();
             IsRunning = true;
             StatusMessage?.Invoke("Live captions listening.");
-            DraftChanged?.Invoke(_captionState.GetDraftTail());
+            PublishCaptionSnapshot();
         }
         catch (Exception ex)
         {
@@ -58,6 +61,32 @@ public sealed class CompanionSessionService : IDisposable
             throw;
         }
     }
+
+    /// <summary>Restart Live Captions capture without clearing interview history.</summary>
+    public void RestartCaptions()
+    {
+        Stop();
+        SessionGeneration++;
+        _captionState.ResetForNewSession();
+        try
+        {
+            LiveCaptionsRestarter.Restart();
+            _capture.Start();
+            _hotkeys.Start();
+            IsRunning = true;
+            StatusMessage?.Invoke("Live captions restarted.");
+            PublishCaptionSnapshot();
+        }
+        catch (Exception ex)
+        {
+            Trace.WriteLine($"[Companion] restart captions failed: {ex}");
+            Stop();
+            throw;
+        }
+    }
+
+    private void PublishCaptionSnapshot() =>
+        DraftChanged?.Invoke(_captionState.GetDraftTail());
 
     public void Stop()
     {
@@ -80,6 +109,7 @@ public sealed class CompanionSessionService : IDisposable
         running = IsRunning,
         mode = ModePrompts.SessionMode,
         language = LanguagePrompts.SessionLanguage,
+        session_generation = SessionGeneration,
     };
 
     public IReadOnlyList<HistoryEventDto> GetHistorySnapshot() => _apiHistory.ToList();

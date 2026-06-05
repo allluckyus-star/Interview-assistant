@@ -4,6 +4,7 @@
     <TargetFramework>net8.0-windows</TargetFramework>
     <UseWindowsForms>true</UseWindowsForms>
     <UseWPF>true</UseWPF>
+    <DefineConstants>$(DefineConstants);COMPANION</DefineConstants>
     <RootNamespace>InterviewAssistant.Companion</RootNamespace>
     <AssemblyName>InterviewAssistant.Companion</AssemblyName>
     <ApplicationIcon />
@@ -12,6 +13,7 @@
   </PropertyGroup>
 
   <ItemGroup>
+    <FrameworkReference Include="Microsoft.AspNetCore.App" />
     <PackageReference Include="DocumentFormat.OpenXml" Version="3.2.0" />
     <PackageReference Include="UglyToad.PdfPig" Version="1.7.0-custom-5" />
   </ItemGroup>
@@ -30,8 +32,11 @@
     <Compile Include="..\..\..\c#project\src\InterviewAssistant.App\Services\ModePromptSeed.cs" Link="Linked\ModePromptSeed.cs" />
     <Compile Include="..\..\..\c#project\src\InterviewAssistant.App\Services\InterviewHistory.cs" Link="Linked\InterviewHistory.cs" />
     <Compile Include="..\..\..\c#project\src\InterviewAssistant.App\Services\InterviewHotkeyService.cs" Link="Linked\InterviewHotkeyService.cs" />
+    <Compile Include="..\..\..\c#project\src\InterviewAssistant.App\ResumeJdHistoryStore.cs" Link="Linked\ResumeJdHistoryStore.cs" />
+    <Compile Include="..\..\..\c#project\src\InterviewAssistant.App\InterviewHistoryStore.cs" Link="Linked\InterviewHistoryStore.cs" />
     <Compile Include="..\..\..\c#project\src\InterviewAssistant.App\ResumeJdStore.cs" Link="Linked\ResumeJdStore.cs" />
     <Compile Include="..\..\..\c#project\src\InterviewAssistant.App\PromptTemplateResolver.cs" Link="Linked\PromptTemplateResolver.cs" />
+    <Compile Include="..\..\..\c#project\src\InterviewAssistant.App\Services\StartupDiagnostics.cs" Link="Linked\StartupDiagnostics.cs" />
   </ItemGroup>
 
   <ItemGroup>

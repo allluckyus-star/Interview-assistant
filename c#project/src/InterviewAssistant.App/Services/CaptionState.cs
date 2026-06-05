@@ -241,12 +241,15 @@ public sealed class CaptionState
         }
     }
 
-    public void ApplyNormalizedCaption(string refinedText)
+    public bool ApplyNormalizedCaption(string refinedText)
     {
         if (string.IsNullOrWhiteSpace(refinedText))
-            return;
+            return false;
         lock (_lock)
         {
+            if (string.Equals(refinedText, _previousRefinedText, StringComparison.Ordinal))
+                return false;
+
             var oldNext = _nextChunkStartIndex;
             var oldFullLen = _refinedFullCaption.Length;
             var prevLive = _previousRefinedText;
@@ -300,6 +303,7 @@ public sealed class CaptionState
 
             if (_refinedFullCaption.Length != oldFullLen || oldNext != _nextChunkStartIndex)
                 LogMetrics("update", refinedText.Length);
+            return true;
         }
     }
 

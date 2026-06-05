@@ -6,9 +6,8 @@
  *    descendants (CSS spec), so ChatGPT's fixed nav/modals stay inside 70vw.
  *
  * 2. ChatGPT uses Tailwind `w-screen` (= 100vw) on its root shell and several
- *    nested wrappers. 100vw always means full viewport regardless of parent
- *    width, so we must override those elements explicitly to `width: 100%`
- *    (which cascades from body's 70vw).
+ *    nested wrappers. We override those only inside `.ia-gpt-shell` (layout.js).
+ *    Never use `body > div` — portaled tooltips/menus are also body children.
  *
  * 3. The panel host is a child of <html> (NOT body), so position:fixed on it
  *    is relative to the viewport — it correctly occupies the right 30vw column.
@@ -36,16 +35,25 @@ html.ia-docked:not(.ia-panel-collapsed) body {
 }
 
 /*
- * Override every descendant that uses Tailwind w-screen / h-svh so they
- * fill body's width (70vw) instead of the full viewport (100vw).
- * Exclude the panel host and its children.
+ * Override w-screen inside the marked main shell only (never portaled overlays).
  */
-html.ia-docked:not(.ia-panel-collapsed) body > div,
-html.ia-docked:not(.ia-panel-collapsed) body > div > div,
-html.ia-docked:not(.ia-panel-collapsed) body [class*="w-screen"]:not(#ia-interview-panel-host):not(#ia-interview-panel-host *) {
+html.ia-docked:not(.ia-panel-collapsed) body .ia-gpt-shell,
+html.ia-docked:not(.ia-panel-collapsed) body .ia-gpt-shell > div,
+html.ia-docked:not(.ia-panel-collapsed) body .ia-gpt-shell [class*="w-screen"] {
   width: 100% !important;
   max-width: 100% !important;
   min-width: 0 !important;
+}
+
+/* Portaled / floating ChatGPT UI must keep natural width */
+html.ia-docked:not(.ia-panel-collapsed) body [role="tooltip"],
+html.ia-docked:not(.ia-panel-collapsed) body [role="menu"],
+html.ia-docked:not(.ia-panel-collapsed) body [role="dialog"],
+html.ia-docked:not(.ia-panel-collapsed) body [data-radix-popper-content-wrapper],
+html.ia-docked:not(.ia-panel-collapsed) body [data-radix-portal],
+html.ia-docked:not(.ia-panel-collapsed) body > div[data-radix-portal] {
+  width: auto !important;
+  max-width: none !important;
 }
 
 /* ── Collapsed: full-width, no transform ────────────────────────────────── */

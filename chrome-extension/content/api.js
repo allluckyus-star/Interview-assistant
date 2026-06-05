@@ -30,6 +30,14 @@ window.IaApi = {
     return this.request("POST", path, body);
   },
 
+  del(path) {
+    return this.request("DELETE", path);
+  },
+
+  patch(path, body) {
+    return this.request("PATCH", path, body);
+  },
+
   connectEvents(onEvent) {
     const es = new EventSource(`${this.base}/events`);
 

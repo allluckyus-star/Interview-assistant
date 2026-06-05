@@ -1,12 +1,32 @@
 /** Split live caption text into sentence boxes for the feed UI. */
 window.IaCaptionSentences = (function () {
+  /** Western + CJK sentence terminators (e.g. 。！？). */
+  const SENTENCE_END_RE = /[.!?…。！？]/;
+
   function splitIntoSentences(text) {
     const t = (text || "").trim();
     if (!t) return [];
-    const parts = t
-      .split(/(?<=[.!?…])\s+/)
-      .map((s) => s.trim())
-      .filter(Boolean);
+
+    const parts = [];
+    let buf = "";
+
+    for (let i = 0; i < t.length; i++) {
+      buf += t[i];
+      if (!SENTENCE_END_RE.test(t[i])) continue;
+
+      while (i + 1 < t.length && /\s/.test(t[i + 1])) {
+        i += 1;
+        buf += t[i];
+      }
+
+      const sent = buf.trim();
+      if (sent) parts.push(sent);
+      buf = "";
+    }
+
+    const tail = buf.trim();
+    if (tail) parts.push(tail);
+
     return parts.length ? parts : [t];
   }
 
@@ -38,12 +58,5 @@ window.IaCaptionSentences = (function () {
       .join(" ");
   }
 
-  /** Character index where the live-sync tail begins (~20 sentences before edge; not the green zone). */
-  function pendingStartIndex(full, windowSize) {
-    const items = splitWithRanges(full);
-    if (!items.length || items.length <= windowSize) return 0;
-    return items[items.length - windowSize].start;
-  }
-
-  return { splitIntoSentences, splitWithRanges, joinSentences, pendingStartIndex };
+  return { splitIntoSentences, splitWithRanges, joinSentences };
 })();

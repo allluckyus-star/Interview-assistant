@@ -57,6 +57,6 @@ public static class LiveCaptionsRestarter
             Trace.WriteLine($"[InterviewAssistant] Failed to start LiveCaptions: {ex.Message}");
         }
 
-        Thread.Sleep(1000);
+        Thread.Sleep(1500);
     }
 }

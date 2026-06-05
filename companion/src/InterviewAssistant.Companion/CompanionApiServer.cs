@@ -1,12 +1,14 @@
 using System.Collections.Concurrent;
 using System.Diagnostics;
 using System.IO;
-using System.Net;
 using System.Text;
 using System.Text.Json;
 using System.Text.Json.Serialization;
 using InterviewAssistant.App;
 using InterviewAssistant.App.Services;
+using Microsoft.AspNetCore.Builder;
+using Microsoft.AspNetCore.Hosting;
+using Microsoft.AspNetCore.Http;
 
 namespace InterviewAssistant.Companion;
 
@@ -21,9 +23,9 @@ public sealed class CompanionApiServer : IDisposable
     private readonly CompanionSessionService _session;
     private readonly string _host;
     private readonly int _port;
-    private HttpListener? _listener;
+    private WebApplication? _app;
     private CancellationTokenSource? _cts;
-    private Task? _loop;
+    private Task? _serverTask;
     private readonly ConcurrentDictionary<Guid, StreamWriter> _sseClients = new();
 
     public CompanionApiServer(CompanionSessionService session, string host = "127.0.0.1", int port = 1212)
@@ -41,16 +43,23 @@ public sealed class CompanionApiServer : IDisposable
 
     public void Start()
     {
-        if (_listener is not null)
+        if (_app is not null)
             return;
 
-        var listener = new HttpListener();
-        listener.Prefixes.Add(Prefix);
-        listener.Start();
-        _listener = listener;
+        var url = Prefix.TrimEnd('/');
+        StartupDiagnostics.Log($"Companion: Kestrel binding {url}");
+
+        var builder = WebApplication.CreateSlimBuilder();
+        builder.WebHost.UseUrls(url);
+
+        var app = builder.Build();
+        app.Use((HttpContext ctx, RequestDelegate _) => HandleRequestAsync(ctx));
+
+        _app = app;
         _cts = new CancellationTokenSource();
-        _loop = Task.Run(() => AcceptLoop(_cts.Token));
-        Debug.WriteLine($"[Companion] API {Prefix}");
+        _serverTask = app.StartAsync(_cts.Token);
+        StartupDiagnostics.Log($"Companion: Kestrel listening on {url}");
+        Debug.WriteLine($"[Companion] API {url}/");
     }
 
     public void Stop()
@@ -58,18 +67,46 @@ public sealed class CompanionApiServer : IDisposable
         try
         {
             _cts?.Cancel();
-            _listener?.Stop();
         }
         catch
         {
             // ignore
         }
 
-        foreach (var kv in _sseClients)
+        CloseAllSseClients();
+
+        var app = _app;
+        var serverTask = _serverTask;
+        _app = null;
+        _serverTask = null;
+
+        if (serverTask is not null)
         {
             try
             {
-                kv.Value.Dispose();
+                serverTask.Wait(TimeSpan.FromSeconds(3));
+            }
+            catch (Exception ex)
+            {
+                StartupDiagnostics.Log($"Companion: server task wait: {ex.Message}");
+            }
+        }
+
+        if (app is not null)
+        {
+            try
+            {
+                using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(2));
+                app.StopAsync(timeout.Token).GetAwaiter().GetResult();
+            }
+            catch (Exception ex)
+            {
+                StartupDiagnostics.Log($"Companion: Kestrel stop: {ex.Message}");
+            }
+
+            try
+            {
+                app.DisposeAsync().AsTask().Wait(TimeSpan.FromSeconds(2));
             }
             catch
             {
@@ -77,80 +114,72 @@ public sealed class CompanionApiServer : IDisposable
             }
         }
 
-        _sseClients.Clear();
-        _listener?.Close();
-        _listener = null;
+        _cts?.Dispose();
+        _cts = null;
     }
 
-    private async Task AcceptLoop(CancellationToken token)
+    private void CloseAllSseClients()
     {
-        while (!token.IsCancellationRequested && _listener is { IsListening: true })
+        foreach (var key in _sseClients.Keys.ToArray())
         {
-            HttpListenerContext? ctx = null;
+            if (!_sseClients.TryRemove(key, out var writer))
+                continue;
             try
             {
-                ctx = await _listener.GetContextAsync().WaitAsync(token).ConfigureAwait(false);
-            }
-            catch when (token.IsCancellationRequested)
-            {
-                break;
+                writer.Dispose();
             }
             catch
             {
-                break;
+                // ignore
             }
-
-            if (ctx is not null)
-                _ = Task.Run(() => HandleRequest(ctx), token);
         }
     }
 
-    private void HandleRequest(HttpListenerContext ctx)
+    private async Task HandleRequestAsync(HttpContext ctx)
     {
         try
         {
             AddCors(ctx);
-            if (ctx.Request.HttpMethod == "OPTIONS")
+            if (HttpMethods.IsOptions(ctx.Request.Method))
             {
-                ctx.Response.StatusCode = 204;
-                ctx.Response.Close();
+                ctx.Response.StatusCode = StatusCodes.Status204NoContent;
                 return;
             }
 
-            var path = ctx.Request.Url?.AbsolutePath ?? "/";
+            var path = ctx.Request.Path.Value ?? "/";
             path = path.TrimEnd('/');
             if (path.Length == 0)
                 path = "/";
 
-            if (ctx.Request.HttpMethod == "GET")
+            if (HttpMethods.IsGet(ctx.Request.Method))
             {
                 if (path is "/health" or "/ping")
                 {
-                    WriteJson(ctx, new { ok = true, service = "interview-assistant-companion" });
+                    await WriteJsonAsync(ctx, new { ok = true, service = "interview-assistant-companion" });
                     return;
                 }
 
                 if (path == "/draft")
                 {
-                    WriteJson(ctx, _session.GetDraftPayload());
+                    await WriteJsonAsync(ctx, _session.GetDraftPayload());
                     return;
                 }
 
                 if (path == "/history")
                 {
-                    WriteJson(ctx, new { events = _session.GetHistorySnapshot() });
+                    await WriteJsonAsync(ctx, new { events = _session.GetHistorySnapshot() });
                     return;
                 }
 
                 if (path == "/events")
                 {
-                    HandleSse(ctx);
+                    await HandleSseAsync(ctx);
                     return;
                 }
 
                 if (path == "/modes")
                 {
-                    WriteJson(ctx, new
+                    await WriteJsonAsync(ctx, new
                     {
                         active = _session.ModePrompts.SessionMode,
                         modes = new[] { "read", "type", "behavioral" },
@@ -160,7 +189,7 @@ public sealed class CompanionApiServer : IDisposable
 
                 if (path == "/languages")
                 {
-                    WriteJson(ctx, new
+                    await WriteJsonAsync(ctx, new
                     {
                         active = _session.LanguagePrompts.SessionLanguage,
                         languages = new[] { "english", "chinese" },
@@ -170,20 +199,15 @@ public sealed class CompanionApiServer : IDisposable
 
                 if (path == "/endpoint-words")
                 {
-                    var count = int.TryParse(ctx.Request.QueryString["count"], out var c) ? c : 20;
-                    WriteJson(ctx, new { words = _session.GetEndpointWords(count) });
+                    var countRaw = ctx.Request.Query["count"].ToString();
+                    var count = int.TryParse(countRaw, out var c) ? c : 20;
+                    await WriteJsonAsync(ctx, new { words = _session.GetEndpointWords(count) });
                     return;
                 }
 
                 if (path == "/context")
                 {
-                    var (resume, jd) = ResumeJdStore.Load();
-                    WriteJson(ctx, new
-                    {
-                        resume,
-                        job_description = jd,
-                        templates = BuildTemplatesMap(),
-                    });
+                    await WriteJsonAsync(ctx, BuildContextPayload());
                     return;
                 }
 
@@ -191,40 +215,142 @@ public sealed class CompanionApiServer : IDisposable
                 {
                     var key = path["/prompts/".Length..];
                     var text = GetPromptByKey(key);
-                    WriteJson(ctx, new { key, text });
+                    await WriteJsonAsync(ctx, new { key, text });
+                    return;
+                }
+
+                // ── Interview history ──────────────────────────────────────
+                if (path == "/interview-history")
+                {
+                    var list = InterviewHistoryStore.List()
+                        .Select(m => new { name = m.Name, created_utc = m.CreatedUtc, pair_count = m.PairCount });
+                    await WriteJsonAsync(ctx, new { files = list });
+                    return;
+                }
+
+                if (path.StartsWith("/interview-history/", StringComparison.Ordinal))
+                {
+                    var fname = Uri.UnescapeDataString(path["/interview-history/".Length..].Trim());
+                    var session = InterviewHistoryStore.Load(fname);
+                    if (session is null)
+                    {
+                        await WriteJsonAsync(ctx, new { ok = false, error = "not_found" }, 404);
+                        return;
+                    }
+                    await WriteJsonAsync(ctx, session);
                     return;
                 }
             }
 
-            if (ctx.Request.HttpMethod == "POST")
+            if (HttpMethods.IsDelete(ctx.Request.Method))
+            {
+                if (path.StartsWith("/context/resume/", StringComparison.Ordinal))
+                {
+                    var name = Uri.UnescapeDataString(path["/context/resume/".Length..].Trim());
+                    var ok = ResumeJdHistoryStore.DeleteResume(name);
+                    await WriteJsonAsync(ctx, ok ? BuildContextPayload() : new { ok = false, error = "not_found" }, ok ? 200 : 404);
+                    return;
+                }
+
+                if (path.StartsWith("/context/jd/", StringComparison.Ordinal))
+                {
+                    var name = Uri.UnescapeDataString(path["/context/jd/".Length..].Trim());
+                    var ok = ResumeJdHistoryStore.DeleteJd(name);
+                    await WriteJsonAsync(ctx, ok ? BuildContextPayload() : new { ok = false, error = "not_found" }, ok ? 200 : 404);
+                    return;
+                }
+
+                if (path.StartsWith("/interview-history/", StringComparison.Ordinal))
+                {
+                    var fname = Uri.UnescapeDataString(path["/interview-history/".Length..].Trim());
+                    var ok = InterviewHistoryStore.Delete(fname);
+                    await WriteJsonAsync(ctx, new { ok }, ok ? 200 : 404);
+                    return;
+                }
+            }
+
+            if (HttpMethods.IsPatch(ctx.Request.Method) || (HttpMethods.IsPost(ctx.Request.Method) && path.EndsWith("/rename", StringComparison.Ordinal)))
+            {
+                if (path.StartsWith("/interview-history/", StringComparison.Ordinal))
+                {
+                    var fname = Uri.UnescapeDataString(path["/interview-history/".Length..].TrimEnd('/').Replace("/rename", "").Trim());
+                    var body  = await ReadJsonBodyAsync(ctx);
+                    var newName = body.TryGetProperty("new_name", out var nn) ? nn.GetString() ?? "" : "";
+                    if (string.IsNullOrWhiteSpace(newName))
+                    {
+                        await WriteJsonAsync(ctx, new { ok = false, error = "new_name required" }, 400);
+                        return;
+                    }
+                    var ok = InterviewHistoryStore.Rename(fname, newName);
+                    await WriteJsonAsync(ctx, new { ok }, ok ? 200 : 409);
+                    return;
+                }
+            }
+
+            if (HttpMethods.IsPost(ctx.Request.Method))
             {
                 if (path == "/session/start")
                 {
                     if (!_session.IsRunning)
                         _session.Start();
-                    WriteJson(ctx, new { ok = true, running = true });
+                    await WriteJsonAsync(ctx, new { ok = true, running = true });
                     return;
                 }
 
                 if (path == "/session/stop")
                 {
                     _session.Stop();
-                    WriteJson(ctx, new { ok = true, running = false });
+                    await WriteJsonAsync(ctx, new { ok = true, running = false });
+                    return;
+                }
+
+                if (path == "/interview-history")
+                {
+                    try
+                    {
+                        var body = await ReadJsonBodyAsync(ctx);
+                        var session = new InterviewHistoryStore.Session
+                        {
+                            CreatedUtc = body.TryGetProperty("created_utc", out var c) && c.TryGetDateTime(out var dt)
+                                ? dt : DateTime.UtcNow,
+                        };
+
+                        if (body.TryGetProperty("pairs", out var pairsEl))
+                        {
+                            foreach (var p in pairsEl.EnumerateArray())
+                            {
+                                session.Pairs.Add(new InterviewHistoryStore.QaPair
+                                {
+                                    Caption = p.TryGetProperty("caption", out var cap) ? cap.GetString() ?? "" : "",
+                                    Result  = p.TryGetProperty("result",  out var res) ? res.GetString() ?? "" : "",
+                                    TsUtc   = p.TryGetProperty("ts_utc", out var ts) && ts.TryGetDateTime(out var tdt)
+                                                ? tdt : DateTime.UtcNow,
+                                });
+                            }
+                        }
+
+                        var name = InterviewHistoryStore.Save(session);
+                        await WriteJsonAsync(ctx, new { ok = true, name });
+                    }
+                    catch (Exception ex)
+                    {
+                        await WriteJsonAsync(ctx, new { ok = false, error = ex.Message }, 400);
+                    }
                     return;
                 }
 
                 if (path == "/end")
                 {
                     string? overrideChunk = null;
-                    if (ctx.Request.ContentLength64 > 0)
+                    if (ctx.Request.ContentLength is > 0)
                     {
-                        var body = ReadJsonBody(ctx);
+                        var body = await ReadJsonBodyAsync(ctx);
                         if (body.TryGetProperty("chunk", out var c))
                             overrideChunk = c.GetString();
                     }
 
                     var result = _session.TryEnd(overrideChunk);
-                    WriteJson(ctx, new
+                    await WriteJsonAsync(ctx, new
                     {
                         ok = result.Ok,
                         chunk = result.Chunk,
@@ -232,15 +358,23 @@ public sealed class CompanionApiServer : IDisposable
                         draft = result.Draft,
                         full = _session.GetFullCaption(),
                         pending_start = _session.GetPendingStartIndex(),
+                        session_generation = _session.SessionGeneration,
                         message = result.Message,
                     });
+                    return;
+                }
+
+                if (path == "/captions/restart")
+                {
+                    _session.RestartCaptions();
+                    await WriteJsonAsync(ctx, _session.GetDraftPayload());
                     return;
                 }
 
                 if (path == "/delete")
                 {
                     var skip = _session.TryDelete();
-                    WriteJson(ctx, new
+                    await WriteJsonAsync(ctx, new
                     {
                         ok = true,
                         skipped = skip.Skipped,
@@ -254,82 +388,98 @@ public sealed class CompanionApiServer : IDisposable
 
                 if (path == "/endpoint")
                 {
-                    var body = ReadJsonBody(ctx);
+                    var body = await ReadJsonBodyAsync(ctx);
                     var idx = body.TryGetProperty("start_index", out var p) ? p.GetInt32() : -1;
                     var ok = idx >= 0 && _session.SetEndpoint(idx);
-                    WriteJson(ctx, new { ok, draft = _session.GetDraft() });
+                    await WriteJsonAsync(ctx, new { ok, draft = _session.GetDraft() });
                     return;
                 }
 
                 if (path == "/mode")
                 {
-                    var body = ReadJsonBody(ctx);
+                    var body = await ReadJsonBodyAsync(ctx);
                     if (body.TryGetProperty("mode", out var m))
                         _session.ModePrompts.SessionMode = m.GetString() ?? "read";
-                    WriteJson(ctx, new { ok = true, active = _session.ModePrompts.SessionMode });
+                    await WriteJsonAsync(ctx, new { ok = true, active = _session.ModePrompts.SessionMode });
                     return;
                 }
 
                 if (path == "/language")
                 {
-                    var body = ReadJsonBody(ctx);
+                    var body = await ReadJsonBodyAsync(ctx);
                     if (body.TryGetProperty("language", out var lang))
                         _session.LanguagePrompts.SessionLanguage = lang.GetString() ?? "english";
-                    WriteJson(ctx, new { ok = true, active = _session.LanguagePrompts.SessionLanguage });
+                    await WriteJsonAsync(ctx, new { ok = true, active = _session.LanguagePrompts.SessionLanguage });
                     return;
                 }
 
                 if (path == "/context/extract-text")
                 {
-                    var body = ReadJsonBody(ctx);
+                    var body = await ReadJsonBodyAsync(ctx);
                     var fileName = body.TryGetProperty("file_name", out var fn) ? fn.GetString() ?? "file.txt" : "file.txt";
                     var b64 = body.TryGetProperty("content_base64", out var b) ? b.GetString() ?? "" : "";
                     try
                     {
                         var bytes = Convert.FromBase64String(b64);
                         var text = DocumentTextExtractor.Extract(fileName, bytes);
-                        WriteJson(ctx, new { ok = true, text });
+                        await WriteJsonAsync(ctx, new { ok = true, text });
                     }
                     catch (Exception ex)
                     {
-                        WriteJson(ctx, new { ok = false, error = ex.Message });
+                        await WriteJsonAsync(ctx, new { ok = false, error = ex.Message });
                     }
                     return;
                 }
 
                 if (path == "/context/resume")
                 {
-                    var body = ReadJsonBody(ctx);
-                    var text = body.TryGetProperty("text", out var t) ? t.GetString() ?? "" : "";
-                    var (_, jd) = ResumeJdStore.Load();
-                    ResumeJdStore.Save(text, jd);
-                    WriteJson(ctx, new { ok = true });
+                    try
+                    {
+                        var body = await ReadJsonBodyAsync(ctx);
+                        var name = body.TryGetProperty("name", out var n) ? n.GetString() ?? "" : "";
+                        var text = body.TryGetProperty("text", out var t) ? t.GetString() ?? "" : "";
+                        ResumeJdHistoryStore.SaveResume(name, text);
+                        await WriteJsonAsync(ctx, new { ok = true, context = BuildContextPayload() });
+                    }
+                    catch (ArgumentException ex)
+                    {
+                        await WriteJsonAsync(ctx, new { ok = false, error = ex.Message }, StatusCodes.Status400BadRequest);
+                    }
+
                     return;
                 }
 
                 if (path == "/context/jd")
                 {
-                    var body = ReadJsonBody(ctx);
-                    var text = body.TryGetProperty("text", out var t) ? t.GetString() ?? "" : "";
-                    var (resume, _) = ResumeJdStore.Load();
-                    ResumeJdStore.Save(resume, text);
-                    WriteJson(ctx, new { ok = true });
+                    try
+                    {
+                        var body = await ReadJsonBodyAsync(ctx);
+                        var name = body.TryGetProperty("name", out var n) ? n.GetString() ?? "" : "";
+                        var text = body.TryGetProperty("text", out var t) ? t.GetString() ?? "" : "";
+                        ResumeJdHistoryStore.SaveJd(name, text);
+                        await WriteJsonAsync(ctx, new { ok = true, context = BuildContextPayload() });
+                    }
+                    catch (ArgumentException ex)
+                    {
+                        await WriteJsonAsync(ctx, new { ok = false, error = ex.Message }, StatusCodes.Status400BadRequest);
+                    }
+
                     return;
                 }
 
                 if (path.StartsWith("/prompts/", StringComparison.Ordinal))
                 {
                     var key = path["/prompts/".Length..];
-                    var body = ReadJsonBody(ctx);
+                    var body = await ReadJsonBodyAsync(ctx);
                     var text = body.TryGetProperty("text", out var t) ? t.GetString() ?? "" : "";
                     SavePromptByKey(key, text);
-                    WriteJson(ctx, new { ok = true });
+                    await WriteJsonAsync(ctx, new { ok = true });
                     return;
                 }
 
                 if (path == "/gpt-answer")
                 {
-                    var body = ReadJsonBody(ctx);
+                    var body = await ReadJsonBodyAsync(ctx);
                     var answer = body.TryGetProperty("text", out var t) ? t.GetString() ?? "" : "";
                     if (!string.IsNullOrWhiteSpace(answer))
                     {
@@ -338,19 +488,19 @@ public sealed class CompanionApiServer : IDisposable
                         BroadcastSse("history", ev);
                     }
 
-                    WriteJson(ctx, new { ok = true });
+                    await WriteJsonAsync(ctx, new { ok = true });
                     return;
                 }
             }
 
-            WriteJson(ctx, new { error = "not_found" }, 404);
+            await WriteJsonAsync(ctx, new { error = "not_found" }, StatusCodes.Status404NotFound);
         }
         catch (Exception ex)
         {
             Debug.WriteLine($"[Companion] API error: {ex.Message}");
             try
             {
-                WriteJson(ctx, new { error = ex.Message }, 500);
+                await WriteJsonAsync(ctx, new { error = ex.Message }, StatusCodes.Status500InternalServerError);
             }
             catch
             {
@@ -359,30 +509,40 @@ public sealed class CompanionApiServer : IDisposable
         }
     }
 
-    private void HandleSse(HttpListenerContext ctx)
+    private async Task HandleSseAsync(HttpContext ctx)
     {
-        ctx.Response.StatusCode = 200;
+        ctx.Response.StatusCode = StatusCodes.Status200OK;
         ctx.Response.ContentType = "text/event-stream";
-        ctx.Response.Headers.Add("Cache-Control", "no-cache");
+        ctx.Response.Headers.CacheControl = "no-cache";
         AddCors(ctx);
-        ctx.Response.SendChunked = true;
 
         var id = Guid.NewGuid();
-        var writer = new StreamWriter(ctx.Response.OutputStream, Encoding.UTF8) { AutoFlush = true };
+        var writer = new StreamWriter(ctx.Response.Body, Encoding.UTF8) { AutoFlush = true };
         _sseClients[id] = writer;
 
-        writer.WriteLine(": connected");
-        writer.WriteLine($"data: {JsonSerializer.Serialize(new { type = "draft", payload = _session.GetDraftPayload() }, JsonOptions)}");
-        writer.WriteLine();
+        await writer.WriteLineAsync(": connected");
+        await writer.WriteLineAsync(
+            $"data: {JsonSerializer.Serialize(new { type = "draft", payload = _session.GetDraftPayload() }, JsonOptions)}");
+        await writer.WriteLineAsync();
 
         try
         {
-            while (_listener is { IsListening: true } && ctx.Response.OutputStream.CanWrite)
+            using var shutdown = CancellationTokenSource.CreateLinkedTokenSource(
+                ctx.RequestAborted,
+                _cts?.Token ?? CancellationToken.None);
+
+            while (_app is not null && !shutdown.Token.IsCancellationRequested)
             {
-                Thread.Sleep(15000);
-                writer.WriteLine(": keepalive");
-                writer.WriteLine();
+                await Task.Delay(1000, shutdown.Token);
+                if (_app is null)
+                    break;
+                await writer.WriteLineAsync(": keepalive");
+                await writer.WriteLineAsync();
             }
+        }
+        catch (OperationCanceledException)
+        {
+            // client disconnected
         }
         catch
         {
@@ -393,8 +553,7 @@ public sealed class CompanionApiServer : IDisposable
             _sseClients.TryRemove(id, out _);
             try
             {
-                writer.Dispose();
-                ctx.Response.Close();
+                await writer.DisposeAsync();
             }
             catch
             {
@@ -412,6 +571,7 @@ public sealed class CompanionApiServer : IDisposable
             {
                 kv.Value.WriteLine(line);
                 kv.Value.WriteLine();
+                kv.Value.Flush();
             }
             catch
             {
@@ -420,31 +580,44 @@ public sealed class CompanionApiServer : IDisposable
         }
     }
 
-    private static void AddCors(HttpListenerContext ctx)
+    private static void AddCors(HttpContext ctx)
     {
         ctx.Response.Headers["Access-Control-Allow-Origin"] = "*";
-        ctx.Response.Headers["Access-Control-Allow-Methods"] = "GET, POST, OPTIONS";
+        ctx.Response.Headers["Access-Control-Allow-Methods"] = "GET, POST, PATCH, DELETE, OPTIONS";
         ctx.Response.Headers["Access-Control-Allow-Headers"] = "Content-Type";
     }
 
-    private static JsonElement ReadJsonBody(HttpListenerContext ctx)
+    private static async Task<JsonElement> ReadJsonBodyAsync(HttpContext ctx)
     {
-        using var reader = new StreamReader(ctx.Request.InputStream, ctx.Request.ContentEncoding);
-        var json = reader.ReadToEnd();
+        using var reader = new StreamReader(ctx.Request.Body, Encoding.UTF8);
+        var json = await reader.ReadToEndAsync();
         if (string.IsNullOrWhiteSpace(json))
             return default;
         using var doc = JsonDocument.Parse(json);
         return doc.RootElement.Clone();
     }
 
-    private static void WriteJson(HttpListenerContext ctx, object payload, int status = 200)
+    private static async Task WriteJsonAsync(HttpContext ctx, object payload, int status = StatusCodes.Status200OK)
     {
-        var bytes = JsonSerializer.SerializeToUtf8Bytes(payload, payload.GetType(), JsonOptions);
         ctx.Response.StatusCode = status;
         ctx.Response.ContentType = "application/json; charset=utf-8";
-        ctx.Response.ContentLength64 = bytes.Length;
-        ctx.Response.OutputStream.Write(bytes, 0, bytes.Length);
-        ctx.Response.Close();
+        await JsonSerializer.SerializeAsync(ctx.Response.Body, payload, payload.GetType(), JsonOptions);
+    }
+
+    private object BuildContextPayload()
+    {
+        var snap = ResumeJdHistoryStore.LoadSnapshot();
+        var (resume, jd) = ResumeJdHistoryStore.GetActiveTexts();
+        return new
+        {
+            resume,
+            job_description = jd,
+            active_resume = snap.ActiveResumeName,
+            active_jd = snap.ActiveJdName,
+            resumes = snap.Resumes.Select(e => new { name = e.Name, text = e.Text, updated_utc = e.UpdatedUtc }),
+            jds = snap.Jds.Select(e => new { name = e.Name, text = e.Text, updated_utc = e.UpdatedUtc }),
+            templates = BuildTemplatesMap(),
+        };
     }
 
     private Dictionary<string, string> BuildTemplatesMap()

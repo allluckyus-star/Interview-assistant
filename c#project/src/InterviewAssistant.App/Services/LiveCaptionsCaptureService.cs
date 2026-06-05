@@ -7,9 +7,16 @@ namespace InterviewAssistant.App.Services;
 /// <summary>Polls Windows Live Captions via UI Automation (same approach as live.py).</summary>
 public sealed class LiveCaptionsCaptureService : IDisposable
 {
+    private const int ActivePollMs = 15;
+    private const int IdlePollMs = 40;
+    private const int WindowMissingPollMs = 120;
+
     private readonly CaptionState _state;
     private CancellationTokenSource? _cts;
     private Thread? _captureThread;
+    private volatile bool _discardStaleUntilEmpty;
+    private DateTime _startedUtc;
+    private int _unchangedPolls;
 
     public LiveCaptionsCaptureService(CaptionState state) => _state = state;
 
@@ -18,6 +25,9 @@ public sealed class LiveCaptionsCaptureService : IDisposable
     public void Start()
     {
         Stop();
+        _discardStaleUntilEmpty = true;
+        _startedUtc = DateTime.UtcNow;
+        _unchangedPolls = 0;
         _cts = new CancellationTokenSource();
         var token = _cts.Token;
         _captureThread = new Thread(() => RunLoop(token))
@@ -45,7 +55,8 @@ public sealed class LiveCaptionsCaptureService : IDisposable
         {
             try
             {
-                _captureThread.Join(TimeSpan.FromSeconds(2));
+                if (!_captureThread.Join(TimeSpan.FromSeconds(2)))
+                    Trace.WriteLine("[InterviewAssistant] LiveCaptions capture thread did not exit within 2s (process may still exit)");
             }
             catch
             {
@@ -62,6 +73,7 @@ public sealed class LiveCaptionsCaptureService : IDisposable
     {
         while (!token.IsCancellationRequested)
         {
+            var pollMs = IdlePollMs;
             try
             {
                 var window = AutomationElement.RootElement.FindFirst(
@@ -69,35 +81,56 @@ public sealed class LiveCaptionsCaptureService : IDisposable
                     new PropertyCondition(AutomationElement.NameProperty, LiveCaptionsRestarter.WindowTitle));
                 if (window is null)
                 {
-                    Thread.Sleep(500);
+                    Thread.Sleep(WindowMissingPollMs);
                     continue;
                 }
 
                 var text = GetAllTextControls(window);
                 if (string.IsNullOrWhiteSpace(text))
                 {
-                    Thread.Sleep(200);
+                    if (_discardStaleUntilEmpty)
+                    {
+                        _discardStaleUntilEmpty = false;
+                        _state.ResetForNewSession();
+                        RaiseDraftUpdated(_state.GetDraftTail());
+                    }
+                    Thread.Sleep(ActivePollMs);
                     continue;
                 }
 
                 var refined = CaptionState.NormalizeCaptionText(text);
                 if (string.IsNullOrWhiteSpace(refined))
                 {
-                    Thread.Sleep(200);
+                    Thread.Sleep(ActivePollMs);
                     continue;
                 }
 
-                _state.ApplyNormalizedCaption(refined);
-                var draft = _state.GetDraftTail();
-                RaiseDraftUpdated(draft);
+                if (_discardStaleUntilEmpty)
+                {
+                    if ((DateTime.UtcNow - _startedUtc).TotalSeconds < 2)
+                        continue;
+                    _discardStaleUntilEmpty = false;
+                }
+
+                if (_state.ApplyNormalizedCaption(refined))
+                {
+                    _unchangedPolls = 0;
+                    pollMs = ActivePollMs;
+                    RaiseDraftUpdated(_state.GetDraftTail());
+                }
+                else
+                {
+                    _unchangedPolls++;
+                    pollMs = _unchangedPolls >= 3 ? IdlePollMs : ActivePollMs;
+                }
             }
             catch (Exception ex)
             {
                 Trace.WriteLine($"[InterviewAssistant] caption capture: {ex.Message}");
-                Thread.Sleep(300);
+                pollMs = 60;
             }
 
-            Thread.Sleep(200);
+            Thread.Sleep(pollMs);
         }
     }
 
@@ -113,7 +146,7 @@ public sealed class LiveCaptionsCaptureService : IDisposable
         if (dispatcher.CheckAccess())
             DraftUpdated?.Invoke(draft);
         else
-            dispatcher.BeginInvoke(() => DraftUpdated?.Invoke(draft), DispatcherPriority.Background);
+            dispatcher.BeginInvoke(() => DraftUpdated?.Invoke(draft), DispatcherPriority.Send);
     }
 
     private static string GetAllTextControls(AutomationElement control)
@@ -133,7 +166,7 @@ public sealed class LiveCaptionsCaptureService : IDisposable
         {
             try
             {
-                if (child.Current.ControlType == ControlType.Text && (child.Current.Name?.Length ?? 0) > 10)
+                if (child.Current.ControlType == ControlType.Text && (child.Current.Name?.Length ?? 0) > 0)
                     return child.Current.Name ?? "";
             }
             catch (ElementNotAvailableException)
