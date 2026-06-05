@@ -33,7 +33,11 @@ public sealed class CompanionApiServer : IDisposable
         _session = session;
         _host = host;
         _port = port;
-        _session.DraftChanged += _ => BroadcastSse("draft", _session.GetDraftPayload());
+        _session.DraftChanged += _ =>
+        {
+            if (_session.TryBuildDraftPayload(forceFullCaption: false, out var payload) && payload is not null)
+                BroadcastSse("draft", payload);
+        };
         _session.HistoryAdded += ev => BroadcastSse("history", ev);
         _session.EndPressed += () => BroadcastSse("hotkey", new { key = "end" });
         _session.DeletePressed += () => BroadcastSse("hotkey", new { key = "delete" });
@@ -161,7 +165,21 @@ public sealed class CompanionApiServer : IDisposable
 
                 if (path == "/draft")
                 {
-                    await WriteJsonAsync(ctx, _session.GetDraftPayload());
+                    var forceFull = string.Equals(ctx.Request.Query["full"], "1", StringComparison.Ordinal);
+                    if (_session.TryBuildDraftPayloadForPoll(forceFull, out var payload) && payload is not null)
+                    {
+                        await WriteJsonAsync(ctx, payload);
+                    }
+                    else
+                    {
+                        await WriteJsonAsync(ctx, new
+                        {
+                            changed = false,
+                            running = _session.IsRunning,
+                            session_generation = _session.SessionGeneration,
+                        });
+                    }
+
                     return;
                 }
 
@@ -367,7 +385,8 @@ public sealed class CompanionApiServer : IDisposable
                 if (path == "/captions/restart")
                 {
                     _session.RestartCaptions();
-                    await WriteJsonAsync(ctx, _session.GetDraftPayload());
+                    _session.TryBuildDraftPayload(forceFullCaption: true, out var payload);
+                    await WriteJsonAsync(ctx, payload ?? _session.GetDraftPayload(forceFullCaption: true));
                     return;
                 }
 
@@ -521,9 +540,12 @@ public sealed class CompanionApiServer : IDisposable
         _sseClients[id] = writer;
 
         await writer.WriteLineAsync(": connected");
-        await writer.WriteLineAsync(
-            $"data: {JsonSerializer.Serialize(new { type = "draft", payload = _session.GetDraftPayload() }, JsonOptions)}");
-        await writer.WriteLineAsync();
+        if (_session.TryBuildDraftPayload(forceFullCaption: true, out var connectPayload) && connectPayload is not null)
+        {
+            await writer.WriteLineAsync(
+                $"data: {JsonSerializer.Serialize(new { type = "draft", payload = connectPayload }, JsonOptions)}");
+            await writer.WriteLineAsync();
+        }
 
         try
         {

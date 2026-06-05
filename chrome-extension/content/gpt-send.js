@@ -168,9 +168,6 @@ function __iaDebugLog(requestId, stage, detail) {
       window.chrome.webview.postMessage(payload);
     }
   } catch (_e) {}
-  try {
-    console.log("[InterviewAssistant]", stage, detail);
-  } catch (_e2) {}
 }
 
 function __iaDescribeSubmitControl(btn) {

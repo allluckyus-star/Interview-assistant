@@ -119,10 +119,11 @@ window.IaPanel = (function () {
 
   const AUTOSCROLL_RESUME_MS = 2000;
   const HEALTH_POLL_MS = 3000;
-  const DRAFT_POLL_MS = 60;
+  const DRAFT_POLL_MS = 16;
   let draftPollId = null;
   let renderFeedScheduled = false;
   let lastRenderedCaption = "";
+  let captionResyncPending = false;
 
   function splitSentences(text) {
     return window.IaCaptionSentences?.splitIntoSentences(text) || [(text || "").trim()].filter(Boolean);
@@ -140,8 +141,10 @@ window.IaPanel = (function () {
     return window.IaCaptionSentences?.joinSentences(sentences) || (sentences || []).join(" ");
   }
 
-  function applyCaptionSnapshot(data) {
+  function applyCaptionSnapshot(data, source = "unknown") {
     if (!data) return;
+    if (data.changed === false) return;
+
     if (typeof data.session_generation === "number" && data.session_generation !== companionSessionGeneration) {
       companionSessionGeneration = data.session_generation;
       state.endpoint = 0;
@@ -151,8 +154,36 @@ window.IaPanel = (function () {
       lastRenderedCaption = "";
     }
     if (data.draft !== undefined) state.draft = data.draft || "";
-    if (data.full !== undefined) state.fullCaption = data.full || "";
-    else if (!state.fullCaption && state.draft) state.fullCaption = state.draft;
+
+    if (data.full !== null && data.full !== undefined) {
+      // Full replace (initial connect, session reset, or forced full).
+      state.fullCaption = data.full || "";
+      captionResyncPending = false;
+    } else if (
+      typeof data.patch_from === "number" &&
+      data.patch_tail !== null &&
+      data.patch_tail !== undefined
+    ) {
+      // Incremental patch: keep the stable prefix, splice in the new tail.
+      const current = state.fullCaption || "";
+      if (data.patch_from <= current.length) {
+        if (state.skipThrough > data.patch_from) {
+          state.skipThrough = data.patch_from;
+        }
+        state.fullCaption = current.slice(0, data.patch_from) + (data.patch_tail || "");
+        captionResyncPending = false;
+      } else if (data.patch_from === 0) {
+        // Full replace via patch (first content or backend fallback).
+        state.fullCaption = data.patch_tail || "";
+        captionResyncPending = false;
+      } else {
+        // Client behind backend — request a full snapshot on next poll.
+        captionResyncPending = true;
+      }
+    } else if (!state.fullCaption && data.draft) {
+      state.fullCaption = state.draft;
+    }
+
     if (typeof data.pending_start === "number" && data.pending_start >= 0) {
       state.endpoint = data.pending_start;
     }
@@ -1587,11 +1618,11 @@ window.IaPanel = (function () {
 
     state.selection = null;
 
-    const draft = await IaApi.get("/draft");
+    const draft = await IaApi.get("/draft?full=1");
 
     if (draft.ok && draft.data) {
 
-      applyCaptionSnapshot(draft.data);
+      applyCaptionSnapshot(draft.data, "load");
 
       if (draft.data.mode) {
 
@@ -1652,8 +1683,8 @@ window.IaPanel = (function () {
 
 
   async function refreshCaptionSnapshot() {
-    const draft = await IaApi.get("/draft");
-    if (draft.ok && draft.data) applyCaptionSnapshot(draft.data);
+    const draft = await IaApi.get("/draft?full=1");
+    if (draft.ok && draft.data) applyCaptionSnapshot(draft.data, "refresh");
   }
 
   async function checkCompanionHealth() {
@@ -1715,13 +1746,14 @@ window.IaPanel = (function () {
   }
 
   async function pollDraftFast() {
-    if (!state.connected || state.tab !== "caption") return;
-    const draft = await IaApi.get("/draft");
-    if (!draft.ok || !draft.data) return;
+    if (!state.connected) return;
+    const path = captionResyncPending ? "/draft?full=1" : "/draft";
+    const draft = await IaApi.get(path);
+    if (!draft.ok || !draft.data || draft.data.changed === false) return;
     const prevFull = state.fullCaption || "";
-    applyCaptionSnapshot(draft.data);
+    applyCaptionSnapshot(draft.data, "poll");
     const nextFull = state.fullCaption || "";
-    if (nextFull !== prevFull) scheduleRenderFeed();
+    if (nextFull !== prevFull || captionResyncPending) renderFeedImmediate();
   }
 
   function scheduleRenderFeed() {
@@ -1731,6 +1763,12 @@ window.IaPanel = (function () {
       renderFeedScheduled = false;
       renderFeed();
     });
+  }
+
+  /** SSE caption path — paint immediately, no rAF frame wait. */
+  function renderFeedImmediate() {
+    renderFeedScheduled = false;
+    renderFeed();
   }
 
 
@@ -1834,11 +1872,11 @@ window.IaPanel = (function () {
 
     if (msg.type === "draft" && msg.payload) {
 
-      applyCaptionSnapshot(msg.payload);
+      applyCaptionSnapshot(msg.payload, "sse");
 
       setConnectionState("connected");
 
-      scheduleRenderFeed();
+      renderFeedImmediate();
 
     }
 
@@ -1876,12 +1914,38 @@ window.IaPanel = (function () {
       items.length - existing.length <= 3;
 
     if (canPatch) {
-      for (let i = 0; i < items.length; i++) {
+      let patchFrom = 0;
+      if (items.length === existing.length) {
+        for (let i = 0; i < items.length; i++) {
+          const label = existing[i]?.querySelector(".ia-sentence-text");
+          const props = sentenceBoxProps(items, i);
+          if (!label || label.textContent !== (props.text || "")) {
+            patchFrom = i;
+            break;
+          }
+        }
+        if (patchFrom === 0 && items.length > 0) {
+          const lastProps = sentenceBoxProps(items, items.length - 1);
+          const lastLabel = existing[items.length - 1]?.querySelector(".ia-sentence-text");
+          if (lastLabel && lastLabel.textContent === (lastProps.text || "")) {
+            patchFrom = items.length;
+          }
+        }
+      } else {
+        patchFrom = Math.max(0, existing.length - 1);
+      }
+
+      for (let i = patchFrom; i < items.length; i++) {
         const props = sentenceBoxProps(items, i);
         if (i < existing.length) {
           updateSentenceBox(existing[i], props);
         } else {
           els.feed.appendChild(renderSentenceBox(props));
+        }
+      }
+      if (patchFrom >= items.length) {
+        for (let i = 0; i < items.length; i++) {
+          updateSentenceBox(existing[i], sentenceBoxProps(items, i));
         }
       }
       while (els.feed.children.length > items.length) {
@@ -2033,7 +2097,7 @@ window.IaPanel = (function () {
 
     }
 
-    applyCaptionSnapshot(data);
+    applyCaptionSnapshot(data, "send-end");
 
     await setEndpointToNow();
 
@@ -2089,7 +2153,7 @@ window.IaPanel = (function () {
         return;
       }
 
-      applyCaptionSnapshot(data);
+      applyCaptionSnapshot(data, "quote-send");
       await refreshCaptionSnapshot();
       await setEndpointToNow();
       state.selection = null;
@@ -2133,7 +2197,7 @@ window.IaPanel = (function () {
 
     }
 
-    if (r.data) applyCaptionSnapshot(r.data);
+    if (r.data) applyCaptionSnapshot(r.data, "skip");
 
     const skipped = (r.data?.skipped || "").trim();
 

@@ -1,15 +1,15 @@
 using System.Diagnostics;
 using System.Windows.Automation;
-using System.Windows.Threading;
 
 namespace InterviewAssistant.App.Services;
 
 /// <summary>Polls Windows Live Captions via UI Automation (same approach as live.py).</summary>
 public sealed class LiveCaptionsCaptureService : IDisposable
 {
-    private const int ActivePollMs = 15;
-    private const int IdlePollMs = 40;
-    private const int WindowMissingPollMs = 120;
+    private const int ActivePollMs = 5;
+    private const int IdlePollMs = 12;
+    private const int WindowMissingPollMs = 80;
+    private const double StaleDiscardMaxSeconds = 0.35;
 
     private readonly CaptionState _state;
     private CancellationTokenSource? _cts;
@@ -107,7 +107,7 @@ public sealed class LiveCaptionsCaptureService : IDisposable
 
                 if (_discardStaleUntilEmpty)
                 {
-                    if ((DateTime.UtcNow - _startedUtc).TotalSeconds < 2)
+                    if ((DateTime.UtcNow - _startedUtc).TotalSeconds < StaleDiscardMaxSeconds)
                         continue;
                     _discardStaleUntilEmpty = false;
                 }
@@ -121,7 +121,7 @@ public sealed class LiveCaptionsCaptureService : IDisposable
                 else
                 {
                     _unchangedPolls++;
-                    pollMs = _unchangedPolls >= 3 ? IdlePollMs : ActivePollMs;
+                    pollMs = _unchangedPolls >= 6 ? IdlePollMs : ActivePollMs;
                 }
             }
             catch (Exception ex)
@@ -136,17 +136,9 @@ public sealed class LiveCaptionsCaptureService : IDisposable
 
     private void RaiseDraftUpdated(string draft)
     {
-        var dispatcher = System.Windows.Application.Current?.Dispatcher;
-        if (dispatcher is null || dispatcher.HasShutdownStarted)
-        {
-            DraftUpdated?.Invoke(draft);
-            return;
-        }
-
-        if (dispatcher.CheckAccess())
-            DraftUpdated?.Invoke(draft);
-        else
-            dispatcher.BeginInvoke(() => DraftUpdated?.Invoke(draft), DispatcherPriority.Send);
+        // Fire on the capture thread — CaptionState is lock-protected; avoids WPF
+        // dispatcher queue delay (often 50–200 ms under load).
+        DraftUpdated?.Invoke(draft);
     }
 
     private static string GetAllTextControls(AutomationElement control)

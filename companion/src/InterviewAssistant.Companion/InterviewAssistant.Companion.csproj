@@ -20,6 +20,7 @@
 
   <ItemGroup>
     <Compile Include="..\..\..\c#project\src\InterviewAssistant.App\Services\CaptionState.cs" Link="Linked\CaptionState.cs" />
+    <Compile Include="..\..\..\c#project\src\InterviewAssistant.App\Services\CaptionSentenceSplitter.cs" Link="Linked\CaptionSentenceSplitter.cs" />
     <Compile Include="..\..\..\c#project\src\InterviewAssistant.App\Services\CaptionChunkBoundaryRealign.cs" Link="Linked\CaptionChunkBoundaryRealign.cs" />
     <Compile Include="..\..\..\c#project\src\InterviewAssistant.App\Services\CaptionDiagnostics.cs" Link="Linked\CaptionDiagnostics.cs" />
     <Compile Include="..\..\..\c#project\src\InterviewAssistant.App\Services\EndpointWordOption.cs" Link="Linked\EndpointWordOption.cs" />
