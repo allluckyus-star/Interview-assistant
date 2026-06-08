@@ -52,6 +52,17 @@ public sealed class CompanionApiServer : IDisposable
                 StartupDiagnostics.Log($"[IA ShareX] SSE text pending={pendingId} len={txt.Text?.Length ?? 0}");
                 BroadcastSse("sharex_text", new { text = txt.Text, pending_id = pendingId });
             });
+        var globalShortcuts = _shareXAutoForward.Shortcuts;
+        globalShortcuts.SendShortcutPressed += () =>
+        {
+            StartupDiagnostics.Log("[IA shortcuts] SSE panel_shortcut send");
+            BroadcastSse("panel_shortcut", new { action = "send" });
+        };
+        globalShortcuts.CopyGptShortcutPressed += () =>
+        {
+            StartupDiagnostics.Log("[IA shortcuts] SSE panel_shortcut copy_gpt");
+            BroadcastSse("panel_shortcut", new { action = "copy_gpt" });
+        };
         _session.DraftChanged += _ =>
         {
             if (_session.TryBuildDraftPayload(forceFullCaption: false, out var payload) && payload is not null)
@@ -222,10 +233,12 @@ public sealed class CompanionApiServer : IDisposable
 
                 if (path == "/sharex/shortcuts")
                 {
-                    var (image, text) = _shareXAutoForward.Shortcuts.GetBindings();
+                    var (image, text, send, copyGpt) = _shareXAutoForward.Shortcuts.GetBindings();
                     await WriteJsonAsync(ctx, new
                     {
                         ok = true,
+                        send = SerializeShareXBinding(send),
+                        copy_gpt = SerializeShareXBinding(copyGpt),
                         image_capture = SerializeShareXBinding(image),
                         ocr = SerializeShareXBinding(text),
                     });
@@ -455,11 +468,17 @@ public sealed class CompanionApiServer : IDisposable
                     var body = await ReadJsonBodyAsync(ctx);
                     ShareXShortcutBinding? image = null;
                     ShareXShortcutBinding? text = null;
+                    ShareXShortcutBinding? send = null;
+                    ShareXShortcutBinding? copyGpt = null;
                     if (body.TryGetProperty("image_capture", out var imgCap))
                         image = ParseShareXShortcutBinding(imgCap);
                     if (body.TryGetProperty("ocr", out var ocrCap))
                         text = ParseShareXShortcutBinding(ocrCap);
-                    _shareXAutoForward.Shortcuts.UpdateBindings(image, text);
+                    if (body.TryGetProperty("send", out var sendCap))
+                        send = ParseShareXShortcutBinding(sendCap);
+                    if (body.TryGetProperty("copy_gpt", out var copyCap))
+                        copyGpt = ParseShareXShortcutBinding(copyCap);
+                    _shareXAutoForward.Shortcuts.UpdateBindings(image, text, send, copyGpt);
                     await WriteJsonAsync(ctx, new { ok = true });
                     return;
                 }

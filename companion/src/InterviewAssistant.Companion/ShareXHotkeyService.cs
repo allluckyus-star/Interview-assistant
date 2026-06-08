@@ -4,8 +4,8 @@ using InterviewAssistant.App.Services;
 namespace InterviewAssistant.Companion;
 
 /// <summary>
-/// Detect ShareX shortcuts by polling physical key state.
-/// Bindings are configurable from the extension settings tab.
+/// Global shortcut detection via GetAsyncKeyState polling (works when Chrome is unfocused).
+/// Bindings are synced from the extension Settings tab.
 /// </summary>
 internal sealed class ShareXHotkeyService : IDisposable
 {
@@ -17,9 +17,13 @@ internal sealed class ShareXHotkeyService : IDisposable
     private readonly object _bindGate = new();
     private ShareXShortcutBinding? _imageBinding;
     private ShareXShortcutBinding? _textBinding;
+    private ShareXShortcutBinding? _sendBinding;
+    private ShareXShortcutBinding? _copyGptBinding;
     private readonly Dictionary<int, bool> _keyWasDown = new();
     private double _lastImage;
     private double _lastText;
+    private double _lastSend;
+    private double _lastCopyGpt;
     private double _lastTextShortcutAt;
 
     public double CooldownSeconds { get; set; } = 0.8;
@@ -27,11 +31,15 @@ internal sealed class ShareXHotkeyService : IDisposable
 
     public event Action? ImageShortcutPressed;
     public event Action? TextShortcutPressed;
+    public event Action? SendShortcutPressed;
+    public event Action? CopyGptShortcutPressed;
 
     public ShareXHotkeyService()
     {
         _imageBinding = DefaultImageBinding();
         _textBinding = DefaultTextBinding();
+        _sendBinding = DefaultSendBinding();
+        _copyGptBinding = DefaultCopyGptBinding();
         _timer = new System.Threading.Timer(_ => Poll(), null, TimeSpan.FromMilliseconds(40), TimeSpan.FromMilliseconds(40));
     }
 
@@ -41,28 +49,48 @@ internal sealed class ShareXHotkeyService : IDisposable
     public static ShareXShortcutBinding DefaultTextBinding() =>
         new(Ctrl: false, Alt: true, Shift: false, KeyVk: 0xBE, AltKeyVks: [0x6E]);
 
-    public void UpdateBindings(ShareXShortcutBinding? image, ShareXShortcutBinding? text)
+    public static ShareXShortcutBinding DefaultSendBinding() =>
+        new(Ctrl: true, Alt: false, Shift: true, KeyVk: 0x0D);
+
+    public static ShareXShortcutBinding DefaultCopyGptBinding() =>
+        new(Ctrl: true, Alt: false, Shift: true, KeyVk: 0x47);
+
+    public void UpdateBindings(
+        ShareXShortcutBinding? image,
+        ShareXShortcutBinding? text,
+        ShareXShortcutBinding? send = null,
+        ShareXShortcutBinding? copyGpt = null)
     {
         lock (_bindGate)
         {
             if (image is not null && image.EffectiveKeyVks.Length > 0) _imageBinding = image;
             if (text is not null && text.EffectiveKeyVks.Length > 0) _textBinding = text;
+            if (send is not null && send.EffectiveKeyVks.Length > 0) _sendBinding = send;
+            if (copyGpt is not null && copyGpt.EffectiveKeyVks.Length > 0) _copyGptBinding = copyGpt;
             _keyWasDown.Clear();
         }
 
         StartupDiagnostics.Log(
-            $"[IA ShareX] shortcuts updated image={DescribeBinding(_imageBinding)} text={DescribeBinding(_textBinding)}");
+            "[IA shortcuts] updated " +
+            $"image={DescribeBinding(_imageBinding)} " +
+            $"ocr={DescribeBinding(_textBinding)} " +
+            $"send={DescribeBinding(_sendBinding)} " +
+            $"copy={DescribeBinding(_copyGptBinding)}");
     }
 
-    public (ShareXShortcutBinding Image, ShareXShortcutBinding Text) GetBindings()
+    public (ShareXShortcutBinding Image, ShareXShortcutBinding Text, ShareXShortcutBinding Send, ShareXShortcutBinding CopyGpt) GetBindings()
     {
         lock (_bindGate)
-            return (_imageBinding ?? DefaultImageBinding(), _textBinding ?? DefaultTextBinding());
+            return (
+                _imageBinding ?? DefaultImageBinding(),
+                _textBinding ?? DefaultTextBinding(),
+                _sendBinding ?? DefaultSendBinding(),
+                _copyGptBinding ?? DefaultCopyGptBinding());
     }
 
     public void Start()
     {
-        StartupDiagnostics.Log("[IA ShareX] shortcut poller active (configurable bindings)");
+        StartupDiagnostics.Log("[IA shortcuts] global poller active (Companion, all windows)");
     }
 
     public bool WasTextShortcutRecent()
@@ -77,18 +105,28 @@ internal sealed class ShareXHotkeyService : IDisposable
         {
             ShareXShortcutBinding? image;
             ShareXShortcutBinding? text;
+            ShareXShortcutBinding? send;
+            ShareXShortcutBinding? copyGpt;
             lock (_bindGate)
             {
                 image = _imageBinding;
                 text = _textBinding;
+                send = _sendBinding;
+                copyGpt = _copyGptBinding;
             }
 
             var now = Environment.TickCount64 / 1000.0;
 
+            if (send is not null && TryFireEdge(send, now, ref _lastSend, "send"))
+                SendShortcutPressed?.Invoke();
+
+            if (copyGpt is not null && TryFireEdge(copyGpt, now, ref _lastCopyGpt, "copy_gpt"))
+                CopyGptShortcutPressed?.Invoke();
+
             if (image is not null && TryFireEdge(image, now, ref _lastImage, "image"))
                 ImageShortcutPressed?.Invoke();
 
-            if (text is not null && TryFireEdge(text, now, ref _lastText, "text"))
+            if (text is not null && TryFireEdge(text, now, ref _lastText, "ocr"))
             {
                 _lastTextShortcutAt = now;
                 TextShortcutPressed?.Invoke();
@@ -96,7 +134,7 @@ internal sealed class ShareXHotkeyService : IDisposable
         }
         catch (Exception ex)
         {
-            StartupDiagnostics.Log($"[IA ShareX] shortcut poll: {ex.Message}");
+            StartupDiagnostics.Log($"[IA shortcuts] poll: {ex.Message}");
         }
     }
 
@@ -114,7 +152,7 @@ internal sealed class ShareXHotkeyService : IDisposable
                 if (now - lastFire >= CooldownSeconds)
                 {
                     lastFire = now;
-                    StartupDiagnostics.Log($"[IA ShareX] {label} shortcut detected ({DescribeBinding(binding)})");
+                    StartupDiagnostics.Log($"[IA shortcuts] {label} detected ({DescribeBinding(binding)})");
                     return true;
                 }
             }

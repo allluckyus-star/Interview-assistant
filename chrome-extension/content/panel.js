@@ -939,11 +939,13 @@ window.IaPanel = (function () {
     }
   }
 
-  async function syncShareXShortcutsToCompanion() {
+  async function syncShortcutsToCompanion() {
     const S = window.IaShortcuts;
     if (!S || !state.connected || !state.shortcuts) return;
     try {
       await IaApi.post("/sharex/shortcuts", {
+        send: S.toCompanionBinding(state.shortcuts.send),
+        copy_gpt: S.toCompanionBinding(state.shortcuts.copyGpt),
         image_capture: S.toCompanionBinding(state.shortcuts.imageCapture),
         ocr: S.toCompanionBinding(state.shortcuts.ocr),
       });
@@ -1065,7 +1067,7 @@ window.IaPanel = (function () {
     state.shortcuts[actionId] = S.cloneShortcut(S.DEFAULTS[actionId]);
     await persistPanelSettings();
     renderShortcutsSettings();
-    if (S.SHAREX_ACTIONS.includes(actionId)) await syncShareXShortcutsToCompanion();
+    await syncShortcutsToCompanion();
     window.IaToast?.success("Shortcut reset.");
   }
 
@@ -1076,7 +1078,7 @@ window.IaPanel = (function () {
     shortcutRecording = null;
     await persistPanelSettings();
     renderShortcutsSettings();
-    if (S.SHAREX_ACTIONS.includes(actionId)) await syncShareXShortcutsToCompanion();
+    await syncShortcutsToCompanion();
     window.IaToast?.success(`Shortcut set: ${S.formatCombo(binding)}`);
   }
 
@@ -1100,22 +1102,6 @@ window.IaPanel = (function () {
         ev.stopPropagation();
         void applyShortcutBinding(shortcutRecording, binding);
         return;
-      }
-
-      if (ev.repeat) return;
-      const target = ev.target;
-      if (target && (target.tagName === "INPUT" || target.tagName === "TEXTAREA" || target.isContentEditable)) {
-        return;
-      }
-
-      if (S.matchesEvent(ev, state.shortcuts.send)) {
-        ev.preventDefault();
-        void onSend();
-        return;
-      }
-      if (S.matchesEvent(ev, state.shortcuts.copyGpt)) {
-        ev.preventDefault();
-        void onCopyGptResult();
       }
     };
     document.addEventListener("keydown", shortcutKeyHandler, true);
@@ -1337,7 +1323,7 @@ window.IaPanel = (function () {
 
                 <div class="ia-settings-section-body" id="ia-settings-body-shortcuts">
                 <div class="ia-settings-section-inner ia-shortcuts-inner">
-                  <p class="ia-shortcuts-hint">Click Record, then press the key combo. Image/OCR shortcuts sync to Companion.</p>
+                  <p class="ia-shortcuts-hint">Recorded in Settings; Companion runs shortcuts globally (even when Chrome is unfocused). Image/OCR only fire when their toolbar toggle is on.</p>
                   <div class="ia-shortcuts-list" id="ia-shortcuts-list"></div>
                 </div>
                 </div>
@@ -2005,7 +1991,7 @@ window.IaPanel = (function () {
     }
 
     await syncShareXListenToCompanion();
-    await syncShareXShortcutsToCompanion();
+    await syncShortcutsToCompanion();
 
   }
 
@@ -2223,6 +2209,13 @@ window.IaPanel = (function () {
 
       else void checkCompanionHealth();
 
+    }
+
+    if (msg.type === "panel_shortcut" && msg.payload?.action) {
+      const action = msg.payload.action;
+      if (action === "send") void onSend();
+      else if (action === "copy_gpt") void onCopyGptResult();
+      return;
     }
 
     if (msg.type === "sharex_image" && msg.payload?.image_id) {
