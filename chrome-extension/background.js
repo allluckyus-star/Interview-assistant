@@ -10,29 +10,85 @@ function isChatGptUrl(url) {
   }
 }
 
-chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
-  if (msg?.type === "ia_api") {
-    const path = msg.path || "/";
-    const method = msg.method || "GET";
-    const body = msg.body;
-    fetch(`${API_BASE}${path}`, {
-      method,
-      headers: body ? { "Content-Type": "application/json" } : undefined,
-      body: body ? JSON.stringify(body) : undefined,
-    })
-      .then(async (r) => {
-        const text = await r.text();
-        let data = null;
-        try {
-          data = text ? JSON.parse(text) : null;
-        } catch {
-          data = { raw: text };
-        }
-        sendResponse({ ok: r.ok, status: r.status, data });
-      })
-      .catch((e) => sendResponse({ ok: false, error: String(e.message || e) }));
-    return true;
+async function apiRequest(method, path, body) {
+  const hasBody = body !== undefined && body !== null;
+  const res = await fetch(`${API_BASE}${path}`, {
+    method: method || "GET",
+    headers: hasBody ? { "Content-Type": "application/json" } : undefined,
+    body: hasBody ? JSON.stringify(body) : undefined,
+  });
+  const text = await res.text();
+  let data = null;
+  try {
+    data = text ? JSON.parse(text) : null;
+  } catch {
+    data = { raw: text };
   }
+  return { ok: res.ok, status: res.status, data };
+}
+
+chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
+  if (msg?.type !== "ia_api") return false;
+
+  apiRequest(msg.method, msg.path || "/", msg.body)
+    .then((result) => sendResponse(result))
+    .catch((e) => sendResponse({ ok: false, error: String(e.message || e) }));
+
+  return true;
+});
+
+chrome.runtime.onConnect.addListener((port) => {
+  if (port.name !== "ia_sse") return;
+
+  let es = null;
+
+  function closeEs() {
+    if (!es) return;
+    try {
+      es.close();
+    } catch {
+      // ignore
+    }
+    es = null;
+  }
+
+  try {
+    es = new EventSource(`${API_BASE}/events`);
+  } catch (e) {
+    try {
+      port.postMessage({ type: "sse_error", error: String(e.message || e) });
+    } catch {
+      // port closed
+    }
+    return;
+  }
+
+  es.onopen = () => {
+    try {
+      port.postMessage({ type: "sse_open" });
+    } catch {
+      closeEs();
+    }
+  };
+
+  es.onmessage = (ev) => {
+    try {
+      port.postMessage({ type: "sse", data: ev.data });
+    } catch {
+      closeEs();
+    }
+  };
+
+  es.onerror = () => {
+    try {
+      port.postMessage({ type: "sse_error" });
+    } catch {
+      // port closed
+    }
+    closeEs();
+  };
+
+  port.onDisconnect.addListener(closeEs);
 });
 
 chrome.action.onClicked.addListener(async (tab) => {
@@ -49,6 +105,6 @@ chrome.action.onClicked.addListener(async (tab) => {
   try {
     await chrome.tabs.sendMessage(tab.id, { type: "ia_toggle_panel" });
   } catch {
-    // Content script not ready — inject not possible without scripting permission
+    // Content script not ready
   }
 });

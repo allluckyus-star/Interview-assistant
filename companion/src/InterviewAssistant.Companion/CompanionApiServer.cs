@@ -606,7 +606,8 @@ public sealed class CompanionApiServer : IDisposable
     {
         ctx.Response.Headers["Access-Control-Allow-Origin"] = "*";
         ctx.Response.Headers["Access-Control-Allow-Methods"] = "GET, POST, PATCH, DELETE, OPTIONS";
-        ctx.Response.Headers["Access-Control-Allow-Headers"] = "Content-Type";
+        ctx.Response.Headers["Access-Control-Allow-Headers"] = "Content-Type, Access-Control-Request-Private-Network";
+        ctx.Response.Headers["Access-Control-Allow-Private-Network"] = "true";
     }
 
     private static async Task<JsonElement> ReadJsonBodyAsync(HttpContext ctx)

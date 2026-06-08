@@ -1,22 +1,22 @@
+/** Companion API — always via extension background (never page fetch to 127.0.0.1; PNA blocks that on chatgpt.com). */
 window.IaApi = {
   base: "http://127.0.0.1:1212",
 
   async request(method, path, body) {
     try {
-      const hasBody = body !== undefined && body !== null;
-      const res = await fetch(`${this.base}${path}`, {
-        method: method || "GET",
-        headers: hasBody ? { "Content-Type": "application/json" } : undefined,
-        body: hasBody ? JSON.stringify(body) : undefined,
-      });
-      const text = await res.text();
-      let data = null;
-      try {
-        data = text ? JSON.parse(text) : null;
-      } catch {
-        data = { raw: text };
+      if (!chrome?.runtime?.sendMessage) {
+        return { ok: false, error: "extension_runtime_unavailable" };
       }
-      return { ok: res.ok, status: res.status, data };
+      const res = await chrome.runtime.sendMessage({
+        type: "ia_api",
+        method: method || "GET",
+        path,
+        body: body !== undefined && body !== null ? body : undefined,
+      });
+      if (!res) {
+        return { ok: false, error: "no_response" };
+      }
+      return res;
     } catch (e) {
       return { ok: false, error: String(e.message || e) };
     }
@@ -39,21 +39,41 @@ window.IaApi = {
   },
 
   connectEvents(onEvent) {
-    const es = new EventSource(`${this.base}/events`);
+    if (!chrome?.runtime?.connect) {
+      onEvent({ type: "connection", payload: { ok: false } });
+      return () => {};
+    }
 
-    es.onopen = () => onEvent({ type: "connection", payload: { ok: true } });
+    const port = chrome.runtime.connect({ name: "ia_sse" });
 
-    es.onmessage = (ev) => {
+    port.onMessage.addListener((msg) => {
+      if (msg?.type === "sse_open") {
+        onEvent({ type: "connection", payload: { ok: true } });
+        return;
+      }
+      if (msg?.type === "sse_error") {
+        onEvent({ type: "connection", payload: { ok: false } });
+        return;
+      }
+      if (msg?.type === "sse" && msg.data) {
+        try {
+          onEvent(JSON.parse(msg.data));
+        } catch {
+          // ignore malformed SSE payload
+        }
+      }
+    });
+
+    port.onDisconnect.addListener(() => {
+      onEvent({ type: "connection", payload: { ok: false } });
+    });
+
+    return () => {
       try {
-        const msg = JSON.parse(ev.data);
-        onEvent(msg);
+        port.disconnect();
       } catch {
         // ignore
       }
     };
-
-    es.onerror = () => onEvent({ type: "connection", payload: { ok: false } });
-
-    return () => es.close();
   },
 };
