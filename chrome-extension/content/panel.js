@@ -74,7 +74,8 @@ window.IaPanel = (function () {
 
     activeJdName: "",
 
-    /** Highlighted history row + source for resume/JD summary prompts. */
+    /** Settings accordion: resume | jd | prompt — only one expanded. */
+    settingsSection: "resume",
     selectedResumeName: "",
 
     selectedJdName: "",
@@ -842,6 +843,37 @@ window.IaPanel = (function () {
 
     setupFeedSelection();
 
+    setupSettingsAccordion(root);
+
+  }
+
+  function setupSettingsAccordion(root) {
+    const accordion = root.getElementById("ia-settings-accordion");
+    if (!accordion) return;
+
+    accordion.querySelectorAll(".ia-settings-section-toggle").forEach((btn) => {
+      btn.addEventListener("click", () => {
+        const section = btn.closest(".ia-settings-section");
+        const id = section?.dataset.section;
+        if (id) setSettingsAccordionSection(id);
+      });
+    });
+
+    setSettingsAccordionSection(state.settingsSection || "resume");
+  }
+
+  function setSettingsAccordionSection(sectionId) {
+    state.settingsSection = sectionId;
+    const accordion = els.settings?.querySelector("#ia-settings-accordion");
+    if (!accordion) return;
+
+    accordion.querySelectorAll(".ia-settings-section").forEach((sec) => {
+      const isExpanded = sec.dataset.section === sectionId;
+      sec.classList.toggle("is-expanded", isExpanded);
+      sec.classList.toggle("is-collapsed", !isExpanded);
+      const btn = sec.querySelector(".ia-settings-section-toggle");
+      if (btn) btn.setAttribute("aria-expanded", isExpanded ? "true" : "false");
+    });
   }
 
 
@@ -972,9 +1004,17 @@ window.IaPanel = (function () {
 
             <div class="ia-settings" id="ia-settings">
 
-              <div class="ia-settings-card ia-settings-card--compact">
+              <div class="ia-settings-accordion" id="ia-settings-accordion">
 
-                <label>Resume</label>
+              <div class="ia-settings-section ia-settings-card ia-settings-card--compact is-expanded" data-section="resume">
+
+                <button type="button" class="ia-settings-section-toggle" aria-expanded="true" aria-controls="ia-settings-body-resume">
+                  <span>Resume</span>
+                  <span class="ia-settings-chevron" aria-hidden="true">${I.chevronRight || "›"}</span>
+                </button>
+
+                <div class="ia-settings-section-body" id="ia-settings-body-resume">
+                <div class="ia-settings-section-inner">
 
                 <input type="text" id="ia-resume-name" class="ia-context-name" placeholder="Name (required to save)" autocomplete="off" />
 
@@ -988,11 +1028,20 @@ window.IaPanel = (function () {
 
                 <div class="ia-context-history" id="ia-resume-history" aria-label="Saved resumes"></div>
 
+                </div>
+                </div>
+
               </div>
 
-              <div class="ia-settings-card ia-settings-card--compact">
+              <div class="ia-settings-section ia-settings-card ia-settings-card--compact is-collapsed" data-section="jd">
 
-                <label>Job description</label>
+                <button type="button" class="ia-settings-section-toggle" aria-expanded="false" aria-controls="ia-settings-body-jd">
+                  <span>Job description</span>
+                  <span class="ia-settings-chevron" aria-hidden="true">${I.chevronRight || "›"}</span>
+                </button>
+
+                <div class="ia-settings-section-body" id="ia-settings-body-jd">
+                <div class="ia-settings-section-inner">
 
                 <input type="text" id="ia-jd-name" class="ia-context-name" placeholder="Name (required to save)" autocomplete="off" />
 
@@ -1006,11 +1055,20 @@ window.IaPanel = (function () {
 
                 <div class="ia-context-history" id="ia-jd-history" aria-label="Saved job descriptions"></div>
 
+                </div>
+                </div>
+
               </div>
 
-              <div class="ia-settings-card ia-settings-card--prompt">
+              <div class="ia-settings-section ia-settings-card ia-settings-card--prompt is-collapsed" data-section="prompt">
 
-                <label>Prompt template</label>
+                <button type="button" class="ia-settings-section-toggle" aria-expanded="false" aria-controls="ia-settings-body-prompt">
+                  <span>Prompt template</span>
+                  <span class="ia-settings-chevron" aria-hidden="true">${I.chevronRight || "›"}</span>
+                </button>
+
+                <div class="ia-settings-section-body" id="ia-settings-body-prompt">
+                <div class="ia-settings-section-inner">
 
                 <div class="ia-prompt-nav" id="ia-prompt-nav" role="group" aria-label="Prompt template"></div>
 
@@ -1019,6 +1077,11 @@ window.IaPanel = (function () {
                 </div>
 
                 <button type="button" class="ia-btn-save" id="ia-save-prompt">Save prompt</button>
+
+                </div>
+                </div>
+
+              </div>
 
               </div>
 
@@ -1852,6 +1915,8 @@ window.IaPanel = (function () {
     }
 
     if (tab === "settings") {
+
+      setSettingsAccordionSection(state.settingsSection || "resume");
 
       if (PROMPT_KEYS.some((p) => p.id === state.mode)) setPromptKey(state.mode);
 

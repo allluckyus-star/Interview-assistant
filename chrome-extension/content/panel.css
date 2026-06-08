@@ -568,12 +568,13 @@ button {
 .ia-settings {
   display: none;
   flex-direction: column;
-  gap: 10px;
+  gap: 0;
   padding: 10px;
   overflow-y: auto;
   overflow-x: hidden;
   flex: 1;
   min-height: 0;
+  min-width: 0;
   width: 100%;
 }
 
@@ -581,17 +582,92 @@ button {
   display: flex;
 }
 
-.ia-settings-card {
+.ia-settings-accordion {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
   width: 100%;
+  min-width: 0;
+}
+
+.ia-settings-section {
+  width: 100%;
+  min-width: 0;
   flex-shrink: 0;
   background: var(--ia-bg);
   border: 1px solid var(--ia-border);
   border-radius: var(--ia-radius);
   padding: 12px;
+  box-sizing: border-box;
+  overflow: hidden;
+}
+
+.ia-settings-section-toggle {
+  width: 100%;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  margin: 0;
+  padding: 2px 0;
+  border: none;
+  background: transparent;
+  color: var(--ia-ink);
+  font-size: 13px;
+  font-weight: 700;
+  text-align: left;
+  cursor: pointer;
+}
+
+.ia-settings-section-toggle:hover {
+  color: #374151;
+}
+
+.ia-settings-chevron {
+  flex-shrink: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 20px;
+  height: 20px;
+  color: var(--ia-muted);
+  transition: transform 0.22s ease;
+}
+
+.ia-settings-chevron svg {
+  width: 16px;
+  height: 16px;
+}
+
+.ia-settings-section.is-expanded .ia-settings-chevron {
+  transform: rotate(90deg);
+}
+
+.ia-settings-section-body {
+  display: grid;
+  grid-template-rows: 0fr;
+  transition: grid-template-rows 0.28s ease;
+  min-width: 0;
+}
+
+.ia-settings-section.is-expanded .ia-settings-section-body {
+  grid-template-rows: 1fr;
+}
+
+.ia-settings-section-inner {
+  overflow: hidden;
+  min-width: 0;
+  padding-top: 0;
+}
+
+.ia-settings-section.is-expanded .ia-settings-section-inner {
+  padding-top: 10px;
+}
+
+.ia-settings-card {
   display: flex;
   flex-direction: column;
   min-height: 0;
-  box-sizing: border-box;
 }
 
 .ia-settings-card--prompt {
@@ -658,6 +734,10 @@ button {
   margin-bottom: 8px;
 }
 
+.ia-settings-section-inner .ia-context-name {
+  margin-bottom: 10px;
+}
+
 .ia-context-name {
   width: 100%;
   padding: 10px 14px;
@@ -681,8 +761,6 @@ button {
   flex-direction: column;
   gap: 6px;
   margin-top: 10px;
-  max-height: 140px;
-  overflow-y: auto;
 }
 
 .ia-context-history-empty {
@@ -770,8 +848,10 @@ button {
 .ia-settings #ia-resume,
 .ia-settings #ia-jd,
 .ia-settings #ia-prompt-editor {
-  min-height: 400px;
-  height: 400px;
+  min-height: 280px;
+  height: 280px;
+  width: 100%;
+  min-width: 0;
 }
 
 .ia-settings-card--prompt .ia-prompt-editor-wrap textarea {
