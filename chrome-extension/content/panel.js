@@ -74,7 +74,7 @@ window.IaPanel = (function () {
 
     activeJdName: "",
 
-    /** Settings accordion: resume | jd | prompt — only one expanded. */
+    /** Settings accordion: resume | jd | prompt | shortcuts — only one expanded. */
     settingsSection: "resume",
     selectedResumeName: "",
 
@@ -99,6 +99,13 @@ window.IaPanel = (function () {
 
     /** User drag selection: sentence indices in getCaptionItems(). */
     selection: null,
+
+    /** ShareX listen toggles (panel image / text buttons). */
+    shareXImageListen: false,
+    shareXTextListen: false,
+
+    /** Keyboard shortcuts (Settings tab). */
+    shortcuts: null,
 
   };
 
@@ -125,6 +132,8 @@ window.IaPanel = (function () {
   let lastShareXAckId = 0;
   let sharexImageRetryAfter = 0;
   let sharexPollTick = 0;
+  let shortcutRecording = null;
+  let shortcutKeyHandler = null;
   const DRAFT_POLL_MS = 16;
   let draftPollId = null;
   let renderFeedScheduled = false;
@@ -810,10 +819,10 @@ window.IaPanel = (function () {
         void onPasteDraft(false);
         return;
       }
-      void onShareXText();
+      toggleShareXTextListen();
     });
 
-    els.btnImage.addEventListener("click", () => void onShareXImage());
+    els.btnImage.addEventListener("click", () => toggleShareXImageListen());
 
     els.btnReconnect?.addEventListener("click", () => void reconnectCompanion());
 
@@ -862,6 +871,10 @@ window.IaPanel = (function () {
 
     setupSettingsAccordion(root);
 
+    setupShortcutsSettings(root);
+
+    setupPanelShortcutListener();
+
   }
 
   function setupSettingsAccordion(root) {
@@ -891,6 +904,221 @@ window.IaPanel = (function () {
       const btn = sec.querySelector(".ia-settings-section-toggle");
       if (btn) btn.setAttribute("aria-expanded", isExpanded ? "true" : "false");
     });
+  }
+
+  async function loadPanelSettings() {
+    const S = window.IaShortcuts;
+    if (!S) return;
+    const data = await S.load();
+    state.shortcuts = data.shortcuts;
+    state.shareXImageListen = data.shareXImageListen;
+    state.shareXTextListen = data.shareXTextListen;
+    updateCaptureButtonUI();
+    renderShortcutsSettings();
+  }
+
+  async function persistPanelSettings() {
+    const S = window.IaShortcuts;
+    if (!S) return;
+    await S.save({
+      shortcuts: state.shortcuts || S.cloneDefaults(),
+      shareXImageListen: state.shareXImageListen,
+      shareXTextListen: state.shareXTextListen,
+    });
+  }
+
+  async function syncShareXListenToCompanion() {
+    if (!state.connected) return;
+    try {
+      await IaApi.post("/sharex/listen", {
+        image_enabled: state.shareXImageListen,
+        text_enabled: state.shareXTextListen,
+      });
+    } catch {
+      // companion offline
+    }
+  }
+
+  async function syncShareXShortcutsToCompanion() {
+    const S = window.IaShortcuts;
+    if (!S || !state.connected || !state.shortcuts) return;
+    try {
+      await IaApi.post("/sharex/shortcuts", {
+        image_capture: S.toCompanionBinding(state.shortcuts.imageCapture),
+        ocr: S.toCompanionBinding(state.shortcuts.ocr),
+      });
+    } catch {
+      // companion offline
+    }
+  }
+
+  function updateCaptureButtonUI() {
+    const S = window.IaShortcuts;
+    const imgCombo = S ? S.formatCombo(state.shortcuts?.imageCapture) : "Ctrl+PrtSc";
+    const txtCombo = S ? S.formatCombo(state.shortcuts?.ocr) : "Alt+.";
+
+    if (els.btnImage) {
+      els.btnImage.classList.toggle("ia-capture-active", state.shareXImageListen);
+      els.btnImage.title = state.shareXImageListen
+        ? `Image capture ON (${imgCombo}) — adds to GPT input only. Click to turn off.`
+        : `Image capture OFF — click to listen (${imgCombo}) and add to GPT input`;
+    }
+    if (els.btnText) {
+      els.btnText.classList.toggle("ia-capture-active", state.shareXTextListen);
+      els.btnText.title = state.shareXTextListen
+        ? `OCR ON (${txtCombo}) — adds to GPT input. Click to turn off. Shift+click = live caption`
+        : `OCR OFF — click to listen (${txtCombo}) and add to GPT input. Shift+click = live caption`;
+    }
+  }
+
+  async function toggleShareXImageListen() {
+    state.shareXImageListen = !state.shareXImageListen;
+    updateCaptureButtonUI();
+    await persistPanelSettings();
+    await syncShareXListenToCompanion();
+    window.IaToast?.info(
+      state.shareXImageListen ? "Image capture on — shortcut adds image to GPT input (not sent)." : "Image capture off."
+    );
+  }
+
+  async function toggleShareXTextListen() {
+    state.shareXTextListen = !state.shareXTextListen;
+    updateCaptureButtonUI();
+    await persistPanelSettings();
+    await syncShareXListenToCompanion();
+    window.IaToast?.info(
+      state.shareXTextListen ? "OCR on — shortcut adds to GPT input (not sent)." : "OCR capture off."
+    );
+  }
+
+  function renderShortcutsSettings() {
+    const list = els.settings?.querySelector("#ia-shortcuts-list");
+    const S = window.IaShortcuts;
+    if (!list || !S || !state.shortcuts) return;
+
+    list.innerHTML = "";
+    const actions = ["send", "copyGpt", "imageCapture", "ocr"];
+    actions.forEach((actionId) => {
+      const row = document.createElement("div");
+      row.className = "ia-shortcut-row";
+      row.dataset.action = actionId;
+
+      const label = document.createElement("label");
+      label.textContent = S.ACTION_LABELS[actionId] || actionId;
+
+      const combo = document.createElement("input");
+      combo.type = "text";
+      combo.className = "ia-shortcut-combo";
+      combo.readOnly = true;
+      combo.value = S.formatCombo(state.shortcuts[actionId]);
+      combo.dataset.action = actionId;
+
+      const recordBtn = document.createElement("button");
+      recordBtn.type = "button";
+      recordBtn.className = "ia-btn-upload ia-shortcut-record";
+      recordBtn.textContent = shortcutRecording === actionId ? "Press keys…" : "Record";
+      recordBtn.dataset.action = actionId;
+      if (shortcutRecording === actionId) recordBtn.classList.add("is-recording");
+
+      const resetBtn = document.createElement("button");
+      resetBtn.type = "button";
+      resetBtn.className = "ia-btn-upload ia-shortcut-reset";
+      resetBtn.textContent = "Reset";
+      resetBtn.dataset.action = actionId;
+
+      row.appendChild(label);
+      row.appendChild(combo);
+      row.appendChild(recordBtn);
+      row.appendChild(resetBtn);
+      list.appendChild(row);
+    });
+  }
+
+  function setupShortcutsSettings(root) {
+    const list = root.getElementById("ia-shortcuts-list");
+    if (!list) return;
+
+    list.addEventListener("click", (e) => {
+      const recordBtn = e.target.closest(".ia-shortcut-record");
+      const resetBtn = e.target.closest(".ia-shortcut-reset");
+      if (recordBtn) {
+        startShortcutRecording(recordBtn.dataset.action);
+        return;
+      }
+      if (resetBtn) {
+        void resetShortcut(resetBtn.dataset.action);
+      }
+    });
+  }
+
+  function startShortcutRecording(actionId) {
+    const S = window.IaShortcuts;
+    if (!S || !actionId) return;
+    shortcutRecording = actionId;
+    renderShortcutsSettings();
+    window.IaToast?.info("Press the shortcut keys (Esc to cancel)…");
+  }
+
+  async function resetShortcut(actionId) {
+    const S = window.IaShortcuts;
+    if (!S || !actionId || !state.shortcuts) return;
+    state.shortcuts[actionId] = S.cloneShortcut(S.DEFAULTS[actionId]);
+    await persistPanelSettings();
+    renderShortcutsSettings();
+    if (S.SHAREX_ACTIONS.includes(actionId)) await syncShareXShortcutsToCompanion();
+    window.IaToast?.success("Shortcut reset.");
+  }
+
+  async function applyShortcutBinding(actionId, binding) {
+    const S = window.IaShortcuts;
+    if (!S || !actionId || !binding || !state.shortcuts) return;
+    state.shortcuts[actionId] = binding;
+    shortcutRecording = null;
+    await persistPanelSettings();
+    renderShortcutsSettings();
+    if (S.SHAREX_ACTIONS.includes(actionId)) await syncShareXShortcutsToCompanion();
+    window.IaToast?.success(`Shortcut set: ${S.formatCombo(binding)}`);
+  }
+
+  function setupPanelShortcutListener() {
+    if (shortcutKeyHandler) return;
+    shortcutKeyHandler = (ev) => {
+      const S = window.IaShortcuts;
+      if (!S || !state.shortcuts) return;
+
+      if (shortcutRecording) {
+        if (ev.code === "Escape") {
+          shortcutRecording = null;
+          renderShortcutsSettings();
+          window.IaToast?.info("Shortcut recording cancelled.");
+          ev.preventDefault();
+          return;
+        }
+        const binding = S.bindingFromEvent(ev);
+        if (!binding) return;
+        ev.preventDefault();
+        ev.stopPropagation();
+        void applyShortcutBinding(shortcutRecording, binding);
+        return;
+      }
+
+      if (ev.repeat) return;
+      const target = ev.target;
+      if (target && (target.tagName === "INPUT" || target.tagName === "TEXTAREA" || target.isContentEditable)) {
+        return;
+      }
+
+      if (S.matchesEvent(ev, state.shortcuts.send)) {
+        ev.preventDefault();
+        void onSend();
+        return;
+      }
+      if (S.matchesEvent(ev, state.shortcuts.copyGpt)) {
+        ev.preventDefault();
+        void onCopyGptResult();
+      }
+    };
+    document.addEventListener("keydown", shortcutKeyHandler, true);
   }
 
 
@@ -1005,9 +1233,9 @@ window.IaPanel = (function () {
 
                   <button type="button" class="ia-icon-btn" id="ia-btn-reject" title="Skip draft">${I.close || "×"}</button>
 
-                  <button type="button" class="ia-icon-btn" id="ia-btn-image" title="ShareX Ctrl+Print Screen → GPT (automatic when ChatGPT is open)">${I.image || "▣"}</button>
+                  <button type="button" class="ia-icon-btn ia-btn-capture" id="ia-btn-image" title="Toggle image capture listening">${I.image || "▣"}</button>
 
-                  <button type="button" class="ia-icon-btn" id="ia-btn-text" title="ShareX Alt+. OCR → GPT (automatic). Shift+click = live caption">${I.text || "T"}</button>
+                  <button type="button" class="ia-icon-btn ia-btn-capture" id="ia-btn-text" title="Toggle OCR capture listening. Shift+click = live caption">${I.text || "T"}</button>
 
                   <button type="button" class="ia-icon-btn ia-btn-record" id="ia-btn-record" title="Start recording interview Q+A pairs">${I.play || "▶"}</button>
 
@@ -1095,6 +1323,22 @@ window.IaPanel = (function () {
 
                 <button type="button" class="ia-btn-save" id="ia-save-prompt">Save prompt</button>
 
+                </div>
+                </div>
+
+              </div>
+
+              <div class="ia-settings-section ia-settings-card ia-settings-card--compact is-collapsed" data-section="shortcuts">
+
+                <button type="button" class="ia-settings-section-toggle" aria-expanded="false" aria-controls="ia-settings-body-shortcuts">
+                  <span>Shortcuts</span>
+                  <span class="ia-settings-chevron" aria-hidden="true">${I.chevronRight || "›"}</span>
+                </button>
+
+                <div class="ia-settings-section-body" id="ia-settings-body-shortcuts">
+                <div class="ia-settings-section-inner ia-shortcuts-inner">
+                  <p class="ia-shortcuts-hint">Click Record, then press the key combo. Image/OCR shortcuts sync to Companion.</p>
+                  <div class="ia-shortcuts-list" id="ia-shortcuts-list"></div>
                 </div>
                 </div>
 
@@ -1671,6 +1915,8 @@ window.IaPanel = (function () {
 
     if (window.IaLayout && !window.IaLayout.isChatGptPage()) return;
 
+    await loadPanelSettings();
+
     setConnectionState("connecting");
 
     await checkCompanionHealth();
@@ -1757,6 +2003,9 @@ window.IaPanel = (function () {
       void loadPromptEditor();
 
     }
+
+    await syncShareXListenToCompanion();
+    await syncShareXShortcutsToCompanion();
 
   }
 
@@ -1943,6 +2192,8 @@ window.IaPanel = (function () {
 
       else void loadPromptEditor();
 
+      renderShortcutsSettings();
+
     }
 
     if (tab === "history" && prevTab !== "history") {
@@ -1976,6 +2227,14 @@ window.IaPanel = (function () {
 
     if (msg.type === "sharex_image" && msg.payload?.image_id) {
       const pendingId = msg.payload.pending_id || 0;
+      if (!state.shareXImageListen) {
+        if (pendingId) {
+          void IaApi.post("/sharex/ack", { pending_id: pendingId }).then(() => {
+            lastShareXAckId = Math.max(lastShareXAckId, pendingId);
+          });
+        }
+        return;
+      }
       console.log("[IA ShareX] SSE image → GPT", msg.payload.image_id);
       void (async () => {
         const attached = await deliverShareXImageFromId(msg.payload.image_id, false);
@@ -1990,6 +2249,14 @@ window.IaPanel = (function () {
 
     if (msg.type === "sharex_text" && msg.payload?.text) {
       const pendingId = msg.payload.pending_id || 0;
+      if (!state.shareXTextListen) {
+        if (pendingId) {
+          void IaApi.post("/sharex/ack", { pending_id: pendingId }).then(() => {
+            lastShareXAckId = Math.max(lastShareXAckId, pendingId);
+          });
+        }
+        return;
+      }
       console.log("[IA ShareX] SSE text → GPT", msg.payload.text.length, "chars");
       void (async () => {
         await deliverShareXText(msg.payload.text, false);
@@ -2392,7 +2659,7 @@ window.IaPanel = (function () {
       console.log("[IA ShareX] poll → GPT", d);
 
       if (d.image_id) {
-        if (shareXImageInProgress) return;
+        if (!state.shareXImageListen || shareXImageInProgress) return;
         const attached = await deliverShareXImageFromId(d.image_id, false);
         if (attached) {
           await IaApi.post("/sharex/ack", { pending_id: d.pending_id });
@@ -2404,7 +2671,7 @@ window.IaPanel = (function () {
       }
 
       if (d.text) {
-        if (shareXTextInProgress) return;
+        if (!state.shareXTextListen || shareXTextInProgress) return;
         await deliverShareXText(d.text, false);
       }
 
@@ -2483,7 +2750,7 @@ window.IaPanel = (function () {
     }
     console.log("[IA ShareX] attach result", result);
     if (result?.ok) {
-      if (!quiet) window.IaToast?.success("ShareX image added to prompt. Send when ready.");
+      if (!quiet) window.IaToast?.success("Image added to GPT input (not sent).");
       return true;
     }
     if (!quiet) window.IaToast?.warning(sendFailureMessage(result));
@@ -2512,7 +2779,7 @@ window.IaPanel = (function () {
   function formatShareXCapturedText(raw) {
     const t = String(raw || "").trim();
     if (!t) return "";
-    return `Captured Text: "${t}"  \\`;
+    return `Captured Text: "${t}"\n`;
   }
 
   async function deliverShareXText(text, quiet) {
@@ -2524,9 +2791,9 @@ window.IaPanel = (function () {
         if (!quiet) window.IaToast?.warning("ShareX OCR returned no text.");
         return;
       }
-      const result = await pasteTextToComposer(formatShareXCapturedText(t), false, true);
+      const result = await pasteTextToComposer(formatShareXCapturedText(t), true, false);
       if (result?.ok && !quiet) {
-        window.IaToast?.success("ShareX OCR pasted into prompt (not sent).");
+        window.IaToast?.success("OCR added to GPT input (not sent).");
       }
     } catch (e) {
       if (!quiet) window.IaToast?.error(String(e.message || e));

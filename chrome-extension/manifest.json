@@ -4,7 +4,7 @@
 
   "name": "Interview Assistant",
 
-  "version": "0.2.78",
+  "version": "0.2.82",
 
   "description": "Live captions + interview modes alongside ChatGPT (requires Companion tray app).",
 
@@ -65,6 +65,8 @@
         "content/api.js",
 
         "content/caption-sentences.js",
+
+        "content/shortcuts.js",
 
         "content/icons.js",
 

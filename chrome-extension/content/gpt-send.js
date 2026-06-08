@@ -1221,3 +1221,9 @@ window.__iaExtensionAttachImage = function (imagePngBase64) {
   }
   return __iaAttachImageViaPageBridge(imagePngBase64);
 };
+
+window.__iaExtensionSubmitComposer = async function () {
+  await __iaWait(320);
+  var sent = await __iaTrySubmitWithRetry(22000);
+  return sent ? { ok: true } : { ok: false, error: "send_button_disabled" };
+};

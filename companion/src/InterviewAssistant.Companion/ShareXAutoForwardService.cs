@@ -2,13 +2,14 @@ using InterviewAssistant.App.Services;
 
 namespace InterviewAssistant.Companion;
 
-/// <summary>Arm on ShareX shortcuts only, then capture the first clipboard change and stop.</summary>
+/// <summary>Arm on ShareX shortcuts only when extension listen toggles are on.</summary>
 internal sealed class ShareXAutoForwardService : IDisposable
 {
     private readonly CompanionClipboardService _clipboard;
     private readonly Action<ShareXImageResponse> _onImageReady;
     private readonly Action<ShareXTextResponse> _onTextReady;
     private readonly ShareXHotkeyService _shortcuts;
+    private readonly ShareXListenState _listenState;
     private readonly object _waitGate = new();
     private CancellationTokenSource? _waitCts;
     private int _armedKind;
@@ -19,22 +20,26 @@ internal sealed class ShareXAutoForwardService : IDisposable
 
     public ShareXAutoForwardService(
         CompanionClipboardService clipboard,
+        ShareXListenState listenState,
         Action<ShareXImageResponse> onImageReady,
         Action<ShareXTextResponse> onTextReady)
     {
         _clipboard = clipboard;
+        _listenState = listenState;
         _onImageReady = onImageReady;
         _onTextReady = onTextReady;
         _shortcuts = new ShareXHotkeyService();
 
-        _shortcuts.ImageShortcutPressed += () => TryArmImage("Ctrl+PrtSc");
-        _shortcuts.TextShortcutPressed += () => TryArmText("Alt+.");
+        _shortcuts.ImageShortcutPressed += () => TryArmImage("shortcut");
+        _shortcuts.TextShortcutPressed += () => TryArmText("shortcut");
     }
+
+    public ShareXHotkeyService Shortcuts => _shortcuts;
 
     public void Start()
     {
         _shortcuts.Start();
-        StartupDiagnostics.Log("[IA ShareX] armed-wait mode (shortcut → first clipboard change only)");
+        StartupDiagnostics.Log("[IA ShareX] armed-wait mode (listen toggles + shortcut → clipboard)");
     }
 
     private CancellationToken BeginWait(int kind)
@@ -60,6 +65,9 @@ internal sealed class ShareXAutoForwardService : IDisposable
 
     private void TryArmImage(string reason)
     {
+        if (!_listenState.ImageEnabled)
+            return;
+
         lock (_waitGate)
         {
             if (_armedKind == ArmedText)
@@ -73,6 +81,9 @@ internal sealed class ShareXAutoForwardService : IDisposable
 
     private void TryArmText(string reason)
     {
+        if (!_listenState.TextEnabled)
+            return;
+
         BeginWait(ArmedText);
         StartupDiagnostics.Log($"[IA ShareX] armed OCR ({reason}) — waiting for first clipboard text");
         _ = RunTextWaitAsync();

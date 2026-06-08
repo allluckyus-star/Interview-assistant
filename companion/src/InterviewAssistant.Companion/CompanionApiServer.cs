@@ -28,6 +28,7 @@ public sealed class CompanionApiServer : IDisposable
     private CancellationTokenSource? _cts;
     private Task? _serverTask;
     private readonly ConcurrentDictionary<Guid, StreamWriter> _sseClients = new();
+    private readonly ShareXListenState _shareXListen = new();
     private readonly ShareXAutoForwardService _shareXAutoForward;
 
     public CompanionApiServer(CompanionSessionService session, CompanionClipboardService clipboard, string host = "127.0.0.1", int port = 1212)
@@ -38,6 +39,7 @@ public sealed class CompanionApiServer : IDisposable
         _port = port;
         _shareXAutoForward = new ShareXAutoForwardService(
             _clipboard,
+            _shareXListen,
             img =>
             {
                 var pendingId = ShareXPendingBus.PublishImage(img.ImageId!);
@@ -208,6 +210,25 @@ public sealed class CompanionApiServer : IDisposable
                     }
 
                     await WriteJsonAsync(ctx, pending);
+                    return;
+                }
+
+                if (path == "/sharex/listen")
+                {
+                    var (image, text) = _shareXListen.Snapshot();
+                    await WriteJsonAsync(ctx, new { ok = true, image_enabled = image, text_enabled = text });
+                    return;
+                }
+
+                if (path == "/sharex/shortcuts")
+                {
+                    var (image, text) = _shareXAutoForward.Shortcuts.GetBindings();
+                    await WriteJsonAsync(ctx, new
+                    {
+                        ok = true,
+                        image_capture = SerializeShareXBinding(image),
+                        ocr = SerializeShareXBinding(text),
+                    });
                     return;
                 }
 
@@ -407,6 +428,39 @@ public sealed class CompanionApiServer : IDisposable
                     }
 
                     await WriteJsonAsync(ctx, new { ok = false, error = result.Error ?? "sharex_text_failed" });
+                    return;
+                }
+
+                if (path == "/sharex/listen")
+                {
+                    var body = await ReadJsonBodyAsync(ctx);
+                    var imageEnabled = body.TryGetProperty("image_enabled", out var imgEl) && imgEl.ValueKind == JsonValueKind.True
+                        ? true
+                        : body.TryGetProperty("image_enabled", out imgEl) && imgEl.ValueKind == JsonValueKind.False
+                            ? false
+                            : (bool?)null;
+                    var textEnabled = body.TryGetProperty("text_enabled", out var txtEl) && txtEl.ValueKind == JsonValueKind.True
+                        ? true
+                        : body.TryGetProperty("text_enabled", out txtEl) && txtEl.ValueKind == JsonValueKind.False
+                            ? false
+                            : (bool?)null;
+                    var (image, text) = _shareXListen.Update(imageEnabled, textEnabled);
+                    StartupDiagnostics.Log($"[IA ShareX] listen image={image} text={text}");
+                    await WriteJsonAsync(ctx, new { ok = true, image_enabled = image, text_enabled = text });
+                    return;
+                }
+
+                if (path == "/sharex/shortcuts")
+                {
+                    var body = await ReadJsonBodyAsync(ctx);
+                    ShareXShortcutBinding? image = null;
+                    ShareXShortcutBinding? text = null;
+                    if (body.TryGetProperty("image_capture", out var imgCap))
+                        image = ParseShareXShortcutBinding(imgCap);
+                    if (body.TryGetProperty("ocr", out var ocrCap))
+                        text = ParseShareXShortcutBinding(ocrCap);
+                    _shareXAutoForward.Shortcuts.UpdateBindings(image, text);
+                    await WriteJsonAsync(ctx, new { ok = true });
                     return;
                 }
 
@@ -815,6 +869,44 @@ public sealed class CompanionApiServer : IDisposable
                 break;
         }
     }
+
+    private static ShareXShortcutBinding? ParseShareXShortcutBinding(JsonElement el)
+    {
+        if (el.ValueKind != JsonValueKind.Object)
+            return null;
+
+        var ctrl = el.TryGetProperty("ctrl", out var c) && c.GetBoolean();
+        var alt = el.TryGetProperty("alt", out var a) && a.GetBoolean();
+        var shift = el.TryGetProperty("shift", out var s) && s.GetBoolean();
+        var keyVk = el.TryGetProperty("key_vk", out var vk) && vk.TryGetInt32(out var v) ? v : 0;
+        if (keyVk <= 0)
+            return null;
+
+        int[]? altVks = null;
+        if (el.TryGetProperty("alt_key_vks", out var altArr) && altArr.ValueKind == JsonValueKind.Array)
+        {
+            var list = new List<int>();
+            foreach (var item in altArr.EnumerateArray())
+            {
+                if (item.TryGetInt32(out var av) && av > 0 && av != keyVk)
+                    list.Add(av);
+            }
+
+            if (list.Count > 0)
+                altVks = list.ToArray();
+        }
+
+        return new ShareXShortcutBinding(ctrl, alt, shift, keyVk, altVks);
+    }
+
+    private static object SerializeShareXBinding(ShareXShortcutBinding binding) => new
+    {
+        ctrl = binding.Ctrl,
+        alt = binding.Alt,
+        shift = binding.Shift,
+        key_vk = binding.KeyVk,
+        alt_key_vks = binding.AltKeyVks ?? Array.Empty<int>(),
+    };
 
     public void Dispose()
     {
