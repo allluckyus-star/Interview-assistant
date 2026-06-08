@@ -859,6 +859,11 @@ async function __iaWpfAttachPreparedFileToComposer(file) {
 
   var chip = false;
 
+  if (isImg) {
+    await tryMenuAndFileInput();
+    chip = await __iaWaitForComposerAttachment(attachRoot, 11000, fileHint);
+  }
+
   // Documents (.txt, etc.): ChatGPT usually needs + → upload menu + real file input (not image-only or drag alone).
   if (!isImg) {
     await tryMenuAndFileInput();
@@ -952,6 +957,26 @@ window.__iaWpfAttachImageToComposer = function (imagePngBase64) {
   return __iaWpfAttachPngToComposer(imagePngBase64);
 };
 
+function __iaInsertTextAtCursor(composer, chunk) {
+  if (!(composer instanceof HTMLElement) || !chunk) return false;
+  try {
+    composer.focus({ preventScroll: true });
+  } catch (_e) {
+    try {
+      composer.focus();
+    } catch (_e2) {}
+  }
+  try {
+    if (document.execCommand("insertText", false, chunk)) {
+      composer.dispatchEvent(
+        new InputEvent("input", { bubbles: true, composed: true, inputType: "insertText" })
+      );
+      return true;
+    }
+  } catch (_e3) {}
+  return false;
+}
+
 function __iaInsertTextAtComposerEnd(composer, chunk) {
   if (!(composer instanceof HTMLElement) || !chunk) return false;
   try {
@@ -979,7 +1004,7 @@ function __iaInsertTextAtComposerEnd(composer, chunk) {
   return false;
 }
 
-async function __iaPasteTextToComposerCore(text, append) {
+async function __iaPasteTextToComposerCore(text, append, insertAtCursor) {
   var t = String(text ?? "");
   if (!t.trim()) {
     return { ok: false, error: "text_missing" };
@@ -1002,6 +1027,14 @@ async function __iaPasteTextToComposerCore(text, append) {
     } catch (_e3) {}
   }
   await __iaWait(120);
+
+  if (insertAtCursor === true) {
+    if (__iaInsertTextAtCursor(composer, t)) {
+      return { ok: true, phase: "pasted" };
+    }
+    return { ok: false, error: "could_not_insert" };
+  }
+
   var existing = (composer.innerText || composer.textContent || composer.value || "").trim();
   if (append !== false && existing) {
     if (__iaInsertTextAtComposerEnd(composer, "\n\n" + t)) {
@@ -1041,8 +1074,8 @@ function __iaComposerContainsNeedle(needle) {
 }
 
 window.__iaWpfComposerContainsNeedle = __iaComposerContainsNeedle;
-window.__iaWpfPasteTextToComposer = function (text, append) {
-  return __iaPasteTextToComposerCore(text, append);
+window.__iaWpfPasteTextToComposer = function (text, append, insertAtCursor) {
+  return __iaPasteTextToComposerCore(text, append, insertAtCursor);
 };
 
 (function __iaInstallWebViewMessageBridge() {
@@ -1144,9 +1177,47 @@ window.__iaExtensionGetLatestAssistantText = function () {
     return "";
   }
 };
-window.__iaExtensionPasteDraft = function (text, append) {
+window.__iaExtensionPasteDraft = function (text, append, insertAtCursor) {
   if (window.__iaWpfPasteTextToComposer) {
-    return window.__iaWpfPasteTextToComposer(text, append !== false);
+    return window.__iaWpfPasteTextToComposer(text, append !== false, insertAtCursor === true);
   }
   return Promise.resolve({ ok: false, error: "paste_unavailable" });
+};
+
+function __iaAttachImageViaPageBridge(imagePngBase64) {
+  return new Promise(function (resolve) {
+    var requestId = "ia-img-" + Date.now() + "-" + Math.random().toString(36).slice(2);
+    var done = false;
+    function finish(result) {
+      if (done) return;
+      done = true;
+      window.removeEventListener("message", onMsg);
+      clearTimeout(timer);
+      resolve(result);
+    }
+    function onMsg(e) {
+      if (e.source !== window || !e.data || e.data.type !== "IA_ATTACH_IMAGE_RESULT") return;
+      if (e.data.requestId !== requestId) return;
+      finish(e.data.result || { ok: false, error: "empty_result" });
+    }
+    window.addEventListener("message", onMsg);
+    window.postMessage(
+      {
+        type: "IA_ATTACH_IMAGE",
+        requestId: requestId,
+        imagePngBase64: String(imagePngBase64 || ""),
+      },
+      "*"
+    );
+    var timer = setTimeout(function () {
+      finish({ ok: false, error: "attach_timeout" });
+    }, 45000);
+  });
+}
+
+window.__iaExtensionAttachImage = function (imagePngBase64) {
+  if (window.__iaWpfAttachImageToComposer && window.chrome && window.chrome.webview) {
+    return Promise.resolve(window.__iaWpfAttachImageToComposer(imagePngBase64));
+  }
+  return __iaAttachImageViaPageBridge(imagePngBase64);
 };

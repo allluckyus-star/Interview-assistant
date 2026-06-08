@@ -32,8 +32,18 @@ internal static class Program
             using var session = new CompanionSessionService();
             StartupDiagnostics.Log("Companion: session created");
 
-            using var api = new CompanionApiServer(session);
+            var clipboard = new CompanionClipboardService();
+            using var api = new CompanionApiServer(session, clipboard);
             StartupDiagnostics.Log("Companion: API object created");
+
+            try
+            {
+                CompanionSnipDispatcher.Get();
+            }
+            catch (Exception ex)
+            {
+                StartupDiagnostics.Log($"Companion: clipboard dispatcher start failed: {ex}");
+            }
 
             try
             {

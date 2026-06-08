@@ -120,6 +120,11 @@ window.IaPanel = (function () {
 
   const AUTOSCROLL_RESUME_MS = 2000;
   const HEALTH_POLL_MS = 3000;
+  let shareXImageInProgress = false;
+  let shareXTextInProgress = false;
+  let lastShareXAckId = 0;
+  let sharexImageRetryAfter = 0;
+  let sharexPollTick = 0;
   const DRAFT_POLL_MS = 16;
   let draftPollId = null;
   let renderFeedScheduled = false;
@@ -433,7 +438,9 @@ window.IaPanel = (function () {
     if (err.includes("send_button_disabled")) return "Send failed. Send button disabled.";
     if (err.includes("composer_not_found")) return "Send failed. GPT not ready.";
     if (err.includes("could_not_insert")) return "Send failed. Could not insert prompt.";
-    if (err.includes("prep_already_in_flight")) return "Send failed. Busy.";
+    if (err.includes("attachment_not_visible")) return "ShareX image failed. Click the ChatGPT box and try again.";
+    if (err.includes("sharex_timeout")) return "ShareX timed out. Use your shortcut, then try again.";
+    if (err.includes("companion_disconnected")) return "Companion disconnected during ShareX wait.";
     if (err) return `Send failed. ${err.split(":")[0]}`;
     if (result?.ok && result?.phase !== "sent") return `Send failed. Bad phase (${result?.phase || "?"}).`;
     return "Send failed. Not confirmed.";
@@ -501,7 +508,7 @@ window.IaPanel = (function () {
     }
   }
 
-  async function pasteTextToComposer(text, append) {
+  async function pasteTextToComposer(text, append, insertAtCursor) {
     const t = String(text || "").trim();
     if (!t) {
       window.IaToast?.warning("Nothing to paste.");
@@ -516,7 +523,11 @@ window.IaPanel = (function () {
       window.IaToast?.warning("Paste failed. Pipeline missing.");
       return { ok: false };
     }
-    const result = await window.__iaExtensionPasteDraft(t, append !== false);
+    const result = await window.__iaExtensionPasteDraft(
+      t,
+      append !== false,
+      insertAtCursor === true
+    );
     if (result?.ok) return result;
     window.IaToast?.warning(sendFailureMessage(result));
     return result || { ok: false };
@@ -794,9 +805,15 @@ window.IaPanel = (function () {
 
     els.btnSave.addEventListener("click", onSaveEdit);
 
-    els.btnText.addEventListener("click", () => onPasteDraft(false));
+    els.btnText.addEventListener("click", (e) => {
+      if (e.shiftKey) {
+        void onPasteDraft(false);
+        return;
+      }
+      void onShareXText();
+    });
 
-    els.btnImage.addEventListener("click", () => onPasteDraft(false));
+    els.btnImage.addEventListener("click", () => void onShareXImage());
 
     els.btnReconnect?.addEventListener("click", () => void reconnectCompanion());
 
@@ -988,9 +1005,9 @@ window.IaPanel = (function () {
 
                   <button type="button" class="ia-icon-btn" id="ia-btn-reject" title="Skip draft">${I.close || "×"}</button>
 
-                  <button type="button" class="ia-icon-btn" id="ia-btn-image" title="Paste draft">${I.image || "▣"}</button>
+                  <button type="button" class="ia-icon-btn" id="ia-btn-image" title="ShareX Ctrl+Print Screen → GPT (automatic when ChatGPT is open)">${I.image || "▣"}</button>
 
-                  <button type="button" class="ia-icon-btn" id="ia-btn-text" title="Paste draft to composer">${I.text || "T"}</button>
+                  <button type="button" class="ia-icon-btn" id="ia-btn-text" title="ShareX Alt+. OCR → GPT (automatic). Shift+click = live caption">${I.text || "T"}</button>
 
                   <button type="button" class="ia-icon-btn ia-btn-record" id="ia-btn-record" title="Start recording interview Q+A pairs">${I.play || "▶"}</button>
 
@@ -1810,6 +1827,10 @@ window.IaPanel = (function () {
 
   async function pollDraftFast() {
     if (!state.connected) return;
+
+    sharexPollTick = (sharexPollTick + 1) % 15;
+    if (sharexPollTick === 0) void pollShareXPending();
+
     const path = captionResyncPending ? "/draft?full=1" : "/draft";
     const draft = await IaApi.get(path);
     if (!draft.ok || !draft.data || draft.data.changed === false) return;
@@ -1953,9 +1974,33 @@ window.IaPanel = (function () {
 
     }
 
+    if (msg.type === "sharex_image" && msg.payload?.image_id) {
+      const pendingId = msg.payload.pending_id || 0;
+      console.log("[IA ShareX] SSE image → GPT", msg.payload.image_id);
+      void (async () => {
+        const attached = await deliverShareXImageFromId(msg.payload.image_id, false);
+        if (attached && pendingId) {
+          await IaApi.post("/sharex/ack", { pending_id: pendingId });
+          lastShareXAckId = Math.max(lastShareXAckId, pendingId);
+        } else if (!attached) {
+          sharexImageRetryAfter = Date.now() + 2000;
+        }
+      })();
+    }
+
+    if (msg.type === "sharex_text" && msg.payload?.text) {
+      const pendingId = msg.payload.pending_id || 0;
+      console.log("[IA ShareX] SSE text → GPT", msg.payload.text.length, "chars");
+      void (async () => {
+        await deliverShareXText(msg.payload.text, false);
+        if (pendingId) {
+          await IaApi.post("/sharex/ack", { pending_id: pendingId });
+          lastShareXAckId = Math.max(lastShareXAckId, pendingId);
+        }
+      })();
+    }
+
   }
-
-
 
   function renderFeed() {
     if (state.editingKey) return;
@@ -2334,6 +2379,216 @@ window.IaPanel = (function () {
     const result = await pasteTextToComposer(text, append !== false);
     if (result?.ok) {
       window.IaToast?.success("Live caption pasted into prompt (not sent).");
+    }
+  }
+
+  async function pollShareXPending() {
+    if (Date.now() < sharexImageRetryAfter) return;
+    try {
+      const r = await IaApi.get(`/sharex/pending?after=${lastShareXAckId}`);
+      const d = r?.data;
+      if (!r?.ok || !d?.pending_id || d.pending_id <= lastShareXAckId) return;
+
+      console.log("[IA ShareX] poll → GPT", d);
+
+      if (d.image_id) {
+        if (shareXImageInProgress) return;
+        const attached = await deliverShareXImageFromId(d.image_id, false);
+        if (attached) {
+          await IaApi.post("/sharex/ack", { pending_id: d.pending_id });
+          lastShareXAckId = d.pending_id;
+        } else {
+          sharexImageRetryAfter = Date.now() + 2000;
+        }
+        return;
+      }
+
+      if (d.text) {
+        if (shareXTextInProgress) return;
+        await deliverShareXText(d.text, false);
+      }
+
+      await IaApi.post("/sharex/ack", { pending_id: d.pending_id });
+      lastShareXAckId = d.pending_id;
+    } catch (e) {
+      console.warn("[IA ShareX] poll failed", e);
+    }
+  }
+
+  function formatShareXError(r, data) {
+    if (r?.error === "sharex_timeout") return "ShareX timed out. Use your shortcut, then try again.";
+    if (r?.error === "companion_disconnected") return "Companion disconnected. Restart tray app.";
+    if (data?.cancelled) return "ShareX cancelled or timed out.";
+    return data?.error || r?.error || "ShareX failed.";
+  }
+
+  async function readShareXImageBase64(data) {
+    const key = data?.sharex_storage_key;
+    if (key && chrome?.storage?.session) {
+      const stored = await chrome.storage.session.get(key);
+      const b64 = stored?.[key];
+      try {
+        await chrome.storage.session.remove(key);
+      } catch {
+        // ignore
+      }
+      if (b64) return b64;
+    }
+    return "";
+  }
+
+  async function fetchShareXImageById(imageId) {
+    if (!imageId || !chrome?.runtime?.sendMessage) return "";
+    try {
+      const r = await chrome.runtime.sendMessage({
+        type: "ia_fetch_sharex_image",
+        image_id: imageId,
+      });
+      if (!r?.ok) {
+        console.warn("[IA ShareX] fetch failed", imageId, r?.error);
+        return "";
+      }
+      if (r.data?.image_base64) return r.data.image_base64;
+      return readShareXImageBase64(r.data);
+    } catch (e) {
+      console.warn("[IA ShareX] fetch error", imageId, e);
+      return "";
+    }
+  }
+
+  async function attachShareXImageBase64(b64, quiet) {
+    if (!b64) {
+      if (!quiet) window.IaToast?.warning("ShareX returned no image.");
+      return false;
+    }
+
+    const ready = window.__iaExtensionGetGptReady?.();
+    if (!ready?.ok) {
+      if (!quiet) window.IaToast?.warning(gptNotReadyMessage(ready));
+      return false;
+    }
+
+    const attach = window.__iaExtensionAttachImage;
+    if (!attach) {
+      if (!quiet) window.IaToast?.warning("Attach failed. Pipeline missing.");
+      return false;
+    }
+
+    if (!quiet) window.IaToast?.loading("Adding ShareX image to ChatGPT…");
+    let result;
+    try {
+      result = await attach(b64);
+    } finally {
+      if (!quiet) window.IaToast?.clearLoading();
+    }
+    console.log("[IA ShareX] attach result", result);
+    if (result?.ok) {
+      if (!quiet) window.IaToast?.success("ShareX image added to prompt. Send when ready.");
+      return true;
+    }
+    if (!quiet) window.IaToast?.warning(sendFailureMessage(result));
+    return false;
+  }
+
+  async function deliverShareXImageFromId(imageId, quiet) {
+    if (shareXImageInProgress) return false;
+    shareXImageInProgress = true;
+    try {
+      const b64 = await fetchShareXImageById(imageId);
+      if (!b64) {
+        console.warn("[IA ShareX] image fetch failed for", imageId);
+        return false;
+      }
+      return await attachShareXImageBase64(b64, quiet);
+    } catch (e) {
+      if (!quiet) window.IaToast?.error(String(e.message || e));
+      console.warn("[IA ShareX] deliver image failed", e);
+      return false;
+    } finally {
+      shareXImageInProgress = false;
+    }
+  }
+
+  function formatShareXCapturedText(raw) {
+    const t = String(raw || "").trim();
+    if (!t) return "";
+    return `Captured Text: "${t}"  \\`;
+  }
+
+  async function deliverShareXText(text, quiet) {
+    if (shareXTextInProgress) return;
+    shareXTextInProgress = true;
+    try {
+      const t = String(text || "").trim();
+      if (!t) {
+        if (!quiet) window.IaToast?.warning("ShareX OCR returned no text.");
+        return;
+      }
+      const result = await pasteTextToComposer(formatShareXCapturedText(t), false, true);
+      if (result?.ok && !quiet) {
+        window.IaToast?.success("ShareX OCR pasted into prompt (not sent).");
+      }
+    } catch (e) {
+      if (!quiet) window.IaToast?.error(String(e.message || e));
+    } finally {
+      shareXTextInProgress = false;
+    }
+  }
+
+  async function onShareXImage() {
+    if (shareXImageInProgress) return;
+    shareXImageInProgress = true;
+    try {
+      window.IaToast?.loading("ShareX: press Ctrl+Print Screen, select area…");
+      const r = await IaApi.post("/sharex/wait-image", {});
+      window.IaToast?.clearLoading();
+      const data = r?.data || {};
+
+      if (!r?.ok) {
+        window.IaToast?.warning(formatShareXError(r, data));
+        return;
+      }
+      if (data.cancelled) {
+        window.IaToast?.warning("ShareX cancelled or timed out.");
+        return;
+      }
+      if (data.ok === false) {
+        window.IaToast?.warning(formatShareXError(r, data));
+        return;
+      }
+
+      const b64 = await readShareXImageBase64(data);
+      await attachShareXImageBase64(b64, false);
+    } catch (e) {
+      window.IaToast?.clearLoading();
+      window.IaToast?.error(String(e.message || e));
+    } finally {
+      shareXImageInProgress = false;
+    }
+  }
+
+  async function onShareXText() {
+    if (shareXTextInProgress) return;
+    shareXTextInProgress = true;
+    try {
+      window.IaToast?.loading("ShareX: press Alt+., select text area…");
+      const r = await IaApi.post("/sharex/wait-text", {});
+      window.IaToast?.clearLoading();
+      const data = r?.data || {};
+
+      if (!r?.ok || data.cancelled || data.ok === false) {
+        window.IaToast?.warning(formatShareXError(r, data));
+        return;
+      }
+
+      const text = (data.text || "").trim();
+      shareXTextInProgress = false;
+      await deliverShareXText(text, false);
+    } catch (e) {
+      window.IaToast?.clearLoading();
+      window.IaToast?.error(String(e.message || e));
+    } finally {
+      shareXTextInProgress = false;
     }
   }
 

@@ -38,6 +38,7 @@
     <Compile Include="..\..\..\c#project\src\InterviewAssistant.App\ResumeJdStore.cs" Link="Linked\ResumeJdStore.cs" />
     <Compile Include="..\..\..\c#project\src\InterviewAssistant.App\PromptTemplateResolver.cs" Link="Linked\PromptTemplateResolver.cs" />
     <Compile Include="..\..\..\c#project\src\InterviewAssistant.App\Services\StartupDiagnostics.cs" Link="Linked\StartupDiagnostics.cs" />
+    <Compile Include="..\..\..\c#project\src\InterviewAssistant.App\Services\WindowsScreenSnipCapture.cs" Link="Linked\WindowsScreenSnipCapture.cs" />
   </ItemGroup>
 
   <ItemGroup>

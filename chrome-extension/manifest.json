@@ -4,7 +4,7 @@
 
   "name": "Interview Assistant",
 
-  "version": "0.2.65",
+  "version": "0.2.78",
 
   "description": "Live captions + interview modes alongside ChatGPT (requires Companion tray app).",
 
@@ -37,6 +37,18 @@
       "css": ["content/layout.css"],
 
       "run_at": "document_start"
+
+    },
+
+    {
+
+      "matches": ["https://chatgpt.com/*", "https://chat.openai.com/*"],
+
+      "js": ["content/gpt-page-bridge.js"],
+
+      "world": "MAIN",
+
+      "run_at": "document_idle"
 
     },
 

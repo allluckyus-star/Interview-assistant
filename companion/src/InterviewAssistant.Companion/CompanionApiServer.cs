@@ -21,18 +21,35 @@ public sealed class CompanionApiServer : IDisposable
     };
 
     private readonly CompanionSessionService _session;
+    private readonly CompanionClipboardService _clipboard;
     private readonly string _host;
     private readonly int _port;
     private WebApplication? _app;
     private CancellationTokenSource? _cts;
     private Task? _serverTask;
     private readonly ConcurrentDictionary<Guid, StreamWriter> _sseClients = new();
+    private readonly ShareXAutoForwardService _shareXAutoForward;
 
-    public CompanionApiServer(CompanionSessionService session, string host = "127.0.0.1", int port = 1212)
+    public CompanionApiServer(CompanionSessionService session, CompanionClipboardService clipboard, string host = "127.0.0.1", int port = 1212)
     {
         _session = session;
+        _clipboard = clipboard;
         _host = host;
         _port = port;
+        _shareXAutoForward = new ShareXAutoForwardService(
+            _clipboard,
+            img =>
+            {
+                var pendingId = ShareXPendingBus.PublishImage(img.ImageId!);
+                StartupDiagnostics.Log($"[IA ShareX] SSE image pending={pendingId} id={img.ImageId}");
+                BroadcastSse("sharex_image", new { image_id = img.ImageId, pending_id = pendingId });
+            },
+            txt =>
+            {
+                var pendingId = ShareXPendingBus.PublishText(txt.Text!);
+                StartupDiagnostics.Log($"[IA ShareX] SSE text pending={pendingId} len={txt.Text?.Length ?? 0}");
+                BroadcastSse("sharex_text", new { text = txt.Text, pending_id = pendingId });
+            });
         _session.DraftChanged += _ =>
         {
             if (_session.TryBuildDraftPayload(forceFullCaption: false, out var payload) && payload is not null)
@@ -62,6 +79,7 @@ public sealed class CompanionApiServer : IDisposable
         _app = app;
         _cts = new CancellationTokenSource();
         _serverTask = app.StartAsync(_cts.Token);
+        _shareXAutoForward.Start();
         StartupDiagnostics.Log($"Companion: Kestrel listening on {url}");
         Debug.WriteLine($"[Companion] API {url}/");
     }
@@ -160,6 +178,36 @@ public sealed class CompanionApiServer : IDisposable
                 if (path is "/health" or "/ping")
                 {
                     await WriteJsonAsync(ctx, new { ok = true, service = "interview-assistant-companion" });
+                    return;
+                }
+
+                if (path.StartsWith("/sharex/image/", StringComparison.Ordinal))
+                {
+                    var imageId = Uri.UnescapeDataString(path["/sharex/image/".Length..].Trim());
+                    var png = CompanionImageCache.Peek(imageId);
+                    if (png is null || png.Length == 0)
+                    {
+                        await WriteJsonAsync(ctx, new { ok = false, error = "not_found" }, StatusCodes.Status404NotFound);
+                        return;
+                    }
+
+                    ctx.Response.ContentType = "image/png";
+                    await ctx.Response.Body.WriteAsync(png);
+                    return;
+                }
+
+                if (path == "/sharex/pending")
+                {
+                    var afterRaw = ctx.Request.Query["after"].ToString();
+                    _ = int.TryParse(afterRaw, out var afterId);
+                    var pending = ShareXPendingBus.GetPending(afterId);
+                    if (pending is null)
+                    {
+                        await WriteJsonAsync(ctx, new { ok = true, pending_id = 0 });
+                        return;
+                    }
+
+                    await WriteJsonAsync(ctx, pending);
                     return;
                 }
 
@@ -307,6 +355,61 @@ public sealed class CompanionApiServer : IDisposable
 
             if (HttpMethods.IsPost(ctx.Request.Method))
             {
+                if (path == "/sharex/ack")
+                {
+                    var body = await ReadJsonBodyAsync(ctx);
+                    var pendingId = body.TryGetProperty("pending_id", out var idEl) && idEl.TryGetInt32(out var pid)
+                        ? pid
+                        : 0;
+                    var (ok, imageId) = ShareXPendingBus.Ack(pendingId);
+                    if (ok && !string.IsNullOrEmpty(imageId))
+                        CompanionImageCache.Remove(imageId);
+                    await WriteJsonAsync(ctx, new { ok });
+                    return;
+                }
+
+                if (path == "/sharex/wait-image")
+                {
+                    StartupDiagnostics.Log("[IA ShareX] wait-image started");
+                    var result = await _clipboard.WaitForShareXImageAsync(CancellationToken.None).ConfigureAwait(false);
+                    if (result.Ok)
+                    {
+                        StartupDiagnostics.Log($"[IA ShareX] wait-image ok id={result.ImageId}");
+                        await WriteJsonAsync(ctx, new { ok = true, image_id = result.ImageId });
+                        return;
+                    }
+
+                    if (result.Cancelled)
+                    {
+                        await WriteJsonAsync(ctx, new { ok = false, cancelled = true });
+                        return;
+                    }
+
+                    await WriteJsonAsync(ctx, new { ok = false, error = result.Error ?? "sharex_image_failed" });
+                    return;
+                }
+
+                if (path == "/sharex/wait-text")
+                {
+                    StartupDiagnostics.Log("[IA ShareX] wait-text started");
+                    var result = await _clipboard.WaitForShareXTextAsync(CancellationToken.None).ConfigureAwait(false);
+                    if (result.Ok)
+                    {
+                        StartupDiagnostics.Log($"[IA ShareX] wait-text ok len={result.Text?.Length ?? 0}");
+                        await WriteJsonAsync(ctx, new { ok = true, text = result.Text });
+                        return;
+                    }
+
+                    if (result.Cancelled)
+                    {
+                        await WriteJsonAsync(ctx, new { ok = false, cancelled = true });
+                        return;
+                    }
+
+                    await WriteJsonAsync(ctx, new { ok = false, error = result.Error ?? "sharex_text_failed" });
+                    return;
+                }
+
                 if (path == "/session/start")
                 {
                     if (!_session.IsRunning)
@@ -713,5 +816,9 @@ public sealed class CompanionApiServer : IDisposable
         }
     }
 
-    public void Dispose() => Stop();
+    public void Dispose()
+    {
+        _shareXAutoForward.Dispose();
+        Stop();
+    }
 }

@@ -1,4 +1,5 @@
 const API_BASE = "http://127.0.0.1:1212";
+const SHAREX_STORAGE_KEY = "ia_sharex_b64";
 
 function isChatGptUrl(url) {
   if (!url) return false;
@@ -8,6 +9,16 @@ function isChatGptUrl(url) {
   } catch {
     return false;
   }
+}
+
+function arrayBufferToBase64(buffer) {
+  const bytes = new Uint8Array(buffer);
+  let binary = "";
+  const chunkSize = 0x8000;
+  for (let i = 0; i < bytes.length; i += chunkSize) {
+    binary += String.fromCharCode.apply(null, bytes.subarray(i, i + chunkSize));
+  }
+  return btoa(binary);
 }
 
 async function apiRequest(method, path, body) {
@@ -27,7 +38,59 @@ async function apiRequest(method, path, body) {
   return { ok: res.ok, status: res.status, data };
 }
 
+async function runShareXWaitImage() {
+  const post = await apiRequest("POST", "/sharex/wait-image", {});
+  if (!post.ok) return post;
+
+  const data = post.data || {};
+  if (data.cancelled || data.ok === false) {
+    return { ok: post.ok, status: post.status, data };
+  }
+
+  const imageId = data.image_id;
+  if (!imageId) {
+    return { ok: false, data: { ok: false, error: "image_id_missing" } };
+  }
+
+  const binRes = await fetch(`${API_BASE}/sharex/image/${encodeURIComponent(imageId)}`);
+  if (!binRes.ok) {
+    return { ok: false, data: { ok: false, error: "image_fetch_failed_" + binRes.status } };
+  }
+
+  const buf = await binRes.arrayBuffer();
+  const b64 = arrayBufferToBase64(buf);
+  await chrome.storage.session.set({ [SHAREX_STORAGE_KEY]: b64 });
+
+  return {
+    ok: true,
+    status: 200,
+    data: { ok: true, sharex_storage_key: SHAREX_STORAGE_KEY },
+  };
+}
+
 chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
+  if (msg?.type === "ia_fetch_sharex_image") {
+    const imageId = msg.image_id;
+    if (!imageId) {
+      sendResponse({ ok: false, error: "image_id_missing" });
+      return false;
+    }
+
+    fetch(`${API_BASE}/sharex/image/${encodeURIComponent(imageId)}`)
+      .then(async (binRes) => {
+        if (!binRes.ok) {
+          return { ok: false, error: "image_fetch_failed_" + binRes.status };
+        }
+        const buf = await binRes.arrayBuffer();
+        const b64 = arrayBufferToBase64(buf);
+        return { ok: true, data: { image_base64: b64, sharex_storage_key: SHAREX_STORAGE_KEY } };
+      })
+      .then((result) => sendResponse(result))
+      .catch((e) => sendResponse({ ok: false, error: String(e.message || e) }));
+
+    return true;
+  }
+
   if (msg?.type !== "ia_api") return false;
 
   apiRequest(msg.method, msg.path || "/", msg.body)
@@ -38,6 +101,38 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
 });
 
 chrome.runtime.onConnect.addListener((port) => {
+  if (port.name === "ia_clipboard") {
+    port.onMessage.addListener((msg) => {
+      if (msg?.type !== "ia_clipboard_request") return;
+
+      const path = msg.path || "/";
+      const run =
+        path === "/sharex/wait-image"
+          ? runShareXWaitImage()
+          : apiRequest(msg.method || "POST", path, msg.body);
+
+      run
+        .then((result) => {
+          try {
+            port.postMessage({ type: "ia_clipboard_result", result });
+          } catch {
+            // port closed
+          }
+        })
+        .catch((e) => {
+          try {
+            port.postMessage({
+              type: "ia_clipboard_result",
+              result: { ok: false, error: String(e.message || e) },
+            });
+          } catch {
+            // port closed
+          }
+        });
+    });
+    return;
+  }
+
   if (port.name !== "ia_sse") return;
 
   let es = null;
