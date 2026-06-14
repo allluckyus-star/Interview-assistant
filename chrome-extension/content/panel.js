@@ -132,6 +132,8 @@ window.IaPanel = (function () {
   let lastShareXAckId = 0;
   let sharexImageRetryAfter = 0;
   let sharexPollTick = 0;
+  let lastPanelShortcutAt = 0;
+  const PANEL_SHORTCUT_DEBOUNCE_MS = 600;
   let shortcutRecording = null;
   let shortcutKeyHandler = null;
   const DRAFT_POLL_MS = 16;
@@ -941,16 +943,17 @@ window.IaPanel = (function () {
 
   async function syncShortcutsToCompanion() {
     const S = window.IaShortcuts;
-    if (!S || !state.connected || !state.shortcuts) return;
+    if (!S || !state.shortcuts) return;
     try {
-      await IaApi.post("/sharex/shortcuts", {
+      const r = await IaApi.post("/sharex/shortcuts", {
         send: S.toCompanionBinding(state.shortcuts.send),
         copy_gpt: S.toCompanionBinding(state.shortcuts.copyGpt),
         image_capture: S.toCompanionBinding(state.shortcuts.imageCapture),
         ocr: S.toCompanionBinding(state.shortcuts.ocr),
       });
-    } catch {
-      // companion offline
+      if (!r?.ok) console.warn("[IA shortcuts] sync failed", r?.error || r?.data);
+    } catch (e) {
+      console.warn("[IA shortcuts] sync error", e);
     }
   }
 
@@ -1082,6 +1085,14 @@ window.IaPanel = (function () {
     window.IaToast?.success(`Shortcut set: ${S.formatCombo(binding)}`);
   }
 
+  function dispatchPanelShortcut(action) {
+    const now = Date.now();
+    if (now - lastPanelShortcutAt < PANEL_SHORTCUT_DEBOUNCE_MS) return;
+    lastPanelShortcutAt = now;
+    if (action === "send") void onSend();
+    else if (action === "copy_gpt") void onCopyGptResult();
+  }
+
   function setupPanelShortcutListener() {
     if (shortcutKeyHandler) return;
     shortcutKeyHandler = (ev) => {
@@ -1102,6 +1113,22 @@ window.IaPanel = (function () {
         ev.stopPropagation();
         void applyShortcutBinding(shortcutRecording, binding);
         return;
+      }
+
+      if (ev.repeat) return;
+      const target = ev.target;
+      if (target && (target.tagName === "INPUT" || target.tagName === "TEXTAREA" || target.isContentEditable)) {
+        return;
+      }
+
+      if (S.matchesEvent(ev, state.shortcuts.send)) {
+        ev.preventDefault();
+        dispatchPanelShortcut("send");
+        return;
+      }
+      if (S.matchesEvent(ev, state.shortcuts.copyGpt)) {
+        ev.preventDefault();
+        dispatchPanelShortcut("copy_gpt");
       }
     };
     document.addEventListener("keydown", shortcutKeyHandler, true);
@@ -2014,6 +2041,8 @@ window.IaPanel = (function () {
         await loadCompanionData();
       } else {
         await refreshCaptionSnapshot();
+        await syncShareXListenToCompanion();
+        await syncShortcutsToCompanion();
       }
       renderFeed();
     } else {
@@ -2111,9 +2140,7 @@ window.IaPanel = (function () {
 
 
   function setConnectionState(mode) {
-
     const connected = mode === "connected";
-
     state.connected = connected;
 
     els.status.classList.remove("connecting", "connected", "offline");
@@ -2205,16 +2232,17 @@ window.IaPanel = (function () {
 
     if (msg.type === "connection") {
 
-      if (msg.payload?.ok) setConnectionState("connected");
-
-      else void checkCompanionHealth();
+      if (msg.payload?.ok) {
+        setConnectionState("connected");
+        void syncShareXListenToCompanion();
+        void syncShortcutsToCompanion();
+      } else void checkCompanionHealth();
 
     }
 
     if (msg.type === "panel_shortcut" && msg.payload?.action) {
-      const action = msg.payload.action;
-      if (action === "send") void onSend();
-      else if (action === "copy_gpt") void onCopyGptResult();
+      console.log("[IA shortcuts] SSE", msg.payload.action);
+      dispatchPanelShortcut(msg.payload.action);
       return;
     }
 

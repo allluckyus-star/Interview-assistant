@@ -66,7 +66,10 @@ internal sealed class ShareXAutoForwardService : IDisposable
     private void TryArmImage(string reason)
     {
         if (!_listenState.ImageEnabled)
+        {
+            StartupDiagnostics.Log("[IA ShareX] image shortcut ignored — toggle ▣ ON in panel");
             return;
+        }
 
         lock (_waitGate)
         {
@@ -82,7 +85,10 @@ internal sealed class ShareXAutoForwardService : IDisposable
     private void TryArmText(string reason)
     {
         if (!_listenState.TextEnabled)
+        {
+            StartupDiagnostics.Log("[IA ShareX] OCR shortcut ignored — toggle T ON in panel");
             return;
+        }
 
         BeginWait(ArmedText);
         StartupDiagnostics.Log($"[IA ShareX] armed OCR ({reason}) — waiting for first clipboard text");

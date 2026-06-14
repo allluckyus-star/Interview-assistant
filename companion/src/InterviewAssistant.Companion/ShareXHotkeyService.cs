@@ -1,25 +1,34 @@
+using System.Diagnostics;
 using System.Runtime.InteropServices;
 using InterviewAssistant.App.Services;
 
 namespace InterviewAssistant.Companion;
 
 /// <summary>
-/// Global shortcut detection via GetAsyncKeyState polling (works when Chrome is unfocused).
-/// Bindings are synced from the extension Settings tab.
+/// Global shortcuts: LL hook for Send/Copy; GetAsyncKeyState polling for ShareX image/OCR
+/// (PrintScreen and Alt+. are often invisible to WH_KEYBOARD_LL when ShareX owns the hotkey).
 /// </summary>
 internal sealed class ShareXHotkeyService : IDisposable
 {
+    private const int WhKeyboardLl = 13;
+    private const int WmKeydown = 0x0100;
+    private const int WmSyskeydown = 0x0104;
     private const int VkControl = 0x11;
     private const int VkMenu = 0x12;
     private const int VkShift = 0x10;
+    private const int LlkhfAltdown = 0x20;
+    private const int LlkhfUp = unchecked((int)0x80000000);
 
-    private readonly System.Threading.Timer _timer;
+    private readonly LowLevelKeyboardProc _proc;
+    private readonly System.Threading.Timer _shareXPollTimer;
+    private IntPtr _hook = IntPtr.Zero;
+    private GCHandle _gcHandle;
     private readonly object _bindGate = new();
     private ShareXShortcutBinding? _imageBinding;
     private ShareXShortcutBinding? _textBinding;
     private ShareXShortcutBinding? _sendBinding;
     private ShareXShortcutBinding? _copyGptBinding;
-    private readonly Dictionary<int, bool> _keyWasDown = new();
+    private readonly Dictionary<int, bool> _pollKeyWasDown = new();
     private double _lastImage;
     private double _lastText;
     private double _lastSend;
@@ -36,11 +45,13 @@ internal sealed class ShareXHotkeyService : IDisposable
 
     public ShareXHotkeyService()
     {
+        _proc = HookCallback;
+        _gcHandle = GCHandle.Alloc(_proc);
         _imageBinding = DefaultImageBinding();
         _textBinding = DefaultTextBinding();
         _sendBinding = DefaultSendBinding();
         _copyGptBinding = DefaultCopyGptBinding();
-        _timer = new System.Threading.Timer(_ => Poll(), null, TimeSpan.FromMilliseconds(40), TimeSpan.FromMilliseconds(40));
+        _shareXPollTimer = new System.Threading.Timer(_ => PollShareXBindings(), null, TimeSpan.FromMilliseconds(40), TimeSpan.FromMilliseconds(40));
     }
 
     public static ShareXShortcutBinding DefaultImageBinding() =>
@@ -67,7 +78,7 @@ internal sealed class ShareXHotkeyService : IDisposable
             if (text is not null && text.EffectiveKeyVks.Length > 0) _textBinding = text;
             if (send is not null && send.EffectiveKeyVks.Length > 0) _sendBinding = send;
             if (copyGpt is not null && copyGpt.EffectiveKeyVks.Length > 0) _copyGptBinding = copyGpt;
-            _keyWasDown.Clear();
+            _pollKeyWasDown.Clear();
         }
 
         StartupDiagnostics.Log(
@@ -90,7 +101,31 @@ internal sealed class ShareXHotkeyService : IDisposable
 
     public void Start()
     {
-        StartupDiagnostics.Log("[IA shortcuts] global poller active (Companion, all windows)");
+        StartupDiagnostics.Log("[IA shortcuts] ShareX poll active (Ctrl+PrtSc, Alt+.)");
+
+        if (_hook != IntPtr.Zero)
+            return;
+
+        try
+        {
+            var moduleName = Process.GetCurrentProcess().MainModule?.ModuleName;
+            var module = string.IsNullOrEmpty(moduleName)
+                ? GetModuleHandle(null)
+                : GetModuleHandle(moduleName);
+            _hook = SetWindowsHookEx(WhKeyboardLl, _proc, module, 0);
+            if (_hook == IntPtr.Zero)
+            {
+                StartupDiagnostics.Log($"[IA shortcuts] panel LL hook failed (error {Marshal.GetLastWin32Error()}) — Send/Copy may not work globally");
+                return;
+            }
+
+            StartupDiagnostics.Log("[IA shortcuts] panel LL hook active (Send/Copy)");
+        }
+        catch (Exception ex)
+        {
+            StartupDiagnostics.Log($"[IA shortcuts] panel LL hook start failed: {ex.Message}");
+            _hook = IntPtr.Zero;
+        }
     }
 
     public bool WasTextShortcutRecent()
@@ -99,34 +134,24 @@ internal sealed class ShareXHotkeyService : IDisposable
         return now - _lastTextShortcutAt < TextShortcutRecentSeconds;
     }
 
-    private void Poll()
+    private void PollShareXBindings()
     {
         try
         {
             ShareXShortcutBinding? image;
             ShareXShortcutBinding? text;
-            ShareXShortcutBinding? send;
-            ShareXShortcutBinding? copyGpt;
             lock (_bindGate)
             {
                 image = _imageBinding;
                 text = _textBinding;
-                send = _sendBinding;
-                copyGpt = _copyGptBinding;
             }
 
             var now = Environment.TickCount64 / 1000.0;
 
-            if (send is not null && TryFireEdge(send, now, ref _lastSend, "send"))
-                SendShortcutPressed?.Invoke();
-
-            if (copyGpt is not null && TryFireEdge(copyGpt, now, ref _lastCopyGpt, "copy_gpt"))
-                CopyGptShortcutPressed?.Invoke();
-
-            if (image is not null && TryFireEdge(image, now, ref _lastImage, "image"))
+            if (image is not null && TryPollEdge(image, now, ref _lastImage, "image"))
                 ImageShortcutPressed?.Invoke();
 
-            if (text is not null && TryFireEdge(text, now, ref _lastText, "ocr"))
+            if (text is not null && TryPollEdge(text, now, ref _lastText, "ocr"))
             {
                 _lastTextShortcutAt = now;
                 TextShortcutPressed?.Invoke();
@@ -134,42 +159,101 @@ internal sealed class ShareXHotkeyService : IDisposable
         }
         catch (Exception ex)
         {
-            StartupDiagnostics.Log($"[IA shortcuts] poll: {ex.Message}");
+            StartupDiagnostics.Log($"[IA shortcuts] ShareX poll: {ex.Message}");
         }
     }
 
-    private bool TryFireEdge(ShareXShortcutBinding binding, double now, ref double lastFire, string label)
+    private bool TryPollEdge(ShareXShortcutBinding binding, double now, ref double lastFire, string label)
     {
         if (!MatchesModifiers(binding)) return false;
 
         foreach (var vk in binding.EffectiveKeyVks)
         {
-            var down = IsDown(vk);
-            _keyWasDown.TryGetValue(vk, out var wasDown);
+            var down = IsVkDown(vk);
+            _pollKeyWasDown.TryGetValue(vk, out var wasDown);
             if (down && !wasDown)
             {
-                _keyWasDown[vk] = true;
+                _pollKeyWasDown[vk] = true;
                 if (now - lastFire >= CooldownSeconds)
                 {
                     lastFire = now;
-                    StartupDiagnostics.Log($"[IA shortcuts] {label} detected ({DescribeBinding(binding)})");
+                    StartupDiagnostics.Log($"[IA shortcuts] {label} detected via poll ({DescribeBinding(binding)})");
                     return true;
                 }
             }
             else
             {
-                _keyWasDown[vk] = down;
+                _pollKeyWasDown[vk] = down;
             }
         }
 
         return false;
     }
 
+    private IntPtr HookCallback(int nCode, IntPtr wParam, IntPtr lParam)
+    {
+        if (nCode >= 0 && _hook != IntPtr.Zero && IsKeyDownMessage(wParam))
+        {
+            try
+            {
+                var vk = Marshal.ReadInt32(lParam, 0);
+                var flags = Marshal.ReadInt32(lParam, 8);
+                if ((flags & LlkhfUp) != 0)
+                    return CallNextHookEx(_hook, nCode, wParam, lParam);
+
+                HandlePanelKeyDown(vk, flags);
+            }
+            catch (Exception ex)
+            {
+                StartupDiagnostics.Log($"[IA shortcuts] hook callback: {ex.Message}");
+            }
+        }
+
+        return CallNextHookEx(_hook, nCode, wParam, lParam);
+    }
+
+    private void HandlePanelKeyDown(int vk, int flags)
+    {
+        var ctrl = IsVkDown(VkControl);
+        var alt = IsVkDown(VkMenu) || (flags & LlkhfAltdown) != 0;
+        var shift = IsVkDown(VkShift);
+        var now = Environment.TickCount64 / 1000.0;
+
+        ShareXShortcutBinding? send;
+        ShareXShortcutBinding? copyGpt;
+        lock (_bindGate)
+        {
+            send = _sendBinding;
+            copyGpt = _copyGptBinding;
+        }
+
+        if (send is not null && MatchesBinding(send, vk, ctrl, alt, shift) && now - _lastSend >= CooldownSeconds)
+        {
+            _lastSend = now;
+            StartupDiagnostics.Log($"[IA shortcuts] send detected ({DescribeBinding(send)})");
+            SendShortcutPressed?.Invoke();
+            return;
+        }
+
+        if (copyGpt is not null && MatchesBinding(copyGpt, vk, ctrl, alt, shift) && now - _lastCopyGpt >= CooldownSeconds)
+        {
+            _lastCopyGpt = now;
+            StartupDiagnostics.Log($"[IA shortcuts] copy_gpt detected ({DescribeBinding(copyGpt)})");
+            CopyGptShortcutPressed?.Invoke();
+        }
+    }
+
+    private static bool MatchesBinding(ShareXShortcutBinding binding, int vk, bool ctrl, bool alt, bool shift) =>
+        ctrl == binding.Ctrl &&
+        alt == binding.Alt &&
+        shift == binding.Shift &&
+        binding.EffectiveKeyVks.Contains(vk);
+
     private static bool MatchesModifiers(ShareXShortcutBinding binding)
     {
-        var ctrl = IsDown(VkControl);
-        var alt = IsDown(VkMenu);
-        var shift = IsDown(VkShift);
+        var ctrl = IsVkDown(VkControl);
+        var alt = IsVkDown(VkMenu);
+        var shift = IsVkDown(VkShift);
         return ctrl == binding.Ctrl && alt == binding.Alt && shift == binding.Shift;
     }
 
@@ -184,9 +268,39 @@ internal sealed class ShareXHotkeyService : IDisposable
         return string.Join("+", mods);
     }
 
-    private static bool IsDown(int vk) => (GetAsyncKeyState(vk) & 0x8000) != 0;
+    private static bool IsVkDown(int vk) => (GetAsyncKeyState(vk) & 0x8000) != 0;
 
-    public void Dispose() => _timer.Dispose();
+    private static bool IsKeyDownMessage(IntPtr wParam) =>
+        wParam == (IntPtr)WmKeydown || wParam == (IntPtr)WmSyskeydown;
+
+    public void Dispose()
+    {
+        _shareXPollTimer.Dispose();
+
+        if (_hook != IntPtr.Zero)
+        {
+            UnhookWindowsHookEx(_hook);
+            _hook = IntPtr.Zero;
+        }
+
+        if (_gcHandle.IsAllocated)
+            _gcHandle.Free();
+    }
+
+    private delegate IntPtr LowLevelKeyboardProc(int nCode, IntPtr wParam, IntPtr lParam);
+
+    [DllImport("user32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+    private static extern IntPtr SetWindowsHookEx(int idHook, LowLevelKeyboardProc lpfn, IntPtr hMod, uint dwThreadId);
+
+    [DllImport("user32.dll", CharSet = CharSet.Auto, SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool UnhookWindowsHookEx(IntPtr hhk);
+
+    [DllImport("user32.dll", CharSet = CharSet.Auto, SetLastError = true)]
+    private static extern IntPtr CallNextHookEx(IntPtr hhk, int nCode, IntPtr wParam, IntPtr lParam);
+
+    [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+    private static extern IntPtr GetModuleHandle(string? lpModuleName);
 
     [DllImport("user32.dll")]
     private static extern short GetAsyncKeyState(int vKey);
