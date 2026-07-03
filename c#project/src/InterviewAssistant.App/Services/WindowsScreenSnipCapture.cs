@@ -1,6 +1,7 @@
 using System.Diagnostics;
 using System.IO;
 using System.Runtime.InteropServices;
+using System.Security.Cryptography;
 using System.Text;
 using System.Threading;
 using System.Windows;
@@ -14,6 +15,13 @@ using WinFormsClipboard = System.Windows.Forms.Clipboard;
 #endif
 
 namespace InterviewAssistant.App.Services;
+
+/// <summary>Clipboard snapshot taken the moment a ShareX shortcut is pressed.</summary>
+public sealed record ShareXClipboardArmBaseline(
+    uint SeqAtShortcut,
+    uint ClipboardSequence,
+    byte[]? ImageFingerprint,
+    string? Text);
 
 /// <summary>Win+Shift+S snip (same flow as live.py) — poll clipboard for a new image.</summary>
 public static class WindowsScreenSnipCapture
@@ -152,34 +160,116 @@ public static class WindowsScreenSnipCapture
     /// <summary>Wait for ShareX (or any tool) to put a new image on the clipboard — does not trigger Win+Shift+S.</summary>
     public static async Task<byte[]?> WaitForShareXImageAsync(
         Dispatcher dispatcher,
-        CancellationToken cancellationToken = default)
+        CancellationToken cancellationToken = default,
+        ShareXClipboardArmBaseline? armBaseline = null)
     {
-        return await WaitForClipboardImageChangeAsync(dispatcher, cancellationToken, ShareXWaitTimeout)
+        return await WaitForClipboardImageChangeAsync(
+                dispatcher,
+                cancellationToken,
+                ShareXWaitTimeout,
+                armBaseline)
             .ConfigureAwait(false);
     }
 
     /// <summary>Wait for ShareX OCR (Alt+.) or similar to put new text on the clipboard.</summary>
     public static async Task<string?> WaitForShareXTextAsync(
         Dispatcher dispatcher,
-        CancellationToken cancellationToken = default)
+        CancellationToken cancellationToken = default,
+        ShareXClipboardArmBaseline? armBaseline = null)
     {
-        return await WaitForClipboardTextChangeAsync(dispatcher, cancellationToken, ShareXWaitTimeout)
+        return await WaitForClipboardTextChangeAsync(
+                dispatcher,
+                cancellationToken,
+                ShareXWaitTimeout,
+                armBaseline)
             .ConfigureAwait(false);
+    }
+
+    public static byte[] ComputeImageFingerprint(byte[] png) => SHA256.HashData(png);
+
+    public static ShareXClipboardArmBaseline CaptureImageArmBaseline(Dispatcher dispatcher, uint seqAtShortcut)
+    {
+        ShareXClipboardArmBaseline baseline = new(seqAtShortcut, seqAtShortcut, null, null);
+        dispatcher.Invoke(() =>
+        {
+            var png = TryEncodeClipboardImageToPng();
+            baseline = new ShareXClipboardArmBaseline(
+                seqAtShortcut,
+                GetClipboardSequenceNumber(),
+                png is { Length: > 0 } ? ComputeImageFingerprint(png) : null,
+                null);
+        }, DispatcherPriority.Send);
+        return baseline;
+    }
+
+    public static ShareXClipboardArmBaseline CaptureTextArmBaseline(Dispatcher dispatcher, uint seqAtShortcut)
+    {
+        ShareXClipboardArmBaseline baseline = new(seqAtShortcut, seqAtShortcut, null, null);
+        dispatcher.Invoke(() =>
+        {
+            baseline = new ShareXClipboardArmBaseline(
+                seqAtShortcut,
+                GetClipboardSequenceNumber(),
+                null,
+                TryGetClipboardText());
+        }, DispatcherPriority.Send);
+        return baseline;
+    }
+
+    private static bool IsImageChangedSinceArm(byte[] png, ShareXClipboardArmBaseline arm)
+    {
+        if (png is not { Length: > 0 })
+            return false;
+
+        var seqNow = GetClipboardSequenceNumber();
+        if (seqNow <= arm.SeqAtShortcut)
+            return false;
+
+        if (arm.ImageFingerprint is null or { Length: 0 })
+            return true;
+
+        var fingerprint = SHA256.HashData(png);
+        if (!fingerprint.AsSpan().SequenceEqual(arm.ImageFingerprint))
+            return true;
+
+        return arm.ClipboardSequence > arm.SeqAtShortcut;
+    }
+
+    private static bool IsTextChangedSinceArm(string text, ShareXClipboardArmBaseline arm)
+    {
+        if (string.IsNullOrWhiteSpace(text))
+            return false;
+
+        var seqNow = GetClipboardSequenceNumber();
+        if (seqNow <= arm.SeqAtShortcut)
+            return false;
+
+        if (string.IsNullOrWhiteSpace(arm.Text))
+            return true;
+
+        if (!string.Equals(text.Trim(), arm.Text.Trim(), StringComparison.Ordinal))
+            return true;
+
+        return arm.ClipboardSequence > arm.SeqAtShortcut;
     }
 
     private static async Task<byte[]?> WaitForClipboardImageChangeAsync(
         Dispatcher dispatcher,
         CancellationToken cancellationToken,
-        TimeSpan timeout)
+        TimeSpan timeout,
+        ShareXClipboardArmBaseline? armBaseline = null)
     {
         byte[]? imageBefore = null;
         var seqBefore = 0u;
 
-        await dispatcher.InvokeAsync(() =>
+        if (armBaseline is null)
         {
-            imageBefore = TryEncodeClipboardImageToPng();
-            seqBefore = GetClipboardSequenceNumber();
-        }, DispatcherPriority.Normal).Task.ConfigureAwait(false);
+            await dispatcher.InvokeAsync(() =>
+            {
+                imageBefore = TryEncodeClipboardImageToPng();
+                seqBefore = GetClipboardSequenceNumber();
+            }, DispatcherPriority.Normal).Task.ConfigureAwait(false);
+        }
 
         var tcs = new TaskCompletionSource<byte[]?>(TaskCreationOptions.RunContinuationsAsynchronously);
         var pollCount = 0;
@@ -211,11 +301,20 @@ public static class WindowsScreenSnipCapture
             }
 
             var current = TryEncodeClipboardImageToPng();
+            if (current is not { Length: > 0 })
+                return;
+
+            if (armBaseline is ShareXClipboardArmBaseline arm)
+            {
+                if (IsImageChangedSinceArm(current, arm))
+                    Complete(current);
+                return;
+            }
+
             var seqNow = GetClipboardSequenceNumber();
-            if (current is { Length: > 0 }
-                && (seqNow != seqBefore
-                    || imageBefore is null
-                    || !imageBefore.AsSpan().SequenceEqual(current)))
+            if (seqNow != seqBefore
+                || imageBefore is null
+                || !imageBefore.AsSpan().SequenceEqual(current))
             {
                 Complete(current);
             }
@@ -249,16 +348,20 @@ public static class WindowsScreenSnipCapture
     private static async Task<string?> WaitForClipboardTextChangeAsync(
         Dispatcher dispatcher,
         CancellationToken cancellationToken,
-        TimeSpan timeout)
+        TimeSpan timeout,
+        ShareXClipboardArmBaseline? armBaseline = null)
     {
         string? textBefore = null;
         var seqBefore = 0u;
 
-        await dispatcher.InvokeAsync(() =>
+        if (armBaseline is null)
         {
-            textBefore = TryGetClipboardText();
-            seqBefore = GetClipboardSequenceNumber();
-        }, DispatcherPriority.Normal).Task.ConfigureAwait(false);
+            await dispatcher.InvokeAsync(() =>
+            {
+                textBefore = TryGetClipboardText();
+                seqBefore = GetClipboardSequenceNumber();
+            }, DispatcherPriority.Normal).Task.ConfigureAwait(false);
+        }
 
         var tcs = new TaskCompletionSource<string?>(TaskCreationOptions.RunContinuationsAsynchronously);
         var pollCount = 0;
@@ -290,10 +393,19 @@ public static class WindowsScreenSnipCapture
             }
 
             var current = TryGetClipboardText();
+            if (string.IsNullOrWhiteSpace(current))
+                return;
+
+            if (armBaseline is ShareXClipboardArmBaseline arm)
+            {
+                if (IsTextChangedSinceArm(current, arm))
+                    Complete(current);
+                return;
+            }
+
             var seqNow = GetClipboardSequenceNumber();
-            if (!string.IsNullOrWhiteSpace(current)
-                && (seqNow != seqBefore
-                    || !string.Equals(current, textBefore, StringComparison.Ordinal)))
+            if (seqNow != seqBefore
+                || !string.Equals(current, textBefore, StringComparison.Ordinal))
             {
                 Complete(current);
             }

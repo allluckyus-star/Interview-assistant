@@ -30,11 +30,24 @@ internal static class ShareXPendingBus
         }
     }
 
+    /// <summary>Drop undelivered pending payload when user presses shortcut again.</summary>
+    public static void ClearUnacked()
+    {
+        lock (Gate)
+        {
+            _imageId = null;
+            _text = null;
+        }
+    }
+
     public static object? GetPending(int afterId)
     {
         lock (Gate)
         {
             if (_pendingId <= afterId)
+                return null;
+
+            if (_imageId is null && _text is null)
                 return null;
 
             return new

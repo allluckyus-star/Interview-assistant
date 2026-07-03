@@ -26,8 +26,9 @@ internal static class ModePromptSeed
                         if (prop.Value.ValueKind == JsonValueKind.String)
                             loaded[prop.Name] = prop.Value.GetString() ?? "";
                     }
-                    if (loaded.Count >= 3)
+                    if (loaded.Count >= 1)
                     {
+                        MergeAssetPromptFromFile(loaded, "behavioral", "behavioral_mode_prompt.txt");
                         MergeAssetPromptFromFile(loaded, "closing", "closing_mode_prompt.txt");
                         MergeAssetPromptFromFile(loaded, "error", "error_mode_prompt.txt");
                         _cache = loaded;

@@ -282,7 +282,7 @@ public sealed class CompanionApiServer : IDisposable
                     await WriteJsonAsync(ctx, new
                     {
                         active = _session.ModePrompts.SessionMode,
-                        modes = new[] { "read", "type", "behavioral" },
+                        modes = new[] { "behavioral" },
                     });
                     return;
                 }
@@ -405,7 +405,7 @@ public sealed class CompanionApiServer : IDisposable
                 if (path == "/sharex/wait-image")
                 {
                     StartupDiagnostics.Log("[IA ShareX] wait-image started");
-                    var result = await _clipboard.WaitForShareXImageAsync(CancellationToken.None).ConfigureAwait(false);
+                    var result = await _clipboard.WaitForShareXImageAsync(cancellationToken: CancellationToken.None).ConfigureAwait(false);
                     if (result.Ok)
                     {
                         StartupDiagnostics.Log($"[IA ShareX] wait-image ok id={result.ImageId}");
@@ -426,7 +426,7 @@ public sealed class CompanionApiServer : IDisposable
                 if (path == "/sharex/wait-text")
                 {
                     StartupDiagnostics.Log("[IA ShareX] wait-text started");
-                    var result = await _clipboard.WaitForShareXTextAsync(CancellationToken.None).ConfigureAwait(false);
+                    var result = await _clipboard.WaitForShareXTextAsync(cancellationToken: CancellationToken.None).ConfigureAwait(false);
                     if (result.Ok)
                     {
                         StartupDiagnostics.Log($"[IA ShareX] wait-text ok len={result.Text?.Length ?? 0}");
@@ -594,7 +594,7 @@ public sealed class CompanionApiServer : IDisposable
                 {
                     var body = await ReadJsonBodyAsync(ctx);
                     if (body.TryGetProperty("mode", out var m))
-                        _session.ModePrompts.SessionMode = m.GetString() ?? "read";
+                        _session.ModePrompts.SessionMode = m.GetString() ?? "behavioral";
                     await WriteJsonAsync(ctx, new { ok = true, active = _session.ModePrompts.SessionMode });
                     return;
                 }

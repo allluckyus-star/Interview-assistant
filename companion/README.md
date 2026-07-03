@@ -71,6 +71,7 @@ Prompt templates under `Assets\` are bundled into the exe and extracted next to 
 ## Tray menu
 
 - **Restart captions** — restarts capture session
+- **Run at Windows startup** — register in Windows login startup (on by default)
 - **Quit** — exits the app (stops API and captions)
 
 If you run with `dotnet run`, **Ctrl+C** in that terminal also stops the host. After tray **Quit**, the companion process should disappear from Task Manager within a few seconds.

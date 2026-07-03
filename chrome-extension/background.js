@@ -1,5 +1,10 @@
 const API_BASE = "http://127.0.0.1:1212";
 const SHAREX_STORAGE_KEY = "ia_sharex_b64";
+const GPT_URL_PATTERNS = ["https://chatgpt.com/*", "https://chat.openai.com/*"];
+const GLOBAL_SSE_RELAY_TYPES = new Set(["sharex_image", "sharex_text", "panel_shortcut"]);
+
+let globalEs = null;
+let globalEsReconnectTimer = null;
 
 function isChatGptUrl(url) {
   if (!url) return false;
@@ -20,6 +25,77 @@ function arrayBufferToBase64(buffer) {
   }
   return btoa(binary);
 }
+
+async function broadcastPanelEvent(msg) {
+  if (!msg?.type) return;
+  let tabs = [];
+  try {
+    tabs = await chrome.tabs.query({ url: GPT_URL_PATTERNS });
+  } catch {
+    return;
+  }
+  for (const tab of tabs) {
+    if (!tab?.id) continue;
+    try {
+      await chrome.tabs.sendMessage(tab.id, { type: "ia_panel_sse", msg });
+    } catch {
+      // content script not ready or tab discarded
+    }
+  }
+}
+
+function stopGlobalSse() {
+  if (globalEsReconnectTimer) {
+    clearTimeout(globalEsReconnectTimer);
+    globalEsReconnectTimer = null;
+  }
+  if (!globalEs) return;
+  try {
+    globalEs.close();
+  } catch {
+    // ignore
+  }
+  globalEs = null;
+}
+
+function scheduleGlobalSseReconnect() {
+  if (globalEsReconnectTimer) return;
+  globalEsReconnectTimer = setTimeout(() => {
+    globalEsReconnectTimer = null;
+    startGlobalSse();
+  }, 2000);
+}
+
+function startGlobalSse() {
+  if (globalEs) return;
+  try {
+    globalEs = new EventSource(`${API_BASE}/events`);
+  } catch {
+    scheduleGlobalSseReconnect();
+    return;
+  }
+
+  globalEs.onmessage = (ev) => {
+    if (!ev?.data) return;
+    let msg;
+    try {
+      msg = JSON.parse(ev.data);
+    } catch {
+      return;
+    }
+    if (!GLOBAL_SSE_RELAY_TYPES.has(msg?.type)) return;
+    void broadcastPanelEvent(msg);
+  };
+
+  globalEs.onerror = () => {
+    stopGlobalSse();
+    scheduleGlobalSseReconnect();
+  };
+}
+
+startGlobalSse();
+chrome.runtime.onStartup.addListener(startGlobalSse);
+chrome.runtime.onInstalled.addListener(startGlobalSse);
 
 async function apiRequest(method, path, body) {
   const hasBody = body !== undefined && body !== null;

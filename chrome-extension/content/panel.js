@@ -3,13 +3,7 @@ window.IaPanel = (function () {
   const SCRIPT_TOKEN = String(Date.now());
 
   const MODES = [
-
-    { id: "read", label: "Read", short: "Read" },
-
-    { id: "type", label: "Type", short: "Type" },
-
     { id: "behavioral", label: "Behavioral", short: "Beh" },
-
   ];
 
   const LANGUAGES = [
@@ -23,23 +17,12 @@ window.IaPanel = (function () {
 
 
   const PROMPT_KEYS = [
-
     { id: "resume_summary", label: "Resume summary" },
-
     { id: "jd_summary", label: "JD summary" },
-
     { id: "initial_interview", label: "Initial interview" },
-
     { id: "english", label: "Language: English" },
-
     { id: "chinese", label: "Language: 中文" },
-
-    { id: "read", label: "Read" },
-
-    { id: "type", label: "Type" },
-
-    { id: "behavioral", label: "Behavioral" },
-
+    { id: "behavioral", label: "Interview mode" },
   ];
 
 
@@ -48,11 +31,11 @@ window.IaPanel = (function () {
 
     tab: "caption",
 
-    mode: "read",
+    mode: "behavioral",
 
     language: "english",
 
-    promptKey: "read",
+    promptKey: "behavioral",
 
     draft: "",
 
@@ -132,6 +115,7 @@ window.IaPanel = (function () {
   let lastShareXAckId = 0;
   let sharexImageRetryAfter = 0;
   let sharexPollTick = 0;
+  const sharexHandledPending = new Set();
   let lastPanelShortcutAt = 0;
   const PANEL_SHORTCUT_DEBOUNCE_MS = 600;
   let shortcutRecording = null;
@@ -1232,13 +1216,13 @@ window.IaPanel = (function () {
 
                   </div>
 
-                  <div class="ia-mode-seg" id="ia-mode-seg" role="group" aria-label="Session mode"></div>
+                  <div class="ia-mode-seg" id="ia-mode-seg" role="group" aria-label="Interview mode"></div>
 
                   <div class="ia-lang-seg" id="ia-lang-seg" role="group" aria-label="Output language"></div>
 
                   <button type="button" class="ia-icon-btn ghost" id="ia-btn-save" title="Save edit" style="display:none">${I.check || "✓"}</button>
 
-                  <button type="button" class="ia-icon-btn primary" id="ia-btn-send" title="Send to ChatGPT (mode prompt)">${I.send || "→"}</button>
+                  <button type="button" class="ia-icon-btn primary" id="ia-btn-send" title="Send to ChatGPT (behavioral prompt)">${I.send || "→"}</button>
 
                   <button type="button" class="ia-icon-btn" id="ia-btn-quote-caption" title="Paste selected caption as: Interviewer said &quot;…&quot; (does not send)">${I.quote || '"'} </button>
 
@@ -1321,7 +1305,7 @@ window.IaPanel = (function () {
               <div class="ia-settings-section ia-settings-card ia-settings-card--prompt is-collapsed" data-section="prompt">
 
                 <button type="button" class="ia-settings-section-toggle" aria-expanded="false" aria-controls="ia-settings-body-prompt">
-                  <span>Prompt template</span>
+                  <span>Interview mode prompt</span>
                   <span class="ia-settings-chevron" aria-hidden="true">${I.chevronRight || "›"}</span>
                 </button>
 
@@ -1435,33 +1419,25 @@ window.IaPanel = (function () {
 
 
   function renderModeButtons() {
-
+    if (!els.modeSeg) return;
     els.modeSeg.innerHTML = "";
-
+    els.modeSeg.hidden = false;
     MODES.forEach((m) => {
-
       const btn = document.createElement("button");
-
       btn.type = "button";
-
-      btn.className = "ia-mode-btn";
-
+      btn.className = "ia-mode-btn active";
       btn.dataset.mode = m.id;
-
       btn.innerHTML = (window.IaIcons && window.IaIcons.forMode(m.id)) || m.short;
-
-      btn.title = m.label;
-
+      btn.title = `${m.label} (active) — click to edit prompt in Settings`;
       btn.setAttribute("aria-label", m.label);
-
-      btn.addEventListener("click", () => setMode(m.id));
-
+      btn.setAttribute("aria-pressed", "true");
+      btn.addEventListener("click", () => {
+        setTab("settings");
+        setSettingsAccordionSection("prompt");
+        setPromptKey("behavioral");
+      });
       els.modeSeg.appendChild(btn);
-
     });
-
-    updateModeButtons();
-
   }
 
   function renderLanguageButtons() {
@@ -1531,17 +1507,13 @@ window.IaPanel = (function () {
 
 
   function updateModeButtons() {
-
+    state.mode = "behavioral";
+    if (!els.modeSeg) return;
     els.modeSeg.querySelectorAll(".ia-mode-btn").forEach((btn) => {
-
-      const on = btn.dataset.mode === state.mode;
-
+      const on = btn.dataset.mode === "behavioral";
       btn.classList.toggle("active", on);
-
       btn.setAttribute("aria-pressed", on ? "true" : "false");
-
     });
-
   }
 
 
@@ -1930,6 +1902,13 @@ window.IaPanel = (function () {
 
     await loadPanelSettings();
 
+    if (chrome?.runtime?.onMessage && !window.__iaPanelSseRelayHook) {
+      window.__iaPanelSseRelayHook = true;
+      chrome.runtime.onMessage.addListener((msg) => {
+        if (msg?.type === "ia_panel_sse" && msg.msg) onSseMessage(msg.msg);
+      });
+    }
+
     setConnectionState("connecting");
 
     await checkCompanionHealth();
@@ -2008,14 +1987,14 @@ window.IaPanel = (function () {
     }
 
     if (PROMPT_KEYS.some((p) => p.id === state.mode)) {
-
-      setPromptKey(state.mode);
-
+      setPromptKey("behavioral");
     } else {
-
       void loadPromptEditor();
-
     }
+
+    await IaApi.post("/mode", { mode: "behavioral" });
+    state.mode = "behavioral";
+    updateModeButtons();
 
     await syncShareXListenToCompanion();
     await syncShortcutsToCompanion();
@@ -2122,11 +2101,8 @@ window.IaPanel = (function () {
 
 
   function normalizeMode(id) {
-
-    const m = MODES.find((x) => x.id === id);
-
-    return m ? m.id : "read";
-
+    void id;
+    return "behavioral";
   }
 
   function normalizeLanguage(id) {
@@ -2218,6 +2194,18 @@ window.IaPanel = (function () {
 
 
 
+  function claimShareXPending(pendingId) {
+    const id = Number(pendingId) || 0;
+    if (!id) return true;
+    if (sharexHandledPending.has(id)) return false;
+    sharexHandledPending.add(id);
+    if (sharexHandledPending.size > 100) {
+      const oldest = sharexHandledPending.values().next().value;
+      if (oldest !== undefined) sharexHandledPending.delete(oldest);
+    }
+    return true;
+  }
+
   function onSseMessage(msg) {
 
     if (msg.type === "draft" && msg.payload) {
@@ -2248,6 +2236,7 @@ window.IaPanel = (function () {
 
     if (msg.type === "sharex_image" && msg.payload?.image_id) {
       const pendingId = msg.payload.pending_id || 0;
+      if (!claimShareXPending(pendingId)) return;
       if (!state.shareXImageListen) {
         if (pendingId) {
           void IaApi.post("/sharex/ack", { pending_id: pendingId }).then(() => {
@@ -2270,6 +2259,7 @@ window.IaPanel = (function () {
 
     if (msg.type === "sharex_text" && msg.payload?.text) {
       const pendingId = msg.payload.pending_id || 0;
+      if (!claimShareXPending(pendingId)) return;
       if (!state.shareXTextListen) {
         if (pendingId) {
           void IaApi.post("/sharex/ack", { pending_id: pendingId }).then(() => {
@@ -2643,21 +2633,10 @@ window.IaPanel = (function () {
 
 
   async function setMode(id) {
-
-    const mode = normalizeMode(id);
-
-    state.mode = mode;
-
+    state.mode = "behavioral";
     updateModeButtons();
-
-    await IaApi.post("/mode", { mode });
-
-    if (state.tab === "settings" && PROMPT_KEYS.some((p) => p.id === mode)) {
-
-      setPromptKey(mode);
-
-    }
-
+    await IaApi.post("/mode", { mode: "behavioral" });
+    if (state.tab === "settings") setPromptKey("behavioral");
   }
 
 

@@ -7,7 +7,9 @@ public sealed class CompanionClipboardService
     private int _imageInProgress;
     private int _textInProgress;
 
-    public async Task<ShareXImageResponse> WaitForShareXImageAsync(CancellationToken cancellationToken = default)
+    public async Task<ShareXImageResponse> WaitForShareXImageAsync(
+        ShareXClipboardArmBaseline? armBaseline = null,
+        CancellationToken cancellationToken = default)
     {
         if (Interlocked.CompareExchange(ref _imageInProgress, 1, 0) != 0)
             return ShareXImageResponse.FromBusy();
@@ -16,7 +18,7 @@ public sealed class CompanionClipboardService
         {
             var dispatcher = CompanionSnipDispatcher.Get();
             var png = await WindowsScreenSnipCapture
-                .WaitForShareXImageAsync(dispatcher, cancellationToken)
+                .WaitForShareXImageAsync(dispatcher, cancellationToken, armBaseline)
                 .ConfigureAwait(false);
 
             if (png is null || png.Length == 0)
@@ -39,7 +41,9 @@ public sealed class CompanionClipboardService
         }
     }
 
-    public async Task<ShareXTextResponse> WaitForShareXTextAsync(CancellationToken cancellationToken = default)
+    public async Task<ShareXTextResponse> WaitForShareXTextAsync(
+        ShareXClipboardArmBaseline? armBaseline = null,
+        CancellationToken cancellationToken = default)
     {
         if (Interlocked.CompareExchange(ref _textInProgress, 1, 0) != 0)
             return ShareXTextResponse.FromBusy();
@@ -48,7 +52,7 @@ public sealed class CompanionClipboardService
         {
             var dispatcher = CompanionSnipDispatcher.Get();
             var text = await WindowsScreenSnipCapture
-                .WaitForShareXTextAsync(dispatcher, cancellationToken)
+                .WaitForShareXTextAsync(dispatcher, cancellationToken, armBaseline)
                 .ConfigureAwait(false);
 
             if (string.IsNullOrWhiteSpace(text))

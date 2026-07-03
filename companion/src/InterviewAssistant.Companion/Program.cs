@@ -59,6 +59,8 @@ internal static class Program
                 return;
             }
 
+            CompanionStartupRegistration.ApplyPreference();
+
             try
             {
                 session.Start();

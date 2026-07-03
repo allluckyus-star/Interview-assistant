@@ -50,7 +50,7 @@ public sealed class ModePromptStore
 
 
 
-    private string _sessionMode = "read";
+    private string _sessionMode = "behavioral";
 
     public string SessionMode
     {
@@ -61,11 +61,10 @@ public sealed class ModePromptStore
     private static string NormalizeSessionMode(string? mode) =>
         mode?.Trim().ToLowerInvariant() switch
         {
-            "type" => "type",
-            "error" => "error",
             "behavioral" => "behavioral",
             "closing" => "closing",
-            _ => "read",
+            "error" => "error",
+            _ => "behavioral",
         };
 
 
@@ -256,7 +255,10 @@ public sealed class ModePromptStore
 
                 && !text.Contains("FULL CORRECTED CODE", StringComparison.Ordinal),
 
-            "behavioral" => text.Contains("Output SHORT ANSWER and STORY ANSWER sections.", StringComparison.Ordinal),
+            "behavioral" => text.Contains("STORY ANSWER", StringComparison.Ordinal)
+                || text.Contains("SHORT ANSWER:", StringComparison.Ordinal)
+                || (text.Contains("Behavioral Mode prompt:", StringComparison.Ordinal)
+                    && !text.Contains("KEY SENTENCES:", StringComparison.Ordinal)),
 
             _ => false,
 

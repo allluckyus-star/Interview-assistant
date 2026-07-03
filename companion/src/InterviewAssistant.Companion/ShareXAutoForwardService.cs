@@ -39,7 +39,7 @@ internal sealed class ShareXAutoForwardService : IDisposable
     public void Start()
     {
         _shortcuts.Start();
-        StartupDiagnostics.Log("[IA ShareX] armed-wait mode (listen toggles + shortcut → clipboard)");
+        StartupDiagnostics.Log("[IA ShareX] armed-wait mode (listen toggles + shortcut → clipboard change after press)");
     }
 
     private CancellationToken BeginWait(int kind)
@@ -77,9 +77,15 @@ internal sealed class ShareXAutoForwardService : IDisposable
                 return;
         }
 
+        ShareXPendingBus.ClearUnacked();
+        var seqAtShortcut = WindowsScreenSnipCapture.ReadClipboardSequenceNumber();
+        var dispatcher = CompanionSnipDispatcher.Get();
+        var baseline = WindowsScreenSnipCapture.CaptureImageArmBaseline(dispatcher, seqAtShortcut);
+        StartupDiagnostics.Log(
+            $"[IA ShareX] armed image ({reason}) seq_at_key={baseline.SeqAtShortcut} seq_now={baseline.ClipboardSequence} — waiting for change after press");
+
         BeginWait(ArmedImage);
-        StartupDiagnostics.Log($"[IA ShareX] armed image ({reason}) — waiting for first clipboard image");
-        _ = RunImageWaitAsync();
+        _ = RunImageWaitAsync(baseline);
     }
 
     private void TryArmText(string reason)
@@ -90,12 +96,18 @@ internal sealed class ShareXAutoForwardService : IDisposable
             return;
         }
 
+        ShareXPendingBus.ClearUnacked();
+        var seqAtShortcut = WindowsScreenSnipCapture.ReadClipboardSequenceNumber();
+        var dispatcher = CompanionSnipDispatcher.Get();
+        var baseline = WindowsScreenSnipCapture.CaptureTextArmBaseline(dispatcher, seqAtShortcut);
+        StartupDiagnostics.Log(
+            $"[IA ShareX] armed OCR ({reason}) seq_at_key={baseline.SeqAtShortcut} seq_now={baseline.ClipboardSequence} — waiting for change after press");
+
         BeginWait(ArmedText);
-        StartupDiagnostics.Log($"[IA ShareX] armed OCR ({reason}) — waiting for first clipboard text");
-        _ = RunTextWaitAsync();
+        _ = RunTextWaitAsync(baseline);
     }
 
-    private async Task RunImageWaitAsync()
+    private async Task RunImageWaitAsync(ShareXClipboardArmBaseline baseline)
     {
         CancellationToken token;
         lock (_waitGate)
@@ -103,7 +115,9 @@ internal sealed class ShareXAutoForwardService : IDisposable
 
         try
         {
-            var result = await _clipboard.WaitForShareXImageAsync(token).ConfigureAwait(false);
+            var result = await _clipboard
+                .WaitForShareXImageAsync(baseline, token)
+                .ConfigureAwait(false);
             if (result.Ok)
             {
                 StartupDiagnostics.Log($"[IA ShareX] image captured ({result.ImageId})");
@@ -120,7 +134,7 @@ internal sealed class ShareXAutoForwardService : IDisposable
         }
     }
 
-    private async Task RunTextWaitAsync()
+    private async Task RunTextWaitAsync(ShareXClipboardArmBaseline baseline)
     {
         CancellationToken token;
         lock (_waitGate)
@@ -128,7 +142,9 @@ internal sealed class ShareXAutoForwardService : IDisposable
 
         try
         {
-            var result = await _clipboard.WaitForShareXTextAsync(token).ConfigureAwait(false);
+            var result = await _clipboard
+                .WaitForShareXTextAsync(baseline, token)
+                .ConfigureAwait(false);
             if (result.Ok)
             {
                 StartupDiagnostics.Log($"[IA ShareX] OCR text captured ({result.Text?.Length ?? 0} chars)");
